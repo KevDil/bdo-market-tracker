@@ -278,28 +278,56 @@ class MarketTracker:
         metrics = {}
         try:
             s = re.sub(r"\s+", " ", full_text)
-            # Versuche Blöcke wie: "<ItemName> Orders 1000 / Orders Completed : 61 Collect 12,113,100 Re-list"
-            # oder: "<ItemName> Orders   98873 Orders Completed 3581 ... Collect 123,456 Re-list"
-            # oder: "Lion Blood Orders 5000 Orders Completed : 263 Collect 70,581,300 Re-list"
-            # Accept OCR variants: 'Re-list' or 'Relist'; 'Collect' misspellings like 'Collece'
-            # FIXED: Simplified pattern to be more robust
-            pattern = re.compile(
-                r"([A-Za-z\[\]0-9' :\-\(\)]{4,})\s+Orders\s*:?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*:?\s*([0-9,\.]+)[\s\S]{0,160}?Coll\w*\s*([0-9,\.]+)\s+[Rr]e-?list",
+            # CRITICAL FIX: Two-pass approach to capture full item names
+            # Pass 1: Find all "Orders ... Orders Completed ... Collect ... Re-list" blocks
+            # Pass 2: Extract item name by looking backwards from "Orders" keyword
+            
+            # Find all metric blocks first
+            metric_pattern = re.compile(
+                r"Orders\s*:?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*:?\s*([0-9,\.]+)[\s\S]{0,160}?Coll\w*\s*([0-9,\.]+)\s+[Rr]e-?list",
                 re.IGNORECASE,
             )
-            for m in pattern.finditer(s):
-                name = (m.group(1) or '').strip()
-                it_lc = name.lower()
-                orders = normalize_numeric_str(m.group(2)) or 0
-                oc = normalize_numeric_str(m.group(3)) or 0
-                rem = normalize_numeric_str(m.group(4)) or 0
-                if orders >= 0 and oc >= 0 and rem > 0:
-                    metrics[it_lc] = {
-                        'item': name,
-                        'orders': orders,
-                        'ordersCompleted': oc,
-                        'remainingPrice': rem,
-                    }
+            
+            for m in metric_pattern.finditer(s):
+                # Extract metrics
+                orders = normalize_numeric_str(m.group(1)) or 0
+                oc = normalize_numeric_str(m.group(2)) or 0
+                rem = normalize_numeric_str(m.group(3)) or 0
+                
+                if orders <= 0 or oc <= 0 or rem <= 0:
+                    continue
+                
+                # Now look backwards from the start of "Orders" to find the item name
+                # Take up to 100 chars before "Orders" and extract the last valid item name
+                before_orders = s[max(0, m.start()-100):m.start()]
+                
+                # Extract item name: last sequence of letters/spaces/apostrophes before "Orders"
+                # Stop at known delimiters like "Re-list", "Collect", numbers-only sequences, "VT"
+                name_match = re.search(
+                    r"(?:^|Re-?list|Collect|VT|\d{3,})\s*([A-Za-z][A-Za-z' \[\]\(\)\-]{2,})\s*$",
+                    before_orders,
+                    re.IGNORECASE
+                )
+                
+                if not name_match:
+                    # Fallback: take everything that looks like text before "Orders"
+                    name_match = re.search(r"([A-Za-z][A-Za-z' \[\]\(\)\-]{2,})\s*$", before_orders)
+                
+                if name_match:
+                    name = name_match.group(1).strip()
+                    # Clean up trailing noise
+                    name = re.sub(r'\s*[:\d]+$', '', name).strip()
+                    # Remove common OCR artifacts at the end
+                    name = re.sub(r'\s+(Re-?list|Collect|Cancel|VT)$', '', name, flags=re.IGNORECASE).strip()
+                    
+                    if len(name) >= 3:  # Valid item name
+                        it_lc = name.lower()
+                        metrics[it_lc] = {
+                            'item': name,
+                            'orders': orders,
+                            'ordersCompleted': oc,
+                            'remainingPrice': rem,
+                        }
         except Exception:
             pass
         return metrics
@@ -2128,10 +2156,34 @@ class MarketTracker:
                     continue
                 raw_name = metrics.get('item') or item_lc
                 corrected_name = correct_item_name(raw_name) or raw_name
+                
+                # CRITICAL FIX: Validate inferred price against market data
+                # This prevents using stale UI metrics that produce wrong prices
                 try:
-                    ts_for_ui = overall_max_ts if isinstance(overall_max_ts, datetime.datetime) else datetime.datetime.now()
+                    from utils import check_price_plausibility
+                    plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price)
+                    if not plausibility.get('plausible', True):
+                        reason = plausibility.get('reason', 'unknown')
+                        expected_min = plausibility.get('expected_min')
+                        expected_max = plausibility.get('expected_max')
+                        # Skip if price is WAY off (outside 10x range)
+                        if reason == 'too_low' and expected_min and delta_price < expected_min * 0.1:
+                            if self.debug:
+                                log_debug(f"[UI-INFER] SKIP '{corrected_name}' - price {delta_price:,} too low (expected min: {expected_min:,})")
+                            continue
+                        elif reason == 'too_high' and expected_max and delta_price > expected_max * 10:
+                            if self.debug:
+                                log_debug(f"[UI-INFER] SKIP '{corrected_name}' - price {delta_price:,} too high (expected max: {expected_max:,})")
+                            continue
+                        # Warn but allow if within 10x range (might be correct)
+                        elif self.debug:
+                            log_debug(f"[UI-INFER] ⚠ '{corrected_name}' price {delta_price:,} is {reason} (expected: {expected_min:,} - {expected_max:,})")
                 except Exception:
-                    ts_for_ui = datetime.datetime.now()
+                    pass  # If check fails, proceed anyway
+                # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
+                # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
+                # UI-inferred means we're detecting a NEW collect/buy that just happened NOW
+                ts_for_ui = datetime.datetime.now()
                 synthetic_tx = {
                     'item_name': corrected_name,
                     'quantity': delta_qty,
@@ -2191,10 +2243,10 @@ class MarketTracker:
                 corrected_name = correct_item_name(metrics_item) or metrics_item
                 if not self._valid_item_name(corrected_name):
                     continue
-                try:
-                    ts_for_ui = overall_max_ts if isinstance(overall_max_ts, datetime.datetime) else datetime.datetime.now()
-                except Exception:
-                    ts_for_ui = datetime.datetime.now()
+                # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
+                # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
+                # UI-inferred means we're detecting a NEW collect/sell that just happened NOW
+                ts_for_ui = datetime.datetime.now()
                 synthetic_sell = {
                     'item_name': corrected_name,
                     'quantity': int(delta_qty),
