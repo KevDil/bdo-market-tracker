@@ -11,7 +11,10 @@ USE_EASYOCR = True
 DB_PATH = "bdo_tracker.db"
 LOG_PATH = "ocr_log.txt"
 DEFAULT_REGION = (734, 371, 1823, 1070)
-POLL_INTERVAL = 0.3  # 0.3s = ~99 scans/min (GPU cached), erfasst >95% der Transaktionen
+# CRITICAL FIX: Reduced from 0.3s to 0.15s for faster real-time tracking
+# Even with slower OCR (2s), faster polling ensures we capture transaction lines quickly
+# Old: 0.3s = ~3 scans/sec, New: 0.15s = ~6-7 scans/sec
+POLL_INTERVAL = 0.15  # Faster polling for 1-2s response time
 MARKET_DATA_CSV = "config/market_data.csv"  # DEPRECATED - Jetzt über BDO World Market API
 ITEM_CATEGORIES_CSV = "config/item_categories.csv"  # most_likely_buy/sell für Historical Detection
 
@@ -26,7 +29,10 @@ FOCUS_WINDOW_TITLES = [
 # Async Pipeline Feature Flag
 # -----------------------
 USE_ASYNC_PIPELINE = True
-ASYNC_QUEUE_MAXSIZE = max(1, int(os.getenv('ASYNC_QUEUE_MAXSIZE', '3') or '3'))
+# CRITICAL FIX: Queue size = 1 to prevent stale frames
+# Old frames are USELESS - we only care about the LATEST state
+# Queue latency was 10+ seconds with size=3, now <1s with size=1
+ASYNC_QUEUE_MAXSIZE = 1  # MUST be 1 for real-time tracking
 ASYNC_WORKER_COUNT = max(1, int(os.getenv('ASYNC_WORKER_COUNT', '1') or '1'))
 
 # -----------------------

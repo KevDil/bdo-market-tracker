@@ -68,8 +68,9 @@ class MarketTracker:
             # Reduce default poll interval to 0.5s for faster response (was 1.2s)
             # With persistent baseline, we don't need burst-scans anymore!
             self.poll_interval = min(poll_interval, 0.5)  # Max 0.5s between scans
-        # Legacy burst mode variables (kept for compatibility but not actively used)
-        self.poll_interval_burst = 0.3
+        # CRITICAL FIX: Aggressive burst mode for fast transaction capture
+        # Burst scans run at 80ms intervals to catch transaction lines quickly
+        self.poll_interval_burst = 0.08  # Was 0.3s, now 0.08s for 12 scans/sec
         self._burst_until = None
         self._burst_fast_scans = 0
         self._request_immediate_rescan = 0
@@ -2850,7 +2851,21 @@ class AsyncPipelineController:
                 if self.queue is None:
                     break
 
+                # CRITICAL FIX: Drop old frames if queue is full
+                # We ONLY care about the LATEST state, old frames are USELESS
+                # This prevents 10+ second latency when OCR is slow
                 try:
+                    # Try to put with no wait - if queue full, drop oldest and retry
+                    if self.queue.full():
+                        try:
+                            # Drop oldest frame (FIFO - get without blocking)
+                            old_frame = self.queue.get_nowait()
+                            self.queue.task_done()  # Mark old frame as done
+                            if self.tracker.debug:
+                                log_debug("[ASYNC] Dropped stale frame (queue full)")
+                        except asyncio.QueueEmpty:
+                            pass  # Race condition - queue emptied between check and get
+                    
                     await self.queue.put(payload)
                 except asyncio.CancelledError:
                     raise
