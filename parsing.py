@@ -232,7 +232,19 @@ def extract_details_from_entry(ts_text, entry_text):
     elif "placed order" in low or _DETAIL_PATTERNS["order_placed"].search(low) or _DETAIL_PATTERNS["placed_order"].search(low):
         typ = "placed"
     elif "listed" in low or _DETAIL_PATTERNS["relist"].search(low):
-        typ = "listed"
+        # CRITICAL: Avoid false "listed" detection from Buy Overview UI buttons
+        # Buy Overview UI: "Maple Sap Orders 5000 Orders Completed 2564 Collect 17,295,600 Re-list"
+        # This contains "Re-list" but is NOT a listing event - it's a UI button
+        # Only mark as "listed" if we have clear transaction log context (not just UI buttons)
+        has_transaction_context = (
+            "transaction of" in low or 
+            "listed" in low.split("re-list")[0] if "re-list" in low else "listed" in low
+        )
+        # Additional filter: if "orders completed" appears (Buy Overview UI), this is NOT a listing
+        has_ui_context = "orders completed" in low or "orders" in low and "collect" in low
+        if has_transaction_context and not has_ui_context:
+            typ = "listed"
+        # If no clear transaction context, leave as "other"
     elif _DETAIL_PATTERNS["withdrew"].search(low):
         typ = "withdrew"
     elif _DETAIL_PATTERNS["purchased"].search(low):

@@ -659,14 +659,15 @@ class MarketTracker:
 
         # If we just returned from a detail window (prev_window was buy_item/sell_item) into an overview,
         # schedule a couple of immediate fast scans to catch the log update that might render a few frames later.
-        # NOTE: With persistent baseline, these fast scans are less critical but still useful for immediate capture
+        # CRITICAL: Transaction lines appear 1-3 seconds AFTER returning to overview, especially for fast purchases
+        # Need longer burst window to catch Maple Sap, Pure Powder Reagent, etc.
         if prev_window in ("buy_item", "sell_item") and wtype in ("sell_overview", "buy_overview"):
-            self._burst_fast_scans = max(self._burst_fast_scans, 3)
-            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=2))
+            self._burst_fast_scans = max(self._burst_fast_scans, 8)  # Increased from 3 to 8
+            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=4.5))  # Increased from 2s to 4.5s
             # request immediate quick re-scans to catch late-rendering log lines
-            self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
+            self._request_immediate_rescan = max(self._request_immediate_rescan, 3)  # Increased from 2 to 3
             if self.debug:
-                log_debug(f"[BURST] Returned from {prev_window} to {wtype} -> scheduling {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans")
+                log_debug(f"[BURST] Returned from {prev_window} to {wtype} -> scheduling {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (extended for transaction capture)")
 
         # build structured entries
         structured = []
@@ -827,8 +828,8 @@ class MarketTracker:
         # dann gebe ihr den neuesten Timestamp aus diesem Scan, nicht einen alten aus dem Log.
         # Dies ist wichtig nach Collect-Buttons, wo die Transaction-Zeile mit einem alten Log-Timestamp
         # erscheint, aber tatsächlich gerade erst passiert ist.
-        # CRITICAL FIX: Wenn mehrere Transaktionen für dasselbe Item existieren, nur die mit dem
-        # NEUESTEN originalen Timestamp adjustieren (die anderen sind wirklich alt).
+        # CRITICAL FIX: Prüfe NICHT nur ob Item im Baseline ist, sondern ob die SPEZIFISCHE Transaktion
+        # (item/qty/price) bereits in der DB existiert. Das verhindert Duplikate von alten Log-Einträgen.
         if not first_snapshot_mode and overall_max_ts is not None and self.last_overview_text:
             try:
                 # Suche nach frischen Transaction/Purchased-Einträgen (nicht in letzter Baseline)
@@ -869,23 +870,53 @@ class MarketTracker:
                             key=lambda x: x[1].get('timestamp') if isinstance(x[1].get('timestamp'), datetime.datetime) else datetime.datetime.min,
                             reverse=True
                         )
-                        # Nur die neueste adjustieren
+                        # Nur die neueste adjustieren, ABER nur wenn sie noch nicht in DB ist!
                         idx, s = entries_sorted[0]
-                        if isinstance(s.get('timestamp'), datetime.datetime) and s['timestamp'] < overall_max_ts:
-                            if self.debug:
-                                old_ts = s['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                                new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                log_debug(f"fresh transaction detected for '{s['item']}' (newest of {len(entries)}): adjusting ts {old_ts} -> {new_ts}")
-                            s['timestamp'] = overall_max_ts
+                        # CRITICAL: Prüfe ob diese spezifische Transaktion bereits in DB existiert
+                        item_name = s.get('item', '')
+                        qty = s.get('qty', 0) or 0
+                        price = s.get('price', 0) or 0
+                        ts = s.get('timestamp')
+                        if item_name and qty > 0 and price > 0 and isinstance(ts, datetime.datetime):
+                            # Prüfe DB für diese exakte Transaktion (item/qty/price)
+                            # Wenn sie bereits existiert (egal mit welchem Timestamp), NICHT adjustieren!
+                            existing = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
+                            if existing:
+                                if self.debug:
+                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
+                                continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
+                            
+                            # Transaktion ist wirklich frisch, adjustiere Timestamp
+                            if ts < overall_max_ts:
+                                if self.debug:
+                                    old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+                                    new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
+                                    log_debug(f"fresh transaction detected for '{s['item']}' (newest of {len(entries)}): adjusting ts {old_ts} -> {new_ts}")
+                                s['timestamp'] = overall_max_ts
                     else:
                         # Nur eine Transaktion, normale Logik
                         idx, s = entries[0]
-                        if isinstance(s.get('timestamp'), datetime.datetime) and s['timestamp'] < overall_max_ts:
-                            if self.debug:
-                                old_ts = s['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                                new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                log_debug(f"fresh transaction detected for '{s['item']}': adjusting ts {old_ts} -> {new_ts}")
-                            s['timestamp'] = overall_max_ts
+                        # CRITICAL: Prüfe ob diese spezifische Transaktion bereits in DB existiert
+                        item_name = s.get('item', '')
+                        qty = s.get('qty', 0) or 0
+                        price = s.get('price', 0) or 0
+                        ts = s.get('timestamp')
+                        if item_name and qty > 0 and price > 0 and isinstance(ts, datetime.datetime):
+                            # Prüfe DB für diese exakte Transaktion (item/qty/price)
+                            # Wenn sie bereits existiert, NICHT adjustieren!
+                            existing = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
+                            if existing:
+                                if self.debug:
+                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
+                                continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
+                            
+                            # Transaktion ist wirklich frisch, adjustiere Timestamp
+                            if ts < overall_max_ts:
+                                if self.debug:
+                                    old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
+                                    new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
+                                    log_debug(f"fresh transaction detected for '{s['item']}': adjusting ts {old_ts} -> {new_ts}")
+                                s['timestamp'] = overall_max_ts
             except Exception as e:
                 if self.debug:
                     log_debug(f"fresh transaction detection error: {e}")
@@ -1519,12 +1550,51 @@ class MarketTracker:
             # Apply fallback price reconstruction using UI metrics when allowed and necessary
             try:
                 # UI-Fallback für fehlende/ungültige Preise (z.B. wenn Itemname zu lang und Preis abgeschnitten)
-                # Zusätzlich: Prüfe auf unrealistisch niedrige Preise bei hohen Mengen (OCR-Fehler mit fehlenden Ziffern)
+                # Prüfe auf unrealistische Preise mittels BDO Market API (min/max bounds)
                 needs_fallback = (price is None or price <= 0)
-                if not needs_fallback and quantity is not None and quantity >= 10 and price < 1_000_000:
-                    # Unrealistisch niedriger Preis bei hoher Menge → wahrscheinlich OCR-Fehler
-                    log_debug(f"[PRICE] Suspiciously low price {price} for qty={quantity} '{ent.get('item')}' - attempting UI fallback")
-                    needs_fallback = True
+                if not needs_fallback and quantity is not None and quantity > 0 and price:
+                    # Prüfe ob Preis plausibel ist gemäß BDO Market API min/max ranges
+                    try:
+                        plausibility = check_price_plausibility(item_name, quantity, price)
+                        if not plausibility.get('plausible', True):
+                            reason = plausibility.get('reason', 'unknown')
+                            expected_min = plausibility.get('expected_min')
+                            expected_max = plausibility.get('expected_max')
+                            
+                            # Wenn Preis deutlich außerhalb der erwarteten Range → UI-Fallback versuchen
+                            if reason in ('too_low', 'too_high'):
+                                if self.debug:
+                                    log_debug(f"[PRICE-IMPLAUSIBLE] '{item_name}' {quantity}x @ {price:,}: {reason} (expected: {expected_min:,} - {expected_max:,}) - attempting UI fallback")
+                                needs_fallback = True
+                    except Exception as e:
+                        # API-Check fehlgeschlagen, weiter mit geparsten Preis
+                        if self.debug:
+                            log_debug(f"[PRICE] API check failed for '{item_name}': {e}")
+                
+                # CRITICAL: Erkenne ABGESCHNITTENE Preise (lange Itemnamen)
+                # Beispiel: "Transaction of Very Long Item Name x100 worth 1,234,567..." 
+                # OCR sieht: price=1234567, aber echter Preis ist 1234567890
+                # Prüfe gegen UI-Metriken ob Unit-Preis plausibel ist
+                if not needs_fallback and price and quantity and quantity > 0 and wtype == 'buy_overview' and final_type == 'buy':
+                    item_lc_check = (ent.get('item') or '').lower()
+                    if item_lc_check in ui_buy:
+                        m = ui_buy[item_lc_check]
+                        orders = m.get('orders') or 0
+                        oc = m.get('ordersCompleted') or 0
+                        rem = m.get('remainingPrice') or 0
+                        denom = max(0, orders - oc)
+                        
+                        # Berechne erwarteten Unit-Preis aus UI
+                        if rem > 0 and denom > 0:
+                            expected_unit = rem / denom
+                            parsed_unit = price / quantity
+                            
+                            # Wenn geparster Unit-Preis viel kleiner ist als UI Unit-Preis → abgeschnitten!
+                            # Beispiel: parsed=12345 aber expected=12345678 → Faktor ~1000x
+                            if expected_unit > parsed_unit * 10:  # Mindestens 10x Unterschied
+                                if self.debug:
+                                    log_debug(f"[PRICE-TRUNCATED] Detected truncated price for '{item_name}': parsed={price:,} (unit={parsed_unit:.0f}) but UI suggests unit={expected_unit:.0f} - using UI fallback")
+                                needs_fallback = True
                 
                 # CRITICAL: Bei Relist-Cases muss die TRANSACTION-Menge verwendet werden, NICHT ordersCompleted!
                 # Beispiel: Placed 1000x, Withdrew 912x, Transaction 88x → UI zeigt ordersCompleted=1000

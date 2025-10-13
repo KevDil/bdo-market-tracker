@@ -51,12 +51,18 @@ def start_gui():
             return
         status_var.set("Running")
         _apply_region_from_entry()
+        # Log auto-track start in ocr_log.txt
+        from utils import log_debug
+        log_debug("[AUTO-TRACK] ▶️ STARTED - Auto-Track mode enabled")
         t = threading.Thread(target=tracker.auto_track, daemon=True)
         auto_thread["thread"] = t
         t.start()
         messagebox.showinfo("Info", "Auto-Tracking gestartet.")
 
     def stop_auto():
+        # Log auto-track stop in ocr_log.txt
+        from utils import log_debug
+        log_debug("[AUTO-TRACK] ⏸️ STOPPED - Auto-Track mode disabled")
         tracker.stop()
         status_var.set("Idle")
         messagebox.showinfo("Info", "Auto-Tracking gestoppt.")
