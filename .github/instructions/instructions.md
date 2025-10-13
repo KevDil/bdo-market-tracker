@@ -51,8 +51,7 @@ applyTo: '**'
     "⚠️ Keine Datenbankobjekte über Threads teilen (thread-safe connections via get_cursor()/get_connection()).",
     "⚠️ Immer Spiel-Zeitstempel verwenden, nie System-Zeit als Primärquelle. Timestamp-Cluster-Logik für korrekte Zuordnung.",
     "⚠️ Defensive Programmierung: try/except bei OCR, DB, GUI, Threading. Keine Annahmen über OCR-Qualität.",
-  "⚠️ IMMER als erstes die Dateien 'debug_proc.png', 'debug_orig.png' und 'ocr_log.txt' analysieren bei Problemen.",
-  "⚠️ Debug-Screenshots müssen bei jedem Scan mit aktivem Debug-Toggle persistiert werden (mindestens debug/debug_orig_<timestamp>.png und debug/debug_proc_<timestamp>.png, zusätzlich optional debug/debug_annotated_<timestamp>.png). Alte Dateien werden nicht überschrieben, sondern mit UTC-Timestamp (yyyyMMdd_HHmmss) abgelegt.",
+    "⚠️ IMMER als erstes die Dateien 'debug_proc.png', 'debug_orig.png' und 'ocr_log.txt' analysieren bei Problemen.",
     "⚠️ Preis-Fallback NUR bei aktiven Overview-Fenstern mit eindeutigen UI-Metriken und nur für Collect/Relist. Division-durch-Null strikt vermeiden.",
     "⚠️ Am Ende jeder Anfrage prüfen: Gab es Codeänderungen? → instructions.md updaten."
   ],
@@ -321,6 +320,11 @@ applyTo: '**'
  
   "recent_changes": [
     "=== MAJOR UPDATES (October 2025) ===",
+    "",
+    "✅ 2025-10-13 Auto-Track Delta Fix:",
+    "• Occurrence-Index nutzt jetzt den Text-Delta-Status, sodass neue Käufe/Verkäufe direkt im Overview gespeichert werden, ohne das Fenster zu wechseln",
+      "• UI-Inferenz ergänzt fehlende Kauf-Transaktionen: Orders/Collect-Delta erzeugt synthetische Saves, wenn die Log-Zeile durch OCR ausfällt",
+      "• UI-Inferenz ergänzt fehlende Verkaufs-Collects: Sales/Collect-Delta erzeugt synthetische Sell-Saves bei fehlenden Transaction-Zeilen",
     "",
     "✅ 2025-10-13 Regex-Optimierung Phase 1 Refresh:",
     "• parsing.py nutzt jetzt einen zentralen Regex-Pool (_DETAIL_PATTERNS, _BOUNDARY_PATTERNS) mit Helpern zur Segment-Grenzenbestimmung",

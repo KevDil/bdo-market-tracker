@@ -19,6 +19,8 @@ from config import (
     USE_ASYNC_PIPELINE,
     ASYNC_QUEUE_MAXSIZE,
     ASYNC_WORKER_COUNT,
+    MIN_ITEM_QUANTITY,
+    MAX_ITEM_QUANTITY,
 )
 from utils import (
     capture_region,
@@ -88,6 +90,32 @@ class MarketTracker:
             log_debug(f"[INIT] Loaded persistent baseline: {len(self.last_overview_text)} chars, preview: {self.last_overview_text[:100]}...")
         elif self.debug:
             log_debug("[INIT] No persistent baseline found - first run or after reset")
+
+        # Restore the latest UI metrics per tab (buy/sell) so UI-delta inference works across tab switches
+        def _load_ui_metrics(key: str) -> dict:
+            raw = load_state(key, default="{}")
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+                if isinstance(parsed, dict):
+                    # ensure nested dicts are copied and numeric fields are ints
+                    result = {}
+                    for item_key, metrics in parsed.items():
+                        if isinstance(metrics, dict):
+                            result[item_key] = {
+                                mk: int(mv) if isinstance(mv, (int, float)) and mv == int(mv) else mv
+                                for mk, mv in metrics.items()
+                            }
+                        else:
+                            result[item_key] = metrics
+                    return result
+            except Exception:
+                pass
+            return {}
+
+        self._last_ui_buy_metrics = _load_ui_metrics('last_ui_buy_metrics')
+        self._last_ui_sell_metrics = _load_ui_metrics('last_ui_sell_metrics')
         
         # Fenster-Historie: Liste von (timestamp, window_type)
         self.window_history = []  # keep last 5
@@ -418,6 +446,7 @@ class MarketTracker:
             if price is None or qty is None:
                 tx['occurrence_index'] = 0
                 return False
+
             existing = fetch_occurrence_indices(
                 tx.get('item_name'),
                 int(qty),
@@ -426,18 +455,23 @@ class MarketTracker:
                 tx.get('timestamp'),
             )
             slot = tx.get('occurrence_slot', 0) or 0
+            seen_in_prev = bool(tx.get('_seen_in_prev'))
+
             if existing:
-                if slot < len(existing):
+                if seen_in_prev and slot < len(existing):
                     tx['occurrence_index'] = existing[slot]
                     return True
+
                 ts_val = tx.get('timestamp')
                 if (
-                    isinstance(ts_val, datetime.datetime)
+                    seen_in_prev
+                    and isinstance(ts_val, datetime.datetime)
                     and isinstance(self.last_processed_game_ts, datetime.datetime)
                     and ts_val < self.last_processed_game_ts
                 ):
                     tx['occurrence_index'] = existing[-1]
                     return True
+
             tx['occurrence_index'] = self._assign_occurrence_index(tx, existing)
             return False
         except Exception:
@@ -1760,7 +1794,6 @@ class MarketTracker:
             
             # Quantity bounds check: MIN_ITEM_QUANTITY (1) bis MAX_ITEM_QUANTITY (5000)
             # Filtert unrealistische Werte (z.B. 0, negative, UI-Noise wie Collect-Amounts > 5000)
-            from config import MIN_ITEM_QUANTITY, MAX_ITEM_QUANTITY
             if quantity < MIN_ITEM_QUANTITY or quantity > MAX_ITEM_QUANTITY:
                 if self.debug:
                     log_debug(f"drop candidate: quantity {quantity} out of bounds [{MIN_ITEM_QUANTITY}, {MAX_ITEM_QUANTITY}] for item='{item_name}'")
@@ -1903,6 +1936,164 @@ class MarketTracker:
         if self.debug:
             log_debug(f"tx_candidates={len(tx_candidates)} allowed_ts={len(allowed_ts)}")
 
+        # Try to infer missing buy transactions directly from UI metrics when no log anchors were parsed.
+        prev_ui_buy = {}
+        if wtype == 'buy_overview':
+            if getattr(self, '_last_ui_buy_metrics', None):
+                try:
+                    prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
+                except Exception:
+                    prev_ui_buy = self._last_ui_buy_metrics.copy()
+            elif self.last_overview_text:
+                try:
+                    prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
+                except Exception:
+                    prev_ui_buy = {}
+        prev_ui_sell = {}
+        prev_ui_sell_norm = {}
+        if wtype == 'sell_overview':
+            if getattr(self, '_last_ui_sell_metrics', None):
+                try:
+                    prev_ui_sell = {k: dict(v) for k, v in self._last_ui_sell_metrics.items()}
+                except Exception:
+                    prev_ui_sell = self._last_ui_sell_metrics.copy()
+            elif self.last_overview_text:
+                try:
+                    prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
+                except Exception:
+                    prev_ui_sell = {}
+            if prev_ui_sell:
+                try:
+                    for k, v in prev_ui_sell.items():
+                        prev_ui_sell_norm[_norm_key(k)] = v
+                        nm_prev = (v.get('item') or '')
+                        if nm_prev:
+                            prev_ui_sell_norm[_norm_key(nm_prev)] = v
+                except Exception:
+                    prev_ui_sell_norm = {}
+        if (
+            wtype == 'buy_overview'
+            and ui_buy
+            and (self._baseline_initialized or prev_ui_buy)
+        ):
+            existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates}
+            for item_lc, metrics in ui_buy.items():
+                if item_lc in existing_items:
+                    continue
+                orders_completed = metrics.get('ordersCompleted') or 0
+                collect_amount = metrics.get('remainingPrice') or 0
+                if orders_completed <= 0 or collect_amount <= 0:
+                    continue
+                prev_metrics = prev_ui_buy.get(item_lc) if prev_ui_buy else None
+                prev_completed = prev_metrics.get('ordersCompleted') if prev_metrics else 0
+                prev_collect = prev_metrics.get('remainingPrice') if prev_metrics else 0
+                delta_qty = orders_completed - (prev_completed or 0)
+                delta_price = collect_amount - (prev_collect or 0)
+                if delta_qty <= 0 or delta_price <= 0:
+                    continue
+                if delta_qty < MIN_ITEM_QUANTITY or delta_qty > MAX_ITEM_QUANTITY:
+                    continue
+                unit_candidate = delta_price // delta_qty if delta_qty else 0
+                if unit_candidate <= 0:
+                    continue
+                raw_name = metrics.get('item') or item_lc
+                corrected_name = correct_item_name(raw_name) or raw_name
+                try:
+                    ts_for_ui = overall_max_ts if isinstance(overall_max_ts, datetime.datetime) else datetime.datetime.now()
+                except Exception:
+                    ts_for_ui = datetime.datetime.now()
+                synthetic_tx = {
+                    'item_name': corrected_name,
+                    'quantity': delta_qty,
+                    'price': int(delta_price),
+                    'timestamp': ts_for_ui,
+                    'transaction_type': 'buy',
+                    'case': 'collect_ui_inferred',
+                    'raw_related': [
+                        {
+                            'type': 'ui_orders',
+                            'item': corrected_name,
+                            'qty': orders_completed,
+                            'price': collect_amount,
+                            'ts_text': ts_for_ui.strftime('%Y-%m-%d %H:%M') if isinstance(ts_for_ui, datetime.datetime) else str(ts_for_ui),
+                        }
+                    ],
+                    'occurrence_index': None,
+                    'occurrence_slot': 0,
+                    '_ui_inferred': True,
+                }
+                tx_candidates.append(synthetic_tx)
+                existing_items.add(item_lc)
+                existing_items.add((corrected_name or '').lower())
+                if self.debug:
+                    log_debug(
+                        f"[UI-INFER] Added synthetic buy for '{corrected_name}' qty={delta_qty} price={delta_price} "
+                        f"(ordersCompleted Δ{delta_qty}, collect Δ{delta_price})"
+                    )
+
+        if (
+            wtype == 'sell_overview'
+            and ui_sell
+            and (prev_ui_sell or self._last_ui_sell_metrics)
+        ):
+            existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates if t.get('item_name')}
+            existing_norm = { _norm_key(t.get('item_name')) for t in tx_candidates if t.get('item_name') }
+            for item_lc, metrics in ui_sell.items():
+                metrics_item = metrics.get('item') or item_lc
+                norm_key = _norm_key(metrics_item)
+                if item_lc in existing_items or norm_key in existing_norm:
+                    continue
+                prev_metrics = prev_ui_sell.get(item_lc) if prev_ui_sell else None
+                if not prev_metrics and prev_ui_sell_norm:
+                    prev_metrics = prev_ui_sell_norm.get(norm_key)
+                if not prev_metrics:
+                    continue
+                sales_completed = metrics.get('salesCompleted') or 0
+                collect_total = metrics.get('price') or 0
+                prev_sales = prev_metrics.get('salesCompleted') or 0
+                prev_collect = prev_metrics.get('price') or 0
+                delta_qty = sales_completed - prev_sales
+                delta_collect = collect_total - prev_collect
+                if delta_qty <= 0 or delta_collect <= 0:
+                    continue
+                if delta_qty < MIN_ITEM_QUANTITY or delta_qty > MAX_ITEM_QUANTITY:
+                    continue
+                corrected_name = correct_item_name(metrics_item) or metrics_item
+                if not self._valid_item_name(corrected_name):
+                    continue
+                try:
+                    ts_for_ui = overall_max_ts if isinstance(overall_max_ts, datetime.datetime) else datetime.datetime.now()
+                except Exception:
+                    ts_for_ui = datetime.datetime.now()
+                synthetic_sell = {
+                    'item_name': corrected_name,
+                    'quantity': int(delta_qty),
+                    'price': int(delta_collect),
+                    'timestamp': ts_for_ui,
+                    'transaction_type': 'sell',
+                    'case': 'sell_collect_ui_inferred',
+                    'raw_related': [
+                        {
+                            'type': 'ui_sales',
+                            'item': corrected_name,
+                            'qty': sales_completed,
+                            'price': collect_total,
+                            'ts_text': ts_for_ui.strftime('%Y-%m-%d %H:%M') if isinstance(ts_for_ui, datetime.datetime) else str(ts_for_ui),
+                        }
+                    ],
+                    'occurrence_index': None,
+                    'occurrence_slot': 0,
+                    '_ui_inferred': True,
+                }
+                tx_candidates.append(synthetic_sell)
+                existing_items.add(corrected_name.lower())
+                existing_norm.add(_norm_key(corrected_name))
+                if self.debug:
+                    log_debug(
+                        f"[UI-INFER] Added synthetic sell for '{corrected_name}' qty={delta_qty} price={delta_collect} "
+                        f"(salesCompleted Δ{delta_qty}, collect Δ{delta_collect})"
+                    )
+
         # Post-process candidates after a dialog return: adjust timestamps to latest snapshot
         # and keep only items that actually had a purchase/transaction anchor in this scan.
         if 'returning_from_item' in locals() and returning_from_item and wtype == 'buy_overview' and tx_candidates:
@@ -2016,8 +2207,8 @@ class MarketTracker:
                     continue
                 if scan_restrict_min and tx['timestamp'] < scan_restrict_min:
                     continue
-            occurrence_reused = self._resolve_occurrence_index(tx)
-            # create signature from the main transaction's raw text (take first related raw which has 'transaction' type)
+
+            # prepare signature & baseline comparison before assigning occurrence index
             main_raw = None
             main_ts_text = None
             for r in tx['raw_related']:
@@ -2028,9 +2219,18 @@ class MarketTracker:
             if main_raw is None:
                 # fallback: use item+timestamp
                 main_raw = f"{tx['item_name']} {tx['quantity']} {tx['price']}"
-                main_ts_text = tx['timestamp'].strftime("%Y-%m-%d %H:%M")
+                if isinstance(tx['timestamp'], datetime.datetime):
+                    main_ts_text = tx['timestamp'].strftime("%Y-%m-%d %H:%M")
+                else:
+                    main_ts_text = str(tx['timestamp'])
             normalized_main = re.sub(r'\s+', ' ', main_raw).strip()[:180]
             key = (main_ts_text, normalized_main)
+            already_seen_in_prev = (key in prev_entries) or (normalized_main in prev_snippets)
+            tx['_main_ts_text'] = main_ts_text
+            tx['_normalized_main'] = normalized_main
+            tx['_seen_in_prev'] = already_seen_in_prev
+
+            occurrence_reused = self._resolve_occurrence_index(tx)
 
             # robust delta: always allow if tx timestamp is newer than any in previous snapshot
             is_newer_than_prev = False
@@ -2065,8 +2265,6 @@ class MarketTracker:
                     already_in_db_any_side = False
             
             # Check baseline text (less strict - only for additional filtering)
-            already_seen_in_prev = (key in prev_entries) or (normalized_main in prev_snippets)
-            
             if self.debug:
                 log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}")
             
@@ -2222,22 +2420,28 @@ class MarketTracker:
                 self.last_processed_game_ts = max_saved
             if self.debug:
                 log_debug(f"updated baseline last_processed_game_ts={self.last_processed_game_ts}")
-            # After successful saves, if we're on sell_overview and UI blocks indicate active Collect/Relist rows,
-            # trigger a short burst to catch late-rendering transaction lines (e.g., an immediate follow-up sale).
-            if wtype == 'sell_overview':
+            # After successful saves, keep scanning aggressively for any delayed UI rows.
+            if wtype in ('buy_overview', 'sell_overview'):
                 try:
                     s_norm = re.sub(r"\s+", " ", full_text)
+                    has_orders = re.search(r"orders\s+completed", s_norm, re.IGNORECASE) is not None
                     has_items_listed = re.search(r"items\s+listed", s_norm, re.IGNORECASE) is not None
-                    has_sales_completed = re.search(r"sales\s+completed", s_norm, re.IGNORECASE) is not None
                     has_collect = re.search(r"\bcollect\b|\bre-?list\b", s_norm, re.IGNORECASE) is not None
-                    if (has_items_listed or has_sales_completed) and has_collect:
+                    should_burst = False
+                    if wtype == 'buy_overview':
+                        should_burst = has_orders and has_collect
+                    else:
+                        has_sales_completed = re.search(r"sales\s+completed", s_norm, re.IGNORECASE) is not None
+                        should_burst = (has_items_listed or has_sales_completed or has_orders) and has_collect
+                    if should_burst:
                         now2 = datetime.datetime.now()
                         if not self._burst_until or now2 >= self._burst_until:
-                            self._burst_until = now2 + datetime.timedelta(seconds=2.5)
-                            self._burst_fast_scans = max(self._burst_fast_scans, 4)
-                            self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
-                            if self.debug:
-                                log_debug("post-save: sell_overview UI blocks present -> scheduling short burst re-scans")
+                            burst_seconds = 3.0 if wtype == 'buy_overview' else 2.5
+                            self._burst_until = now2 + datetime.timedelta(seconds=burst_seconds)
+                        self._burst_fast_scans = max(self._burst_fast_scans, 6 if wtype == 'buy_overview' else 4)
+                        self._request_immediate_rescan = max(self._request_immediate_rescan, 3 if wtype == 'buy_overview' else 2)
+                        if self.debug:
+                            log_debug(f"post-save: {wtype} UI blocks present -> scheduling follow-up burst re-scans")
                 except Exception:
                     pass
         else:
@@ -2293,6 +2497,26 @@ class MarketTracker:
                 log_debug(f"[BASELINE] Updated & persisted: {old_len} → {new_len} chars, saved {len(saved_any_ts)} transactions")
         elif self.debug:
             log_debug(f"[BASELINE] NOT updated (no transactions saved)")
+
+        # Persist latest UI metrics per tab so inference can compute deltas on the next scan (even across tab switches)
+        if wtype == 'buy_overview':
+            try:
+                self._last_ui_buy_metrics = {k: dict(v) for k, v in ui_buy.items()}
+            except Exception:
+                self._last_ui_buy_metrics = ui_buy.copy() if isinstance(ui_buy, dict) else {}
+            try:
+                save_state('last_ui_buy_metrics', json.dumps(self._last_ui_buy_metrics))
+            except Exception:
+                pass
+        elif wtype == 'sell_overview':
+            try:
+                self._last_ui_sell_metrics = {k: dict(v) for k, v in ui_sell.items()}
+            except Exception:
+                self._last_ui_sell_metrics = ui_sell.copy() if isinstance(ui_sell, dict) else {}
+            try:
+                save_state('last_ui_sell_metrics', json.dumps(self._last_ui_sell_metrics))
+            except Exception:
+                pass
 
         self._persist_occurrence_state_if_needed()
 
