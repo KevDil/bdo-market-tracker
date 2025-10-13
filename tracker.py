@@ -280,9 +280,11 @@ class MarketTracker:
             s = re.sub(r"\s+", " ", full_text)
             # Versuche Blöcke wie: "<ItemName> Orders 1000 / Orders Completed : 61 Collect 12,113,100 Re-list"
             # oder: "<ItemName> Orders   98873 Orders Completed 3581 ... Collect 123,456 Re-list"
+            # oder: "Lion Blood Orders 5000 Orders Completed : 263 Collect 70,581,300 Re-list"
             # Accept OCR variants: 'Re-list' or 'Relist'; 'Collect' misspellings like 'Collece'
+            # FIXED: Simplified pattern to be more robust
             pattern = re.compile(
-                r"([A-Za-z\[\]0-9' :\-\(\)]{4,}?)\s+Orders\s*:?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*:?[\s]*([0-9,\.]+)[\s\S]{0,160}?Coll(?:ec|ect|ece)\b\s*([0-9,\.]+)\s+[Rr]e-?list",
+                r"([A-Za-z\[\]0-9' :\-\(\)]{4,})\s+Orders\s*:?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*:?\s*([0-9,\.]+)[\s\S]{0,160}?Coll\w*\s*([0-9,\.]+)\s+[Rr]e-?list",
                 re.IGNORECASE,
             )
             for m in pattern.finditer(s):
@@ -967,8 +969,11 @@ class MarketTracker:
                 log_debug("structured: " + ln)
 
         # Parse UI metrics from the overview to support fallback price reconstruction
-        ui_buy = self._extract_buy_ui_metrics(full_text) if wtype == 'buy_overview' else {}
-        ui_sell = self._extract_sell_ui_metrics(full_text) if wtype == 'sell_overview' else {}
+        # CRITICAL: Always try to extract both buy AND sell metrics, regardless of window type
+        # This handles fast window switches where buy events appear on sell_overview (or vice versa)
+        # The extract functions are safe and return {} if no metrics found
+        ui_buy = self._extract_buy_ui_metrics(full_text)  # Always extract, not just on buy_overview
+        ui_sell = self._extract_sell_ui_metrics(full_text)  # Always extract, not just on sell_overview
         # Build normalized lookup (remove non-alphanumerics) to be robust to apostrophes/hyphens in names
         def _norm_key(s: str) -> str:
             try:
@@ -1683,15 +1688,31 @@ class MarketTracker:
                             ent['timestamp'] = overall_max_ts
                 except Exception:
                     pass
-            # On buy_overview, avoid saving buy-side relist entries unless a purchased/transaction anchor exists for this item in the same snapshot
-            # EXCEPTION: On first_snapshot_mode, allow historical placed-only events (no transaction needed)
-            if wtype == 'buy_overview' and final_type == 'buy' and not first_snapshot_mode:
+            # Handle buy events: require anchor (purchased/transaction) unless there's UI evidence or first snapshot
+            # EXCEPTION 1: On first_snapshot_mode, allow historical placed-only events (no transaction needed)
+            # EXCEPTION 2: If UI metrics show ordersCompleted > 0, allow it even without anchor
+            #              This handles fast window switches where placed event is visible but transaction already scrolled off
+            # IMPORTANT: Apply this check for buy events regardless of window type (buy_overview OR sell_overview)
+            #            because fast tab switches can cause buy events to appear on sell_overview
+            if final_type == 'buy' and not first_snapshot_mode and wtype in ('buy_overview', 'sell_overview'):
                 anchor_item_lc = (ent['item'] or '').lower()
                 def same_item2(r):
                     return (r.get('item') or '').lower() == anchor_item_lc if anchor_item_lc else False
                 has_buy_anchor_same = any(r['type'] in ('purchased', 'transaction') and same_item2(r) for r in related) or ent['type'] in ('purchased', 'transaction')
-                # allow inferred anchors from placed-withdrew logic
-                if not has_buy_anchor_same and not ent.get('_inferred_buy_anchor'):
+                
+                # Check if UI metrics show completed orders for this item
+                # Look in ui_buy even if wtype is sell_overview (fast window switch scenario)
+                has_ui_evidence = False
+                ui_metrics_source = ui_buy if ui_buy else {}
+                if anchor_item_lc in ui_metrics_source:
+                    oc = ui_metrics_source[anchor_item_lc].get('ordersCompleted', 0) or 0
+                    if oc > 0:
+                        has_ui_evidence = True
+                        if self.debug:
+                            log_debug(f"[UI-EVIDENCE] Item '{ent['item']}' has ordersCompleted={oc} - allowing without transaction anchor (wtype={wtype})")
+                
+                # allow inferred anchors from placed-withdrew logic OR UI evidence
+                if not has_buy_anchor_same and not ent.get('_inferred_buy_anchor') and not has_ui_evidence:
                     if self.debug:
                         log_debug(f"skip buy relist without purchase anchor for item='{ent['item']}' on buy_overview")
                     continue
@@ -1842,9 +1863,21 @@ class MarketTracker:
             # Default: only items that are true buy anchors for this snapshot (purchased or transaction+placed/withdrew).
             # Exception: allow explicit SELL clusters (transaction+listed of same item) even on buy_overview,
             # especially on the first overview snapshot to import visible older sell lines.
+            # ALSO: Allow if UI metrics show ordersCompleted > 0 (handled by earlier check at line 1695)
             if final_type == 'buy':
                 has_buy_anchor = any(r['type'] in ('purchased', 'transaction') for r in related)
-                if not has_buy_anchor and ent.get('type') != 'purchased':
+                
+                # Check UI evidence again (same logic as earlier check)
+                has_ui_evidence_final = False
+                if not has_buy_anchor:
+                    anchor_item_lc_final = (item_name or '').lower()
+                    ui_metrics_final = ui_buy if ui_buy else {}
+                    if anchor_item_lc_final in ui_metrics_final:
+                        oc_final = ui_metrics_final[anchor_item_lc_final].get('ordersCompleted', 0) or 0
+                        if oc_final > 0:
+                            has_ui_evidence_final = True
+                
+                if not has_buy_anchor and ent.get('type') != 'purchased' and not has_ui_evidence_final:
                     if self.debug:
                         log_debug(f"skip buy without purchase/transaction anchor for item='{item_name}' on {wtype}")
                     continue

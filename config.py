@@ -111,6 +111,11 @@ GPU_LOW_PRIORITY = True
 reader = None
 if USE_EASYOCR:
     cpu_retry = False
+    
+    # Try to free up memory before initialization
+    import gc
+    gc.collect()
+    
     try:
         # Initialisiere EasyOCR mit optimierten Settings
         # Versuche erst GPU, fallback auf CPU
@@ -122,7 +127,10 @@ if USE_EASYOCR:
                 import torch
                 gpu_available = torch.cuda.is_available()
                 if gpu_available:
-                    print(f"✅ GPU detected: {torch.cuda.get_device_name(0)}")
+                    try:
+                        print(f"[GPU] Detected: {torch.cuda.get_device_name(0)}")
+                    except UnicodeEncodeError:
+                        print(f"GPU detected: {torch.cuda.get_device_name(0)}")
                     
                     # GPU-Memory-Limit setzen (verhindert VRAM-Konkurrenz mit Spiel)
                     if GPU_MEMORY_LIMIT:
@@ -130,44 +138,89 @@ if USE_EASYOCR:
                             total_mem = torch.cuda.get_device_properties(0).total_memory
                             fraction = min(1.0, max(0.0, (GPU_MEMORY_LIMIT * 1024 * 1024) / float(total_mem)))
                             torch.cuda.set_per_process_memory_fraction(fraction, device=0)
-                            print(f"   GPU Memory Limit: {GPU_MEMORY_LIMIT} MB")
+                            try:
+                                print(f"   GPU Memory Limit: {GPU_MEMORY_LIMIT} MB")
+                            except UnicodeEncodeError:
+                                print(f"GPU Memory Limit: {GPU_MEMORY_LIMIT} MB")
                         except Exception as mem_err:
-                            print(f"   ⚠️ Could not set memory limit: {mem_err}")
+                            try:
+                                print(f"   [WARNING] Could not set memory limit: {mem_err}")
+                            except UnicodeEncodeError:
+                                print(f"Could not set memory limit: {mem_err}")
                     
                     # Low-Priority Mode für OCR (Spiel hat Vorrang)
                     if GPU_LOW_PRIORITY:
                         try:
                             torch.cuda.set_stream(torch.cuda.Stream(priority=-1))
-                            print(f"   GPU Priority: Low (game has priority)")
+                            try:
+                                print(f"   GPU Priority: Low (game has priority)")
+                            except UnicodeEncodeError:
+                                print(f"GPU Priority: Low (game has priority)")
                         except Exception as prio_err:
-                            print(f"   ⚠️ Could not set priority: {prio_err}")
+                            try:
+                                print(f"   [WARNING] Could not set priority: {prio_err}")
+                            except UnicodeEncodeError:
+                                print(f"Could not set priority: {prio_err}")
                     
                 else:
-                    print("⚠️ GPU requested but CUDA not available, falling back to CPU")
+                    try:
+                        print("[WARNING] GPU requested but CUDA not available, falling back to CPU")
+                    except UnicodeEncodeError:
+                        print("GPU requested but CUDA not available, falling back to CPU")
             except Exception:
-                print("⚠️ PyTorch/CUDA not found, falling back to CPU")
+                try:
+                    print("[WARNING] PyTorch/CUDA not found, falling back to CPU")
+                except UnicodeEncodeError:
+                    print("PyTorch/CUDA not found, falling back to CPU")
                 gpu_available = False
         
+        # Use download_enabled=False to avoid network issues during init
+        # Use model_storage_directory to cache models
         reader = easyocr.Reader(
             ['en'], 
             gpu=gpu_available,
             verbose=False,
             quantize=not gpu_available,  # Quantize nur bei CPU (GPU braucht es nicht)
-            cudnn_benchmark=gpu_available  # cuDNN-Optimierung bei GPU
+            cudnn_benchmark=gpu_available,  # cuDNN-Optimierung bei GPU
+            download_enabled=True,  # Allow model downloads if needed
+            detector=True,
+            recognizer=True
         )
         
         mode = "GPU" if gpu_available else "CPU"
-        print(f"✅ EasyOCR initialized ({mode} mode)")
+        try:
+            print(f"[OK] EasyOCR initialized ({mode} mode)")
+        except UnicodeEncodeError:
+            print(f"EasyOCR initialized ({mode} mode)")
         
     except Exception as e:
         attempted_mode = "GPU" if USE_GPU else "CPU"
-        print(f"❌ EasyOCR init error ({attempted_mode} mode): {e}")
+        error_msg = str(e)
+        try:
+            print(f"[ERROR] EasyOCR init error ({attempted_mode} mode): {error_msg}")
+        except UnicodeEncodeError:
+            print(f"EasyOCR init error ({attempted_mode} mode): {error_msg}")
+        
+        # Check if it's a memory error
+        is_memory_error = 'not enough memory' in error_msg.lower() or 'out of memory' in error_msg.lower()
+        
         reader = None
-        if USE_GPU:
+        if USE_GPU and not is_memory_error:
+            # Only retry without GPU if it's not a general memory issue
             cpu_retry = True
             USE_GPU = False
             gpu_available = False
-            print("⚠️ Retrying EasyOCR initialization without GPU ...")
+            try:
+                print("[WARNING] Retrying EasyOCR initialization without GPU ...")
+            except UnicodeEncodeError:
+                print("Retrying EasyOCR initialization without GPU ...")
+        elif is_memory_error:
+            try:
+                print("[WARNING] Memory error detected - EasyOCR initialization skipped")
+                print("[WARNING] Falling back to Tesseract-only mode")
+            except UnicodeEncodeError:
+                print("Memory error detected - using Tesseract only")
+            cpu_retry = False  # Don't retry if memory is the issue
     
     if reader is None and cpu_retry:
         try:
@@ -182,9 +235,15 @@ if USE_EASYOCR:
                 quantize=True,
                 cudnn_benchmark=False
             )
-            print("✅ EasyOCR initialized (CPU fallback)")
+            try:
+                print("[OK] EasyOCR initialized (CPU fallback)")
+            except UnicodeEncodeError:
+                print("EasyOCR initialized (CPU fallback)")
         except Exception as cpu_err:
-            print(f"❌ EasyOCR CPU fallback error: {cpu_err}")
+            try:
+                print(f"[ERROR] EasyOCR CPU fallback error: {cpu_err}")
+            except UnicodeEncodeError:
+                print(f"EasyOCR CPU fallback error: {cpu_err}")
             reader = None
 
 LETTER_TO_DIGIT = {'O':'0','o':'0','D':'0','Q':'0','I':'1','l':'1','|':'1','i':'1',

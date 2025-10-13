@@ -13,6 +13,15 @@ import sys
 sys.path.insert(0, 'c:/Users/kdill/Desktop/market_tracker')
 
 from tracker import MarketTracker
+from database import get_cursor, get_connection
+import datetime
+
+def reset_db():
+    """Reset DB for clean test"""
+    cur = get_cursor()
+    cur.execute("DELETE FROM transactions WHERE item_name IN ('Lion Blood', 'Grim Reaper''s Elixir')")
+    cur.execute("DELETE FROM tracker_state")
+    get_connection().commit()
 
 def test_fast_action_timing():
     """Test mixed context detection and single placed inference."""
@@ -36,29 +45,40 @@ def test_fast_action_timing():
         "Grim Reaper's Elixir Orders 2000 Orders Completed : 128 Collect 391,248,000 Re-list"
     )
     
+    # Reset DB before test to avoid old data
+    reset_db()
+    
     mt = MarketTracker(debug=True)
     mt.process_ocr_text(text)
     
+    # Expected timestamp from OCR text: 2025.10.12 01.31
+    expected_timestamp = datetime.datetime(2025, 10, 12, 1, 31, 0)
+    
     # Check if both transactions were saved
-    from database import get_cursor
     cur = get_cursor()
     
     # Check Lion Blood (should be inferred from placed + UI metrics)
+    # Look for entries around the expected timestamp (within 1 hour window)
+    time_window_start = (expected_timestamp - datetime.timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+    time_window_end = (expected_timestamp + datetime.timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+    
     cur.execute("""
-        SELECT item_name, quantity, price, transaction_type, tx_case 
+        SELECT item_name, quantity, price, transaction_type, tx_case, timestamp
         FROM transactions 
-        WHERE item_name LIKE '%Lion Blood%' 
+        WHERE item_name = 'Lion Blood'
+        AND timestamp BETWEEN ? AND ?
         ORDER BY timestamp DESC LIMIT 1
-    """)
+    """, (time_window_start, time_window_end))
     lion = cur.fetchone()
     
     # Check Grim Reaper's Elixir (should have full context)
     cur.execute("""
-        SELECT item_name, quantity, price, transaction_type, tx_case 
+        SELECT item_name, quantity, price, transaction_type, tx_case, timestamp
         FROM transactions 
-        WHERE item_name LIKE '%Grim Reaper%Elixir%' 
+        WHERE item_name = 'Grim Reaper''s Elixir'
+        AND timestamp BETWEEN ? AND ?
         ORDER BY timestamp DESC LIMIT 1
-    """)
+    """, (time_window_start, time_window_end))
     grim = cur.fetchone()
     
     print("\n" + "="*60)
