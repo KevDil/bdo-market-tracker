@@ -224,6 +224,11 @@ def extract_details_from_entry(ts_text, entry_text):
     item, qty, price
     timestamp: parsed datetime (from ts_text or nearest in entry)
     """
+    # OCR robustness: Fix common OCR errors in Silver keyword before processing
+    # 'Silve_' (missing 'r'), 'Silve ' (trailing space after 'e')
+    # Match 'Silve' followed by non-letter characters (space, underscore, etc.)
+    entry_text = re.sub(r'\bSilve[_\s]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
+    
     low = entry_text.lower()
     typ = "other"
     # classify line type conservatively using shared, pre-compiled patterns
@@ -403,11 +408,13 @@ def extract_details_from_entry(ts_text, entry_text):
         # For transaction lines, prefer 'worth <N> Silver' (net amount)
         if typ == "transaction":
             # allow OCR variants of 'silver' such as 's1lver', 'si1ver', 'siluer'
+            # CRITICAL: Use lowercase 'i' not uppercase 'I' for matching lowercase 'i' in 'Silver'
             silver_pat = r's\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]'
             silver_sep = r'(?:\s|[^A-Za-z0-9]{1,3})*'
             # strict 'worth <N> Silver' first (allow small punctuation between number and Silver)
             # detect if a leading digit may be missing (e.g., "worth ,809,990,000 Silver")
             # CRITICAL: Allow spaces within the numeric string to handle OCR errors like "585, 585, OO0" (spaces after commas)
+            # IMPORTANT: Added capital 'O' to pattern to match 'OO0' in OCR errors
             m_worth_missing = re.search(fr'worth\s+([^0-9]{{0,2}})[\s]*([0-9OolI\|,\.\s]+){silver_sep}{silver_pat}', entry_text, re.IGNORECASE)
             m_worth = re.search(fr'worth\s+([0-9OolI\|,\.\s]{{3,}}?){silver_sep}{silver_pat}', entry_text, re.IGNORECASE)
             if m_worth:

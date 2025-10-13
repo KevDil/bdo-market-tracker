@@ -56,6 +56,14 @@ from parsing import (
 )
 
 # -----------------------
+# Performance: Precompiled Regex Patterns
+# -----------------------
+# These patterns are used frequently in baseline checking and should be precompiled
+_WHITESPACE_PATTERN = re.compile(r'\s+')
+_COMMA_PATTERN = re.compile(r',')
+_TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{price}"
+
+# -----------------------
 # Entscheidungslogik: Fälle erkennen & speichern
 # -----------------------
 class MarketTracker:
@@ -285,7 +293,8 @@ class MarketTracker:
         """
         metrics = {}
         try:
-            s = re.sub(r"\s+", " ", full_text)
+            # PERFORMANCE: Use precompiled whitespace pattern
+            s = _WHITESPACE_PATTERN.sub(' ', full_text)
             # CRITICAL FIX: Two-pass approach to capture full item names
             # Pass 1: Find all "Orders ... Orders Completed ... Collect ... Re-list" blocks
             # Pass 2: Extract item name by looking backwards from "Orders" keyword
@@ -349,7 +358,8 @@ class MarketTracker:
         """
         metrics = {}
         try:
-            s = re.sub(r"\s+", " ", full_text)
+            # PERFORMANCE: Use precompiled whitespace pattern
+            s = _WHITESPACE_PATTERN.sub(' ', full_text)
             # Beispiele: "<ItemName> Registration Count : 200 / Sales Completed 200 ... 3,000,000 Collect Re-list"
             # oder: "<ItemName> Sales Completed: 5 ... 1,234,567 Collect Re-list"
             # Try two patterns:
@@ -616,10 +626,11 @@ class MarketTracker:
             
             if raw_text:
                 # Normalize: lowercase, remove extra spaces
-                normalized = re.sub(r'\s+', ' ', raw_text.lower()).strip()
+                # PERFORMANCE: Use precompiled whitespace pattern
+                normalized = _WHITESPACE_PATTERN.sub(' ', raw_text.lower()).strip()
                 # Remove all numbers but keep text structure
                 normalized = re.sub(r'\d+[,\.\d]*', 'N', normalized)
-                normalized = re.sub(r'\s+', ' ', normalized).strip()
+                normalized = _WHITESPACE_PATTERN.sub(' ', normalized).strip()
                 # Add context (timestamp) to make hash unique for each position
                 hash_input = f"{context_before}|{normalized}"
             else:
@@ -892,8 +903,13 @@ class MarketTracker:
             buy_anchor_items = set()
             try:
                 for (it_lc, ts_key), tset in items_ts_types.items():
-                    if ('purchased' in tset) or ('transaction' in tset and (('placed' in tset) or ('withdrew' in tset))):
-                        buy_anchor_items.add(it_lc)
+                    # CRITICAL FIX: Only classify as buy anchor if it's NOT a sell cluster
+                    # Sell cluster = transaction + listed (clear sell pattern)
+                    # Buy anchor = purchased OR (transaction + placed/withdrew WITHOUT listed)
+                    is_sell_cluster = ('transaction' in tset and 'listed' in tset)
+                    if not is_sell_cluster:
+                        if ('purchased' in tset) or ('transaction' in tset and (('placed' in tset) or ('withdrew' in tset))):
+                            buy_anchor_items.add(it_lc)
             except Exception:
                 buy_anchor_items = set()
             if overall_max_ts is not None and buy_anchor_items:
@@ -1055,11 +1071,15 @@ class MarketTracker:
                         ts = s.get('timestamp')
                         if item_name and qty > 0 and price > 0 and isinstance(ts, datetime.datetime):
                             # Prüfe DB für diese exakte Transaktion (item/qty/price)
+                            # CRITICAL FIX: Check BOTH buy AND sell to catch sell items on buy_overview
                             # Wenn sie bereits existiert (egal mit welchem Timestamp), NICHT adjustieren!
-                            existing = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
-                            if existing:
+                            existing_buy = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
+                            existing_sell = find_existing_tx_by_values(item_name, qty, int(price), 'sell', None, None)
+                            if existing_buy or existing_sell:
+                                existing = existing_buy or existing_sell
                                 if self.debug:
-                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
+                                    tx_type = 'buy' if existing_buy else 'sell'
+                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB as {tx_type} (ID={existing[0]}) - skipping timestamp adjustment")
                                 continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
                             
                             # CRITICAL FIX: Only adjust if timestamp is RECENT (within FRESH_TX_WINDOW)
@@ -1084,11 +1104,14 @@ class MarketTracker:
                         ts = s.get('timestamp')
                         if item_name and qty > 0 and price > 0 and isinstance(ts, datetime.datetime):
                             # Prüfe DB für diese exakte Transaktion (item/qty/price)
-                            # Wenn sie bereits existiert, NICHT adjustieren!
-                            existing = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
-                            if existing:
+                            # CRITICAL FIX: Check BOTH buy AND sell to catch sell items on buy_overview
+                            existing_buy = find_existing_tx_by_values(item_name, qty, int(price), 'buy', None, None)
+                            existing_sell = find_existing_tx_by_values(item_name, qty, int(price), 'sell', None, None)
+                            if existing_buy or existing_sell:
+                                existing = existing_buy or existing_sell
                                 if self.debug:
-                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
+                                    tx_type = 'buy' if existing_buy else 'sell'
+                                    log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB as {tx_type} (ID={existing[0]}) - skipping timestamp adjustment")
                                 continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
                             
                             # CRITICAL FIX: Only adjust if timestamp is RECENT (within FRESH_TX_WINDOW)
@@ -1628,12 +1651,14 @@ class MarketTracker:
             price = ent['price'] or None
             if final_type == 'sell':
                 # Try to override with a related transaction's values
-                tx_rel = transaction_entry if transaction_entry and (transaction_entry.get('qty') or transaction_entry.get('price')) else None
+                # CRITICAL: Prioritize transaction price even if qty is None (price is more reliable in merged OCR text)
+                tx_rel = transaction_entry if transaction_entry else None
                 if tx_rel is None:
-                    tx_rel = next((r for r in related if r['type'] == 'transaction' and (r.get('qty') or r.get('price'))), None)
+                    tx_rel = next((r for r in related if r['type'] == 'transaction'), None)
                 if tx_rel is not None:
                     if tx_rel.get('qty'):
                         quantity = tx_rel['qty']
+                    # CRITICAL FIX: Always use transaction price if available (even when qty is None)
                     if tx_rel.get('price'):
                         price = tx_rel['price']
                 
@@ -1690,10 +1715,11 @@ class MarketTracker:
                         pass
             elif final_type == 'buy':
                 # Prefer 'purchased' values; if both purchased and transaction exist for same item/ts and differ, we will save both entries.
-                pur_rel = next((r for r in related if r['type'] == 'purchased' and (r.get('qty') or r.get('price'))), None)
-                tx_rel_same = transaction_entry if transaction_entry and (transaction_entry.get('qty') or transaction_entry.get('price')) else None
+                # CRITICAL: Don't require qty/price to select entries - we want transaction price even if qty is None
+                pur_rel = next((r for r in related if r['type'] == 'purchased'), None)
+                tx_rel_same = transaction_entry if transaction_entry else None
                 if tx_rel_same is None:
-                    tx_rel_same = next((r for r in related if r['type'] == 'transaction' and (r.get('qty') or r.get('price'))), None)
+                    tx_rel_same = next((r for r in related if r['type'] == 'transaction'), None)
                 if pur_rel is not None:
                     if pur_rel.get('qty'):
                         quantity = pur_rel['qty']
@@ -1702,6 +1728,7 @@ class MarketTracker:
                 elif tx_rel_same is not None:
                     if tx_rel_same.get('qty'):
                         quantity = tx_rel_same['qty']
+                    # CRITICAL FIX: Always use transaction price if available (even when qty is None)
                     if tx_rel_same.get('price'):
                         price = tx_rel_same['price']
                 else:
@@ -1718,11 +1745,53 @@ class MarketTracker:
                         return (r.get('item') or '').lower() == anchor_item_lc if anchor_item_lc else False
                     has_any_buy_anchor = any(r['type'] in ('purchased','placed','withdrew') and same_item3(r) for r in related)
                     
-                    # Historical transaction detection:
-                    # If no buy anchors found, check if this could be a historical transaction
-                    # from the old log (where "Purchased" line already fell out).
+                    # CRITICAL FIX: Check if this transaction is NEW (from delta detection)
+                    # NEW transactions don't need whitelist validation - tab position is sufficient proof!
+                    # Only HISTORICAL transactions (already in baseline) need whitelist check.
+                    is_new_transaction = False
+                    if self.last_overview_text:
+                        # Check if this transaction was in the previous OCR baseline
+                        # Use the same pattern-based matching as delta detection
+                        try:
+                            # PERFORMANCE: Use precompiled patterns and escape special chars only once
+                            item_escaped = re.escape(ent.get('item') or '')
+                            item_pattern = _WHITESPACE_PATTERN.sub(r'\s+', item_escaped)
+                            qty_pattern = str(quantity or '')
+                            price_str = str(int(price or 0))
+                            
+                            # Build flexible price pattern for long numbers
+                            if len(price_str) > 6:
+                                price_prefix = price_str[:3]
+                                price_suffix = price_str[-3:]
+                                price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
+                            else:
+                                price_pattern = _COMMA_PATTERN.sub(',?', price_str)
+                            
+                            # Build and compile pattern (cached per transaction via pattern string)
+                            pattern_str = _TRANSACTION_BASE_PATTERN.format(
+                                item=item_pattern,
+                                qty=qty_pattern,
+                                price=price_pattern
+                            )
+                            # Compile pattern once per unique transaction signature
+                            pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+                            was_in_baseline = pattern.search(self.last_overview_text) is not None
+                            is_new_transaction = not was_in_baseline
+                            
+                            if is_new_transaction and self.debug:
+                                log_debug(f"[NEW-TX] '{ent['item']}' is NEW (not in baseline) - skipping whitelist check")
+                        except Exception:
+                            # If pattern match fails, assume it's new to be safe
+                            is_new_transaction = True
+                    else:
+                        # No baseline yet - treat as new
+                        is_new_transaction = True
+                    
+                    # Historical transaction detection (only for OLD transactions):
+                    # If no buy anchors found AND this is a HISTORICAL transaction (was in baseline),
+                    # check if this could be from the old log (where "Purchased" line already fell out).
                     # Use item category whitelist (most_likely_buy/most_likely_sell) to infer type.
-                    if not has_any_buy_anchor:
+                    if not has_any_buy_anchor and not is_new_transaction:
                         from utils import get_item_likely_type
                         likely_type = get_item_likely_type(ent.get('item', ''))
                         
@@ -1738,8 +1807,11 @@ class MarketTracker:
                         else:
                             # Unknown item, no category -> Skip (ambiguous)
                             if self.debug:
-                                log_debug(f"skip buy transaction-only without anchors for item='{ent['item']}' on buy_overview (no category match)")
+                                log_debug(f"skip buy transaction-only without anchors for item='{ent['item']}' on buy_overview (no category match, HISTORICAL)")
                             continue
+                    elif not has_any_buy_anchor and is_new_transaction and self.debug:
+                        # NEW transaction without anchors - this is normal for collect button transactions!
+                        log_debug(f"[NEW-TX] Allowing NEW transaction of '{ent['item']}' without anchors (tab position = proof)")
                 # If price is still missing but we have quantity and unit candidates from placed/withdrew, compute expected total instead of taking placed total
                 if (price is None or price <= 0) and (quantity is not None and quantity > 0):
                     # Prefer unit from withdrew (often exact), else from placed
@@ -2430,7 +2502,8 @@ class MarketTracker:
             # schedule a short burst of immediate re-scans to catch the purchase/transaction appearing a few frames later.
             if wtype == 'buy_overview':
                 try:
-                    s_norm = re.sub(r"\s+", " ", full_text)
+                    # PERFORMANCE: Use precompiled whitespace pattern
+                    s_norm = _WHITESPACE_PATTERN.sub(' ', full_text)
                     has_orders = re.search(r"orders\s+completed", s_norm, re.IGNORECASE) is not None
                     has_collect = re.search(r"\bcollect\b|\bre-?list\b", s_norm, re.IGNORECASE) is not None
                     # try to detect at least one item name before the word 'Orders'
@@ -2454,7 +2527,8 @@ class MarketTracker:
             # no candidates were found (likely due to delayed transaction line), schedule burst re-scans.
             if wtype == 'sell_overview':
                 try:
-                    s_norm = re.sub(r"\s+", " ", full_text)
+                    # PERFORMANCE: Use precompiled whitespace pattern
+                    s_norm = _WHITESPACE_PATTERN.sub(' ', full_text)
                     has_items_listed = re.search(r"items\s+listed", s_norm, re.IGNORECASE) is not None
                     has_sales_completed = re.search(r"sales\s+completed", s_norm, re.IGNORECASE) is not None
                     has_collect = re.search(r"\bcollect\b|\bre-?list\b", s_norm, re.IGNORECASE) is not None
@@ -2484,10 +2558,12 @@ class MarketTracker:
                 log_debug(f"[DELTA] Baseline has {len(prev_entries_raw)} entries")
             for pos, ts_text, snippet in prev_entries_raw:
                 # we create a coarse signature: ts_text + normalized snippet
-                key = (ts_text, re.sub(r'\s+', ' ', snippet).strip()[:180])
+                # PERFORMANCE: Use precompiled whitespace pattern
+                normalized_snippet = _WHITESPACE_PATTERN.sub(' ', snippet).strip()[:180]
+                key = (ts_text, normalized_snippet)
                 prev_entries.add(key)
                 # also track snippet-only normalized content to tolerate minor timestamp shifts in OCR layout
-                prev_snippets.add(re.sub(r'\s+', ' ', snippet).strip()[:180])
+                prev_snippets.add(normalized_snippet)
                 # track max timestamp in previous snapshot (for robust delta bypass)
                 ts_prev = parse_timestamp_text(ts_text)
                 if ts_prev is not None:
@@ -2531,7 +2607,8 @@ class MarketTracker:
                     main_ts_text = tx['timestamp'].strftime("%Y-%m-%d %H:%M")
                 else:
                     main_ts_text = str(tx['timestamp'])
-            normalized_main = re.sub(r'\s+', ' ', main_raw).strip()[:180]
+            # PERFORMANCE: Use precompiled whitespace pattern
+            normalized_main = _WHITESPACE_PATTERN.sub(' ', main_raw).strip()[:180]
             key = (main_ts_text, normalized_main)
             already_seen_in_prev = (key in prev_entries) or (normalized_main in prev_snippets)
             
@@ -2541,8 +2618,11 @@ class MarketTracker:
                 try:
                     # Build a regex pattern to find this transaction in baseline
                     # Pattern: "Transaction of {item}...x{qty}...{price_approx}"
-                    item_pattern = re.escape(tx['item_name'] or '').replace('\\ ', '\\s+')
-                    qty_pattern = str(tx['quantity'] or '').replace(',', ',?')  # Allow optional commas
+                    # PERFORMANCE: Use precompiled patterns for common operations
+                    item_escaped = re.escape(tx['item_name'] or '')
+                    item_pattern = _WHITESPACE_PATTERN.sub(r'\s+', item_escaped)
+                    qty_pattern = _COMMA_PATTERN.sub(',?', str(tx['quantity'] or ''))
+                    
                     # Price pattern: allow commas, spaces, OCR errors (O for 0, etc)
                     price_str = str(int(tx['price'] or 0))
                     # Build flexible price pattern (allow first/last 3 digits to match)
@@ -2551,10 +2631,15 @@ class MarketTracker:
                         price_suffix = price_str[-3:]
                         price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
                     else:
-                        price_pattern = price_str.replace(',', ',?')
+                        price_pattern = _COMMA_PATTERN.sub(',?', price_str)
                     
-                    pattern = rf"Transaction\s+of\s+{item_pattern}\s*.*?x?\s*{qty_pattern}\s*.*?{price_pattern}"
-                    if re.search(pattern, self.last_overview_text, re.IGNORECASE | re.DOTALL):
+                    pattern_str = _TRANSACTION_BASE_PATTERN.format(
+                        item=item_pattern,
+                        qty=qty_pattern,
+                        price=price_pattern
+                    )
+                    pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+                    if pattern.search(self.last_overview_text):
                         already_seen_in_prev = True
                         if self.debug:
                             log_debug(f"[BASELINE-PATTERN] Matched '{tx['item_name']}' {tx['quantity']}x in previous baseline (pattern match)")

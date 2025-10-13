@@ -190,6 +190,11 @@ python scripts/test_garmoth_api.py
 - **Item names resolved exclusively via config/market.json** (4874 items whitelist)
 - **Quantity bounds: [1, 5000]** filters unrealistic values and UI noise
 - **Never save raw OCR 1:1** – always structure, validate, deduplicate first
+- **âš ï¸ CRITICAL: Users REGULARLY buy/sell identical transactions (same item/qty/price) within SECONDS**
+  - Example: 5x batches of 5000x Material within 1 minute
+  - **NEVER use time-based dedup windows** (e.g., "skip if within 5 minutes") - breaks legitimate use cases!
+  - **ONLY deduplicate using Content-Hash** (position-aware, includes OCR raw text)
+  - **Trust OCR timestamps** - if parser says 23:25, don't change it to 23:26 without solid proof
 
 ### When Debugging Issues
 1. **ALWAYS check first**: `debug_proc.png`, `debug_orig.png`, `ocr_log.txt`
