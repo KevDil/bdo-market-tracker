@@ -1,10 +1,15 @@
-# IDE
+# IDE & Editoren
 .brokk/
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
 
 # Python
 __pycache__/
@@ -30,43 +35,101 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
 
 # Virtual Environment
 venv/
 ENV/
 env/
-.venv
+.venv/
+env.bak/
+venv.bak/
 
-# Database
+# Database & Backups
 bdo_tracker.db
-backups/*.backup_*
+bdo_tracker.db-journal
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+backups/
+*.backup
+*.backup_*
 
-# Debug Files
-debug/*.png
-debug/*.txt
+# Debug & OCR Files
+debug/
+debug_*.png
+debug_*.txt
 debug_orig.png
 debug_proc.png
-debug_*.png
 ocr_log.txt
-
-# Test Files
-scripts/__pycache__/
-scripts/utils/__pycache__/
-scripts/archive/__pycache__/
-scripts/utils/bdo_tracker.db
-
-# macOS
-.DS_Store
-
-# Windows
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-$RECYCLE.BIN/
+ocr_debug/
+screenshots/
+test_images/
 
 # Logs
 *.log
+logs/
 
 # Temporary files
 *.tmp
 *.temp
+~*
+
+# OS-spezifisch
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+
+# Konfiguration & Secrets
+.env
+.env.local
+.env.*.local
+config.local.py
+secrets.py
+*.key
+*.pem
+*.crt
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Daten & Exports
+*.csv
+*.xlsx
+*.json
+!config/*.json
+!config/item_categories.csv
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Performance & Profiling
+*.prof
+*.lprof
