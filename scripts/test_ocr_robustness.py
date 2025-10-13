@@ -19,6 +19,7 @@ def test_silver_keyword_variants():
         # (ts_text, entry_text, expected_price_not_none)
         ("10.13 22:06", "Transaction of Birch Sap x5000 worth 585,585,000 Silve_", True),  # OCR error: Silve_ → Silver
         ("10.13 22:06", "Sold Magical Shard x10 worth 23,000,000 Silve ", True),  # OCR error: 'Silve ' → Silver
+        ("10.14 00:03", "Transaction of Concentrated Magical Black Stone xl3O worth 859,301,625 Silv:", True),  # OCR error: Silv: → Silver
     ]
     
     passed = 0

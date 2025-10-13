@@ -2,6 +2,57 @@
 
 Dieses Dokument enthält die ausführlichen Beschreibungen aller wichtigen Änderungen am BDO Market Tracker. Die Kurzfassungen finden sich in `instructions.md` unter `recent_changes`.
 
+## 2025-10-14: OCR Robustness - Silver Keyword Normalization + Price Priority Fix
+
+**Kategorie:** Critical Bugfix  
+**Tests:** test_ocr_robustness.py (9/9 bestanden)
+
+### Problem 1: Silver Keyword OCR Errors
+
+"Concentrated Magical Black Stone" transaction (130x @ 859,301,625) wurde nicht gespeichert.
+
+**Root Cause:** OCR-Text war `worth 859,301,625 Silv:` → Pattern `worth \d+ Silver` matcht nicht → `price=None` → Transaction dropped
+
+**Solution:** Silver-Keyword-Normalisierung vor Parsing:
+- `Silve_` → `Silver` (underscore artifact)
+- `Silve ` → `Silver` (trailing space)
+- `Silv:` → `Silver` (truncated + colon) **[NEU]**
+- `Silv.` → `Silver` (truncated + dot) **[NEU]**
+- `Silv_` → `Silver` (truncated + underscore) **[NEU]**
+
+### Problem 2: Transaction Price Priority
+
+Bei merged OCR text (transaction + listed im selben Block) wurde Listed-Preis statt Transaction-Preis verwendet.
+
+**Example:**
+```
+Transaction of Birch Sap worth 585,585,000 Silver  (qty=None, price=585M)
+Listed Birch Sap x5000 for 650,000,000 Silver      (qty=5000, price=650M)
+```
+
+**Root Cause:** Alte Logik: `tx_rel = entry if (entry.qty OR entry.price)` → entry mit qty=None wurde übersprungen
+
+**Solution:** Transaction price wird IMMER bevorzugt (auch wenn qty=None):
+```python
+tx_rel = transaction_entry if transaction_entry else None
+if tx_rel and tx_rel.get('price'):
+    price = tx_rel['price']  # ALWAYS use transaction price
+```
+
+### Implementation
+
+- `parsing.py` lines 227-236: Silver keyword normalization (2 regex patterns)
+- `tracker.py` lines 1654-1663: Sell transaction price priority
+- `tracker.py` lines 1718-1732: Buy transaction price priority
+
+### Real-world Validation
+
+✅ Concentrated Magical Black Stone (130x @ 859,301,625) jetzt korrekt erfasst
+✅ Alle Silver-Varianten (Silve_, Silve , Silv:, Silv., Silv_) funktionieren
+✅ Transaction price wird über Listed/Placed-Preise priorisiert
+
+---
+
 ## 2025-10-12: Project Cleanup - Structure Reorganization + Path Fixes
 
 **Kategorie:** Project Structure  

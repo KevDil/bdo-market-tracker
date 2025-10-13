@@ -225,9 +225,15 @@ def extract_details_from_entry(ts_text, entry_text):
     timestamp: parsed datetime (from ts_text or nearest in entry)
     """
     # OCR robustness: Fix common OCR errors in Silver keyword before processing
-    # 'Silve_' (missing 'r'), 'Silve ' (trailing space after 'e')
-    # Match 'Silve' followed by non-letter characters (space, underscore, etc.)
-    entry_text = re.sub(r'\bSilve[_\s]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
+    # Common OCR variants:
+    #   - 'Silve_' (missing 'r', underscore artifact) → Silver
+    #   - 'Silve ' (trailing space) → Silver
+    #   - 'Silv:' / 'Silv.' / 'Silv_' (truncated + punctuation) → Silver
+    # Match patterns:
+    #   1) 'Silve' + non-letter (space, underscore, punctuation)
+    #   2) 'Silv' + punctuation (colon, dot, underscore)
+    entry_text = re.sub(r'\bSilve[_\s:,\.]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
+    entry_text = re.sub(r'\bSilv[:_\.]', 'Silver', entry_text, flags=re.IGNORECASE)
     
     low = entry_text.lower()
     typ = "other"

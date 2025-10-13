@@ -179,6 +179,29 @@ python scripts/test_garmoth_api.py
 
 ## Development Rules
 
+### Test & Documentation Hygiene
+
+**Policy:** Keep the repository lean and maintainable. Only create tests/docs for REAL issues, not hypothetical scenarios.
+
+**Rules:**
+- ✅ **Create** tests/docs only when fixing actual bugs or adding features
+- 🔄 **Consolidate** similar test scripts - merge or archive duplicates
+- 📝 **One source of truth** - prefer WARP.md or inline comments over separate docs
+- 🧹 **Clean up regularly** - archive debug scripts and outdated docs after fixes are validated
+- 🎯 **Target:** <10 active test scripts in `scripts/`, <5 docs in `docs/`
+
+**Lifecycle:**
+```
+Test:  Create → Validate fix → Archive to scripts/archived/
+Doc:   Write → Keep updated → Delete/archive when obsolete
+```
+
+**Archive vs Delete:**
+- Archive: Preserves historical context, reactivatable if needed
+- Delete: Only for completely irrelevant or misleading content
+
+---
+
 ### Critical Constraints
 - **ONLY evaluate transaction logs in sell_overview and buy_overview** (detail windows have no logs)
 - **ALWAYS only ONE tab visible** (Sales Completed XOR Orders Completed)
@@ -227,6 +250,15 @@ python scripts/test_garmoth_api.py
 - Use `@lru_cache` for expensive repeated lookups (item validation, correction)
 - Thread-safe DB access: always use `get_connection()` / `get_cursor()`, never share conn objects
 - Debug logging via `log_debug()` with timestamps for development diagnostics
+
+### Test & Documentation Hygiene
+- **Keep it lean**: Only create tests/docs for REAL issues or features, not hypothetical scenarios
+- **Consolidate aggressively**: Merge similar test scripts, archive outdated ones
+- **No duplicate documentation**: One source of truth per topic (prefer WARP.md or inline comments)
+- **Clean up regularly**: After fixes, remove debug scripts and redundant documentation
+- **Test lifecycle**: Create → Validate fix → Archive (move to `scripts/archived/` if no longer needed)
+- **Doc lifecycle**: Write → Keep updated → Delete when obsolete (not just "deprecated")
+- Target: <10 active test scripts in `scripts/`, <5 docs in `docs/` (excluding auto-generated)
 
 ### Important Anti-Patterns
 - Never blindly trust OCR output (always validate against whitelist)
