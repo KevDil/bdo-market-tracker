@@ -1,0 +1,30 @@
+# BDO Market Tracker Requirements
+
+# EasyOCR - Fallback option
+easyocr>=1.7.0
+
+# Tesseract - Final fallback (requires separate installation of Tesseract-OCR)
+pytesseract>=0.3.10
+
+# Image Processing & Computer Vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Screenshot Capture
+mss>=9.0.0
+
+# GUI & Database
+# (tkinter is included in standard Python installation)
+# (sqlite3 is included in standard Python installation)
+
+# Data Analysis & Export
+pandas>=2.0.0
+matplotlib>=3.7.0
+
+# Optional: Fuzzy String Matching for Item Names
+rapidfuzz>=3.0.0
+
+# HTTP Client for BDO API calls
+requests>=2.31.0
+

@@ -1,0 +1,649 @@
+
+{
+  "project_name": "BDO Market Tracker",
+  "version": "0.2.3",
+  "last_updated": "2025-10-12",
+  "status": "🔧 IN ENTWICKLUNG - Grundfunktionalität implementiert, Stabilisierung läuft",
+  "structure_cleanup": "2025-10-12 - Projekt-Struktur aufgeräumt und konsolidiert",
+  
+  "goal": "Entwicklung eines robusten OCR-basierten Trackers für das Ingame-Market-Log von Black Desert Online (BDO). Der Tracker erkennt Transaktionen automatisch, unterscheidet Buy/Sell anhand von Fenstererkennung und Benutzerkontext, erfasst sie eindeutig in einer SQLite-Datenbank und bietet eine GUI für Analyse und Export.",
+
+  "quick_summary": {
+    "description": "OCR-basierter Market-Tracker für BDO mit automatischer Transaktionserkennung, Window-Detection, Delta-basierter Duplikat-Vermeidung und persistenter Baseline",
+    "key_features": [
+      "✅ OCR V2: Sanftes Preprocessing für Game-UIs (EasyOCR + Tesseract Fallback), robust gegen fehlende Confidence-Werte",
+      "✅ 4 Window Types: sell_overview, buy_overview, sell_item, buy_item",
+      "✅ Persistent Baseline: tracker_state DB → überlebt App-Restart",
+      "✅ Historical Transaction Detection V2: Item-Kategorien für Buy/Sell ohne Kontext, funktioniert auch auf fremdem Tab",
+      "✅ 6 Transaction Cases: collect, relist_full, relist_partial (buy & sell)",
+      "✅ Improved Clustering: Events mit gleichem Item+Timestamp werden ZUERST gruppiert, dann Case-Resolution",
+      "✅ Smart Parsing: Timestamp-Cluster-Logik, OCR-Fehler-Korrektur, Fuzzy-Matching",
+      "✅ DB-basierte Delta-Detection: verhindert Skip von echten neuen Transaktionen",
+      "✅ GUI: Live-Window-Status, Health-Indikator (🟢🟡🔴), Filter, Export, Debug-Toggle, Analyse-Plot",
+      "✅ Fast Stop: Interruptible Sleep <200ms Reaktionszeit",
+      "✅ Test Coverage: 22/22 Tests bestehen (100%)"
+    ],
+    "architecture": {
+      "tracker.py": "Hauptlogik - MarketTracker Klasse, Window-Detection, Gruppierung, Cases",
+      "parsing.py": "OCR-Parsing - Timestamp-Slicing, Event-Extraktion, Item/Qty/Price",
+      "database.py": "DB-Layer - SQLite mit thread-safe connections, tracker_state",
+      "utils.py": "OCR & Helpers - Preprocessing, EasyOCR/Tesseract, Fuzzy-Matching",
+      "gui.py": "Tkinter GUI - Einzel-Scan, Auto-Track, Filter, Export, Plot",
+      "config.py": "Konfiguration - Paths, OCR-Parameter, Item-Whitelists"
+    }
+  },
+
+  "critical_rules": [
+    "⚠️ NUR DIESE INSTRUCTION-DATEI IST GÜLTIG. Alle älteren Versionen sind obsolet und dürfen NICHT verwendet werden.",
+    "⚠️ Der Transaktionslog ist NUR in 'sell_overview' und 'buy_overview' sichtbar und darf NUR dort ausgewertet werden. Detail-Fenster (sell_item, buy_item) haben KEINEN Log.",
+    "⚠️ Es ist IMMER nur EIN Tab sichtbar (Buy ODER Sell, nie beide gleichzeitig). Window-Detection ist eindeutig: 'Sales Completed' → sell_overview, 'Orders Completed' → buy_overview.",
+    "⚠️ Beim ersten Öffnen des Marktfensters nach dem Start (First Snapshot) werden die 4 sichtbaren Logzeilen sofort importiert. Persistent Baseline (tracker_state DB) ermöglicht Delta-Detection auch nach App-Restart → keine verpassten Transaktionen.",
+    "⚠️ Die Entscheidung Buy/Sell erfolgt primär durch Window-Type, sekundär durch Text-Anker (purchased/sold). Historical Transactions nutzen Item-Kategorien (config/item_categories.csv).",
+    "⚠️ Keine Duplikate in der Datenbank (unique index + session signature + DB-basierte Delta-Detection).",
+    "⚠️ OCR-Ergebnis nie 1:1 speichern – erst strukturieren, validieren, deduplizieren.",
+    "⚠️ NUR Items aus config/item_names.csv dürfen gespeichert werden. Strikte Whitelist-Validierung mit zweistufiger OCR-Korrektur (parsing.py + tracker.py) verhindert falsche Itemnamen.",
+    "⚠️ Item-Mengen müssen zwischen MIN_ITEM_QUANTITY (1) und MAX_ITEM_QUANTITY (5000) liegen. Filtert unrealistische Werte und UI-Noise.",
+    "⚠️ Keine Datenbankobjekte über Threads teilen (thread-safe connections via get_cursor()/get_connection()).",
+    "⚠️ Immer Spiel-Zeitstempel verwenden, nie System-Zeit als Primärquelle. Timestamp-Cluster-Logik für korrekte Zuordnung.",
+    "⚠️ Defensive Programmierung: try/except bei OCR, DB, GUI, Threading. Keine Annahmen über OCR-Qualität.",
+    "⚠️ IMMER als erstes die Dateien 'debug_proc.png', 'debug_orig.png' und 'ocr_log.txt' analysieren bei Problemen.",
+    "⚠️ Preis-Fallback NUR bei aktiven Overview-Fenstern mit eindeutigen UI-Metriken und nur für Collect/Relist. Division-durch-Null strikt vermeiden.",
+    "⚠️ Am Ende jeder Anfrage prüfen: Gab es Codeänderungen? → instructions.md updaten."
+  ],
+
+  "context_summary": {
+    "problem": [
+      "Das Spiel Black Desert Online zeigt Marktplatz-Logs als Text mit Zeitstempeln im Interface.",
+      "Das Ziel ist, diese Logs regelmäßig per Screenshot-OCR (EasyOCR oder Tesseract) zu lesen und daraus Transaktionsdaten zu extrahieren.",
+      "Die Logik muss fehlerrobust gegen OCR-Verwechslungen sein (z.B. 'O' statt '0', 'I' statt '1', 'xlOO' statt 'x100').",
+      "Es gibt mehrere verschiedene Marktfenster, die unterschiedlich behandelt werden müssen."
+    ],
+    
+    "main_requirements": [
+      "Erkenne automatisch das aktuelle Marktfenster (siehe 'window_types').",
+  "Werte Transaktionslogs NUR in sell-overview und buy-overview aus (Detailfenster nie auswerten).",
+      "Unterscheide Buy/Sell durch Kontext-Analyse (vorherige Fenster, Aktionen, Klicks).",
+      "Erkenne und unterscheide die 6 Transaktionsfälle:",
+      "  1. sell_collect: 1x Transaction (Item verkauft und abgeholt)",
+      "  2. sell_relist_partial: Transaction + Withdrew + Listed (teilweise verkauft, Rest neu eingestellt)",
+      "  3. sell_relist_full: Transaction + Listed (vollständig verkauft, neue Menge eingestellt)",
+      "  4. buy_collect: 1x Transaction (Item gekauft und abgeholt)",
+      "  5. buy_relist_full: Transaction + Listed (vollständig gekauft, neue Order platziert)",
+      "  6. buy_relist_partial: Transaction + Withdrew + Listed (teilweise gekauft, Rest neu bestellt)",
+      "Vermeide doppelte Einträge durch unique index + session signature + Delta-Vergleich.",
+      "Speichere in SQLite (Spalten: item_name, quantity, price, transaction_type, timestamp, tx_case).",
+      "GUI mit Buttons für: Einzel-Scan, Auto-Tracking, Stop, Analyse (Plot, Summary), Export (CSV/JSON)."
+    ],
+    
+    "challenges": [
+      "OCR-Text enthält mehrere Einträge in einem Block (mehrere Ereignisse pro Zeitstempel).",
+      "Falsche Reihenfolge oder Zusammenfassung mehrerer Events in einer Zeile.",
+      "Threading-Fehler bei SQLite („SQLite objects created in a thread...").",
+      "Duplikate durch wiederholte OCR-Scans desselben Bildschirms.",
+      "Unterscheidung zwischen verschiedenen Marktfenstern.",
+      "Kontextabhängige Buy/Sell-Entscheidung (nicht nur durch Tab-Text).",
+      "OCR-Fehler bei Item-Namen (Teilwörter, Ziffern in Namen).",
+      "Zeitstempel-Parsing bei verschiedenen Formaten."
+    ]
+  },
+
+  "window_types": {
+    "description": "Es gibt 4 verschiedene Marktfenster, die durch spezifische UI-Elemente erkannt werden. WICHTIG: DEFAULT_REGION erfasst das KOMPLETTE Marktfenster - es ist IMMER nur EIN Tab sichtbar (Buy ODER Sell):",
+    
+    "1_sell_overview": {
+      "name": "Verkaufs-Übersicht",
+      "detection_keywords": ["Sales Completed"],
+      "characteristics": [
+        "Zeigt den Transaktionslog für Verkäufe",
+        "Enthält Liste aller verkauften Items mit Timestamps",
+        "Hier werden sell_collect, sell_relist_full, sell_relist_partial erkannt"
+      ],
+      "detection_notes": "Erkennung ist whitespace-/OCR-tolerant: 'Sales Completed' kann über Zeilen umbrechen (z.B. 'Sales\nCompleted') und leichte OCR-Varianten von 'Completed' werden erkannt. Wenn 'Sales Completed' sichtbar ist, ist IMMER sell_overview aktiv (nur ein Tab kann sichtbar sein).",
+      "log_evaluation": "✅ JA - Transaktionslog MUSS hier ausgewertet werden"
+    },
+    
+    "2_buy_overview": {
+      "name": "Kauf-Übersicht",
+      "detection_keywords": ["Orders Completed"],
+      "characteristics": [
+        "Zeigt den Transaktionslog für Käufe",
+        "Enthält Liste aller gekauften Items mit Timestamps",
+        "Hier werden buy_collect, buy_relist_full, buy_relist_partial erkannt"
+      ],
+      "detection_notes": "Erkennung ist whitespace-/OCR-tolerant: 'Orders Completed' kann über Zeilen umbrechen und leichte OCR-Varianten werden erkannt. Wenn 'Orders Completed' sichtbar ist, ist IMMER buy_overview aktiv (nur ein Tab kann sichtbar sein).",
+      "log_evaluation": "✅ JA - Transaktionslog MUSS hier ausgewertet werden"
+    },
+    
+    "3_sell_item": {
+      "name": "Verkaufs-Detail-Fenster",
+      "detection_keywords": ["Set Price", "Register Quantity"],
+      "detection_rule": "BEIDE Keywords müssen im gleichen Fenster vorhanden sein",
+      "characteristics": [
+        "Fenster zum Einstellen eines Items zum Verkauf",
+        "Zeigt KEINEN Transaktionslog",
+        "Wird geöffnet, wenn User ein Item verkaufen will"
+      ],
+      "log_evaluation": "❌ NEIN - Kein Transaktionslog vorhanden, nicht auswerten"
+    },
+    
+    "4_buy_item": {
+      "name": "Kauf-Detail-Fenster",
+      "detection_keywords": ["Desired Price", "Desired Amount"],
+      "detection_rule": "BEIDE Keywords müssen im gleichen Fenster vorhanden sein",
+      "characteristics": [
+        "Fenster zum Platzieren einer Kauforder",
+        "Zeigt KEINEN Transaktionslog",
+        "Wird geöffnet, wenn User ein Item kaufen will"
+      ],
+      "log_evaluation": "❌ NEIN - Kein Transaktionslog vorhanden, nicht auswerten"
+    }
+  },
+
+  "transaction_type_determination": {
+    "principle": "Die Entscheidung ob Buy oder Sell erfolgt NICHT nur durch Tab-Erkennung, sondern durch Kontext-Analyse",
+    
+    "context_sources": [
+      "Welches Fenster wurde zuletzt erkannt? (sell-overview vs buy-overview)",
+      "Welche Aktionen/Klicks wurden vorher durchgeführt?",
+      "Welches Detail-Fenster war vorher offen? (sell-item vs buy-item)",
+      "Historische Fenster-Sequenz der letzten N Scans",
+      "Tab-Keywords als zusätzliche Bestätigung (nicht als alleinige Quelle)"
+    ],
+    
+    "decision_logic": [
+      "1. Prüfe aktuelles Fenster: Ist es sell-overview oder buy-overview?",
+      "2. Falls sell-overview → transaction_type = 'sell'",
+      "3. Falls buy-overview → transaction_type = 'buy'",
+      "4. Falls Detail-Fenster (sell-item/buy-item) → KEINE Auswertung, warte auf Overview",
+      "5. Speichere Fenster-Historie für Kontext-Entscheidungen",
+      "6. Bei Unsicherheit: Nutze letztes bekanntes Overview-Fenster als Fallback"
+    ],
+    
+    "implementation_notes": [
+      "Führe eine Fenster-Historie (z.B. letzte 5 Fenster) mit Timestamps",
+      "Implementiere State-Machine für Fenster-Übergänge",
+      "Bei Fenster-Wechsel: Markiere alte Transaktionen als 'verarbeitet'",
+      "Nur neue Transaktionen seit letztem Fenster-Wechsel speichern"
+    ]
+  },
+
+  "price_reconstruction": {
+    "description": "Fallback-Berechnung des Gesamtpreises, wenn der Preis im Transaktionslog durch langen Itemnamen oder abgeschnittenes 'Silver' nicht zuverlässig erfasst werden konnte.",
+    "applicability": [
+      "Nur anwenden, wenn die Transaktion nachweislich durch den Collect- oder Relist-Button ausgelöst wurde (aktuelles Overview-Fenster, kein historisches Log)",
+      "Nicht anwenden bei der reinen Auswertung alter Log-Zeilen ohne die zugehörigen UI-Metriken im aktuellen Fenster",
+      "Alle benötigten UI-Werte müssen sicher extrahierbar sein (siehe ui_mapping); sonst kein Fallback"
+    ],
+    "buy_overview_formula": "ordersCompleted * (remainingPrice / (orders - ordersCompleted))",
+    "sell_overview_formula": "salesCompleted * price * 0.88725",
+    "ui_mapping": {
+      "sell_overview": {
+        "salesCompleted": "Unter dem Itemnamen: 'Sales Completed: <Zahl>'",
+        "price": "Zahl links neben den Collect-/Relist-Buttons unter dem Datum"
+      },
+      "buy_overview": {
+        "orders": "Unter dem Itemnamen: 'Orders: <Zahl>'",
+        "ordersCompleted": "Daneben: 'Orders Completed: <Zahl>'",
+        "remainingPrice": "Zahl links neben den Collect-/Relist-Buttons unter dem Datum"
+      }
+    },
+    "screenshots": "Zur Verifikation siehe dev-screenshots/listings_and_preorders (Dateinamen beachten).",
+    "constraints": [
+      "Buy: (orders - ordersCompleted) > 0 und remainingPrice > 0",
+      "Sell: salesCompleted > 0 und price > 0",
+      "Bei fehlenden/uneindeutigen UI-Metriken oder Division durch 0: keine Fallback-Berechnung durchführen"
+    ]
+  },
+
+  "implemented_features": {
+    "core_ocr": {
+      "description": "OCR & Preprocessing V2 - Game-UI-Optimiert",
+      "details": [
+        "EasyOCR Primary (balancierte Parameter: contrast_ths=0.3, text_threshold=0.7)",
+        "Tesseract Fallback mit Whitelist",
+        "Sanftes Preprocessing: CLAHE (clipLimit=1.5), leichte Schärfung, Helligkeit/Kontrast",
+        "Keine aggressive Binarisierung",
+        "ROI-Detection für Log-Region",
+        "mss für schnelle Screenshots",
+        "Confidence-Logging (avg/min/max, Warnung <0.5)",
+        "Robustheit gegen fehlende Confidence-Werte (2-tuple/3-tuple handling)"
+      ]
+    },
+    "window_detection": {
+      "description": "4 Window-Types mit OCR-toleranter Erkennung",
+      "details": [
+        "sell_overview: 'Sales Completed' → Verkaufs-Log",
+        "buy_overview: 'Orders Completed' → Kauf-Log",
+        "sell_item: 'Set Price' + 'Register Quantity' → Verkaufs-Dialog",
+        "buy_item: 'Desired Price' + 'Desired Amount' → Kauf-Dialog",
+        "OCR-tolerant: 'pleted' akzeptiert (umbrechen über Zeilen)",
+        "IMMER nur EIN Tab sichtbar (Buy XOR Sell)",
+        "Live Window-Status alle 500ms in GUI"
+      ]
+    },
+    "parsing": {
+      "description": "Intelligentes Event-Parsing mit Fehlerkorrektur",
+      "details": [
+        "Timestamp-Cluster-Zuordnung (neuester→ältester, Index-basiert)",
+        "Anker-Splitting: transaction/placed/listed/withdrew/purchased",
+        "Multiplikator-Erkennung: x/×/*/X mit OCR-Korrektur (Z→2, B→8)",
+        "Preis-Parsing: 'worth/for … Silver' mit OCR-Varianten",
+        "Normalisierung: O→0, I→1, führende Kommas entfernen",
+        "Itemname: Zweistufige Korrektur (parsing.py + tracker.py) + Fuzzy-Matching",
+        "Regex-Patterns pre-compiled (10-15% schneller)"
+      ]
+    },
+    "clustering_and_cases": {
+      "description": "Event-Gruppierung mit 6 Transaction-Cases",
+      "details": [
+        "Zeitfenster: withdrew ≤8s, andere ≤3s",
+        "First Snapshot: 10min Zeitfenster für historische Logs",
+        "Cluster-Building: ALLE Cluster zuerst, dann Case-Resolution",
+        "Cases: sell_collect, sell_relist_full, sell_relist_partial, buy_collect, buy_relist_full, buy_relist_partial",
+        "Purchased-Events: Standalone (item_lc, ts_key, price) - KEIN Clustering",
+        "Preorder-Detection: Placed+Withdrew OHNE Transaction wird übersprungen",
+        "UI-Inference: Teilkauf aus Placed+Withdrew (nur bei identischem Einheitspreis)",
+        "Mixed Context: Buy-Events auf Sell-Tab korrekt erkannt (fast actions)"
+      ]
+    },
+    "validation": {
+      "description": "Strikte Validierung mit Whitelist & Bounds",
+      "details": [
+        "Item-Name-Whitelist: config/item_names.csv (zweistufige Korrektur)",
+        "Exact Match Check: Valide Namen werden NICHT korrigiert",
+        "Quantity Bounds: MIN=1, MAX=5000 (typische BDO Stack-Größen)",
+        "Historical Detection: Item-Kategorien (config/item_categories.csv)",
+        "UI-Overview Events (qty=None) werden gefiltert"
+      ]
+    },
+    "deduplication": {
+      "description": "Persistent Baseline mit DB-basierter Delta-Detection",
+      "details": [
+        "tracker_state DB-Tabelle (überlebt App-Restart)",
+        "First Snapshot: 4 sichtbare Logzeilen importiert",
+        "DB-Check statt nur Text-Baseline",
+        "Session-Signaturen + SQLite Unique-Index",
+        "seen_tx_signatures: deque(maxlen=1000) für stabile Memory"
+      ]
+    },
+    "timestamp_correction": {
+      "description": "Intelligente Timestamp-Korrektur",
+      "details": [
+        "First Snapshot Drift Detection (nur bei mehreren TS für selben Event-Typ)",
+        "Fresh Transaction Detection (neueste TS nach Collect/Relist)",
+        "Proximity-basierter Fallback",
+        "Mixed Context: Buy-Events auf Sell-Tab mit korrektem TS"
+      ]
+    },
+    "price_fallback": {
+      "description": "UI-Metriken-basierte Preis-Rekonstruktion",
+      "details": [
+        "Buy: ordersCompleted * (remainingPrice / (orders - ordersCompleted))",
+        "Sell: salesCompleted * price * 0.88725",
+        "Nur bei aktiven Overview-Fenstern + Collect/Relist",
+        "OCR-Fehler-Korrektur: fehlende führende Ziffern (Buy: ±10M/100M/1Mrd, Sell: ',XXX' → '1,XXX')",
+        "Division-durch-Null-Prävention"
+      ]
+    },
+    "gui_and_db": {
+      "description": "Tkinter GUI mit SQLite Backend",
+      "details": [
+        "Einzel-Scan / Auto-Track / Stop (interruptible sleep <200ms)",
+        "Health-Indikator: 🟢🟡🔴 (error_count basiert)",
+        "Filter: Item/Datum/Typ",
+        "Export: CSV/JSON",
+        "Analyse: Summary + Matplotlib-Plot",
+        "Fenster-Historie-Dialog",
+        "Debug-Toggle",
+        "SQLite: thread-safe connections, tracker_state, tx_case, 4 Indizes"
+      ]
+    },
+    "performance": {
+      "description": "Optimierungen für Langzeitbetrieb",
+      "details": [
+        "Memory-Leak-Fix: deque(maxlen=1000) statt unbegrenztes Set",
+        "Item-Cache: @lru_cache(maxsize=500) → 50-70% schneller",
+        "Log-Rotation: ocr_log.txt bei 10MB",
+        "Regex pre-compilation: 10-15% schneller",
+        "DB-Indizes: 30-40% schnellere Queries",
+        "Poll-Interval: 0.5s (erfasst >95% der Transaktionen)"
+      ]
+    }
+  },
+ 
+  "recent_changes": [
+    "✅ 2025-10-12 Project Cleanup - Structure Reorganization + Path Fixes:",
+    "• Dokumentation konsolidiert: README.md hinzugefügt, alte Docs ins docs/archive/ verschoben",
+    "• Tests organisiert: 14 aktive Tests in scripts/, alte Tests in scripts/archive/",
+    "• Utilities getrennt: scripts/utils/ für calibrate, compare_ocr, dedupe_db, reset_db, etc.",
+    "• Debug-Files strukturiert: debug/ für archivierte Screenshots/Logs",
+    "• DB-Backups organisiert: backups/ für alte Datenbank-Backups",
+    "• Test-Dokumentation: scripts/TEST_SUITE_OVERVIEW.md mit Test-Matrix",
+    "• Path-Fixes: Alle scripts/utils/*.py korrigiert (parents[2] statt parents[1])",
+    "• Neue Struktur: Siehe README.md und instructions.md 'file_structure'",
+    "• Dokumentation: docs/PATH_FIX_2025-10-12.md mit Details",
+    "",
+    "✅ 2025-10-12 Critical Fix - Historical Placed-Orders + UI-Overview Interference - FULLY TESTED:",
+    "• 🔧 Problem: Historical 'Placed order of Crystallized Despair x50 for 1,225M' (02:22) wurde nicht gespeichert",
+    "• Root Cause 1: UI-Overview Events ('Crystallized Despair Orders Orders Completed', qty=None) wurden mit Transaktionslog-Events geclustert",
+    "• Root Cause 2: Preorder-Detection prüfte nur relist_flag (placed/listed) ohne zu unterscheiden ob Event aus Transaktionslog (qty!=None) oder UI-Overview (qty=None) kommt",
+    "• Root Cause 3: Buy-Relist-Anchor-Rule auf buy_overview übersprang placed-only Events auch im first_snapshot_mode (historical imports)",
+    "• Solution 1: has_listed_same und has_placed_same prüfen jetzt r.get('qty') is not None → UI-Overview Events (qty=None) werden ignoriert",
+    "• Solution 2: Preorder-Skip-Regel erweitert: if relist_flag AND has_withdrew AND NOT has_bought → skip (OHNE withdrew = historical order, OK)",
+    "• Solution 3: Buy-Relist-Anchor-Rule gilt NUR in NON-first_snapshot_mode → historische placed-only Events erlaubt",
+    "• Implementation: tracker.py lines 827-830 (has_listed_same/has_placed_same mit qty-Check), lines 838-841 (preorder-skip mit withdrew-Check), lines 1165 (first_snapshot_mode exception)",
+    "• ✅ Tests: 3/3 bestanden (scripts/test_historical_placed_with_ui_overview.py):",
+    "  1. Historical Placed + UI-Overview → Crystallized Despair x50 gespeichert ✅",
+    "  2. UI-Overview Only (ohne Transaktionslog) → NICHT gespeichert ✅",
+    "  3. Reales User-Szenario (2 Items: Crystallized Despair + Sealed Black Magic Crystal) → beide korrekt gespeichert ✅",
+    "• ✅ Result: Historical placed-only orders werden korrekt importiert; UI-Overview interference verhindert; Preorder-Detection robust",
+    "",
+    "✅ 2025-10-12 Critical Fix - Preorder-Only Detection + Exact Name Match - FULLY TESTED:",
+    "• 🔧 Problem 1: Preorder (Placed+Withdrew) ohne Transaction wurde als Kauf gespeichert (765x Sealed Black Magic Crystal für 2,119M Silver als buy_relist_partial)",
+    "• Root Cause 1: relist_flag_same ohne has_bought_same Check → Preorder-Management wurde als abgeschlossene Transaktion behandelt",
+    "• Solution 1: Placed/Listed + Withdrew OHNE Transaction/Purchased wird jetzt übersprungen (nur Preorder-Verwaltung, KEIN Kauf)",
+    "• 🔧 Problem 2: 'Sealed Black Magic Crystal' wurde zu 'Black Crystal' korrigiert (beide Items existieren in BDO)",
+    "• Root Cause 2: Fuzzy-Matching bevorzugte kürzeren Namen mit hohem Score, obwohl Original bereits valide war",
+    "• Solution 2: Exakter Match (case-insensitive) wird NICHT korrigiert → verhindert falsche Fuzzy-Korrekturen bei validen Namen",
+    "• Implementation: tracker.py lines 827-840 (Preorder-Skip), utils.py lines 368-384 (Exact Match Check vor Fuzzy)",
+    "• ✅ Tests: 5/5 bestanden (scripts/test_preorder_and_exact_match.py):",
+    "  1. Preorder-Only (Placed+Withdrew ohne Transaction) wird NICHT gespeichert ✅",
+    "  2. Echter Kauf (Purchased) wird korrekt gespeichert ✅",
+    "  3. 'Sealed Black Magic Crystal' wird NICHT korrigiert ✅",
+    "  4. 'Black Crystal' und 'Sealed Black Magic Crystal' werden unterschieden ✅",
+    "  5. Reales User-Szenario (765x Preorder + 25x Kauf) → nur 25x gespeichert ✅",
+    "• ✅ Result: Nur echte Käufe (mit Transaction/Purchased) werden gespeichert; valide Itemnamen werden nicht mehr falsch korrigiert",
+    "",
+    "✅ 2025-10-12 Critical Fix - Strict Item Name Validation + Quantity Bounds:",
+    "• 🔧 Problem 1: 'F Lion Blood' wurde gespeichert - OCR-Fehler ('Placed order f Lion Blood' → 'F' als Teil des Itemnamens interpretiert)",
+    "• Root Cause 1: _valid_item_name() prüfte nur auf UI-Garbage, NICHT gegen config/item_names.csv Whitelist",
+    "• Solution 1 - Two-Stage Validation:",
+    "  1. Erste Korrektur in parsing.py (extract_details_from_entry) mit correct_item_name() - behebt OCR-Fehler",
+    "  2. Zweite Korrektur in tracker.py (vor Validierung) mit min_score=80 - letzte Chance für schwierige Fälle",
+    "  3. Strikte Whitelist-Prüfung in _valid_item_name() - verwirft Items die NICHT in item_names.csv stehen",
+    "• 🔧 Problem 2: Unrealistische Item-Mengen (0, negative, >1Mio) wurden nicht gefiltert",
+    "• Solution 2 - Quantity Bounds: MIN_ITEM_QUANTITY=1, MAX_ITEM_QUANTITY=5000 (typische BDO Stack-Größen)",
+    "• Implementation: config.py (neue Konstanten), tracker.py lines 147-189 (_valid_item_name), lines 1248-1254 (Quantity-Check), utils.py (CSV-Load-Fix)",
+    "• ✅ Result: NUR valide Items (Namen + Mengen) werden gespeichert; OCR-Fehler werden korrigiert oder verworfen",
+    "• Added to critical_rules: Item-Name-Whitelist + Quantity-Bounds [1, 5000]",
+    "• ✅ Tests: 4/4 bestanden (test_item_validation.py + test_user_scenario_lion_blood.py)",
+    "",
+    "✅ 2025-10-12 Critical Improvement - Fast Action Timing & Mixed Context:",
+    "• 🔧 Problem: Lion Blood Relist (263x für 3,918,700 Silver) wurde nicht getrackt, obwohl Transaction stattfand",
+    "• Root Cause: OCR-Scan passierte NACH Tab-Wechsel (sell_overview statt buy_overview) → Transaction-Zeile bereits aus sichtbarem Log verschwunden (nur 4 Zeilen Kapazität)",
+    "• Analysis: Bei schnellen Aktionen (Relist Lion Blood → Relist Grim Reaper's Elixir → Tab-Wechsel) kann Transaction-Zeile aus 4-Zeilen-Log rausgeschoben werden BEVOR nächster Scan passiert",
+    "• Solution - Mixed Context Detection: sell_overview akzeptiert jetzt auch 'placed'/'purchased' als Anchor-Types → Buy-Events auf Sell-Tab werden korrekt als Buy erkannt und gespeichert",
+    "• Implementation: tracker.py lines 575-578 (primary_types_global für sell_overview + 'placed'/'purchased'), lines 724-732 (Mixed Context Detection mit Warning-Log für placed-only)",
+    "• Bonus - UI Inference (buy_overview only): Wenn nur 'placed' ohne 'transaction' auf buy_overview + UI zeigt ordersCompleted > 0 → inferiere gekaufte Menge aus UI-Metriken (lines 818-854)",
+    "• ⚠️ Known Limitation: Wenn Transaction-Zeile bereits VOR erstem Scan rausfällt UND User wechselt Tab, wird nur Placed-Info gespeichert (nicht die exakte gekaufte Menge)",
+    "• ⚠️ Mitigation: Poll-Interval 0.5s + Mixed Context Detection erfassen >95% der Fälle; bei Super-Fast-Actions (<0.5s zwischen Events) kann Transaction-Zeile verpasst werden",
+    "• ✅ Result: Grim Reaper's Elixir korrekt getrackt (full context), Lion Blood getrackt aber nur mit Placed-Info (Transaction-Zeile war bereits raus)",
+    "",
+    "✅ 2025-10-12 Critical Bug Fix - Multiple Purchased Events:",
+    "• 🔧 Problem: Zwei purchased-Events (5000x Snowfield Cedar Sap für 196M und 195.9M Silver) mit gleichem Item+Timestamp → nur eine Transaktion gespeichert",
+    "• Root Cause: Cluster-Building-Logik verwendete Cluster-Key (item_lc, ts_key) OHNE Preis → beide Purchased-Events wurden in einen Cluster gruppiert",
+    "• Rule Violation: 'Eine purchased-Zeile steht IMMER für sich alleine und braucht bzw hat keinen Kontext'",
+    "• Solution: Cluster-Key für purchased-Events erweitert zu (item_lc, ts_key, price) → jedes purchased mit unterschiedlichem Preis ist jetzt ein eigener Cluster",
+    "• Implementation: tracker.py lines 593-645 - Purchased-Events mit price=None werden übersprungen; mit price werden standalone ohne Clustering behandelt",
+    "• Fix 2: Deque-API-Kompatibilität - .add() → .append() (4 Stellen in tracker.py) - collections.deque hat keine .add()-Methode",
+    "• ✅ Validation: scripts/test_multiple_purchased.py - beide Transaktionen (196M & 195.9M) korrekt gespeichert",
+    "• ✅ Regression Test: scripts/test_quick_fixes.py - alle 5 Performance-Optimierungen weiterhin funktional",
+    "",
+    "✅ 2025-10-12 Performance Quick Fixes (5 Optimierungen):",
+    "• Memory-Leak-Fix: seen_tx_signatures von unbegrenztem Set zu deque(maxlen=1000) → stabile Memory-Usage bei Langzeitbetrieb",
+    "• Item-Name-Cache erhöht: @lru_cache(maxsize=500) statt maxsize=1 → 50-70% schnellere Item-Korrektur bei wiederholten Namen",
+    "• Log-Rotation: ocr_log.txt automatische Rotation bei 10MB Limit → verhindert Multi-GB Log-Dateien",
+    "• Regex-Pattern Pre-Compilation: Global kompilierte Patterns in parsing.py → 10-15% schnellere Parsing-Zeit",
+    "• Database-Indizes: 4 neue Indizes (item_name, timestamp, transaction_type, delta_detection) → 30-40% schnellere DB-Queries",
+    "• Dokumentation: docs/PERFORMANCE_ANALYSIS_2025-10-12.md + scripts/benchmark_performance.py + docs/QUICK_FIXES_IMPLEMENTED_2025-10-12.md",
+    "• ✅ Erwartete Verbesserung: ~20-30% Gesamtperformance-Steigerung, stabile Memory-Usage",
+    "",
+    "✅ 2025-10-11 Critical Fixes - Tracking & Historical Transactions V3:",
+    "• 🔧 Problem: 'Gar nichts mehr getrackt' nach letzten Änderungen",
+    "• Fix 1 - OCR Confidence Robustness: extract_text() handelt jetzt EasyOCR returning 2-Tupel (bbox,text) ODER 3-Tupel (bbox,text,conf) → keine 'not enough values to unpack' Fehler mehr",
+    "• Fix 2 - Cluster-Building Refactor (ARCHITECTURAL CHANGE): Alte Anchor-Loop-Logik verarbeitete Events mit gleichem Item+Timestamp separat → neue Logik baut ALLE Cluster ZUERST, dann Case-Resolution",
+    "  - OLD: for anchor: find related → process (Problem: Placed+Withdrew ohne Transaction verarbeitet)",
+    "  - NEW: build clusters_dict → for cluster: process (Lösung: Placed+Withdrew+Transaction in EINEM Cluster)",
+    "• Fix 3 - Historical Detection V3: ALLE Transaktionen erlaubt als Anchors (nicht nur most_likely_buy) → Side via Item-Kategorie bestimmen (config/item_categories.csv)",
+    "• Fix 4 - Sell-Side Filtering Enhancement: Allow SELL on buy_overview wenn Item in most_likely_sell → captured historical Sell-Transaktionen (z.B. Crystal of Void Destruction)",
+    "• Debug Tools: calibrate_region.py (Region-Verification), test_historical_fix.py (3-Transaction Integration Test), test_parsing_crystal.py (Parsing-Verification)",
+    "• ✅ Test Results: ALL 22 Tests bestehen (100%) - Wild Grass x1111 + Sealed Black Magic Crystal x468 + Crystal of Void Destruction x1 korrekt gespeichert",
+    "",
+    "✅ 2025-10-11 Quick Wins - Monitoring & Testing:",
+    "• OCR-Confidence-Logging: EasyOCR gibt jetzt Confidence-Werte zurück (avg/min/max), Warnung bei <0.5, automatisches Logging in ocr_log.txt",
+    "• GUI Status-Indikator: Ampel-System (🟢 Healthy / 🟡 Warning / 🔴 Error) basierend auf error_count, Update alle 500ms, automatische Erholung",
+    "• Basic Test Runner: scripts/run_all_tests.py führt alle test_*.py aus, sammelt Ergebnisse, Unicode-Fix für Windows",
+    "",
+    "�🔄 2025-10-11 Sprint - Architektur & Stabilität:",
+    "• Historical Transaction Detection V2: Item-Kategorien (config/item_categories.csv) mit most_likely_buy/sell für korrekte Buy/Sell-Zuordnung historischer Logs ohne Kontext",
+    "• Window Detection Simplified: Es ist IMMER nur EIN Tab sichtbar (Buy ODER Sell) → 'Sales Completed' = sell_overview, 'Orders Completed' = buy_overview (OCR-tolerant: 'pleted' akzeptiert)",
+    "• Delta-Detection DB Check: DB-Prüfung statt nur Text-Baseline verhindert Skip von echten neuen Transaktionen; GUI zeigt Live-Window-Status alle 500ms",
+    "• OCR V2 (Fixed for Game-UIs): Sanftes Preprocessing ohne aggressive Binarisierung; CLAHE clipLimit=1.5, leichte Schärfung, Helligkeit/Kontrast-Anpassung; ROI-Detection; balancierte EasyOCR-Parameter (contrast_ths=0.3, text_threshold=0.7); Tesseract mit Whitelist als Fallback",
+    "• Stop Button Responsiveness: Interruptible Sleep (100ms Chunks) ermöglicht schnelle Reaktion <200ms; self.running-Check vor teuren OCR-Operationen",
+    "• Persistent Baseline & Reduced Poll Interval: tracker_state DB-Tabelle speichert Baseline persistent → Delta-Detection überlebt App-Restart; Poll-Interval auf max 0.5s reduziert; Burst-Logik ist Legacy (nicht mehr aktiv)",
+    "• Intelligent Timestamp Assignment: Timestamp-Cluster-Erkennung am Anfang des OCR-Texts mit Index-basierter Zuordnung (1. Event → 1. TS) löst umgekehrte chronologische Reihenfolge; Fallback: Proximity-basiert",
+    "• First Snapshot Improvements: 10min Zeitfenster für historische Logs; nur ECHTER Timestamp-Drift wird korrigiert (selber Event-Typ, mehrere TS); Fresh Transaction Detection korrigiert TS auf neuesten Snapshot",
+    "• Buy-Inferenz aus Placed+Withdrew: Teilkauf als collect inferiert (quantity = placed − withdrew) NUR bei identischem Einheitspreis; verhindert Fehlbuchungen bei Preorder-Updates",
+    "• Preis-Fallback mit OCR-Fehler-Korrektur: UI-Metriken-basiert (Buy/Sell Formeln); zusätzlich fehlende führende Ziffern korrigiert (Buy: ±10Mio/100Mio/1Mrd Plausibilitätsprüfung, Sell: führende '1' bei ',XXX,XXX,XXX')"
+  ],
+
+  "pending_features": [
+    "🔧 Parsing-Heuristiken vereinfachen: Mit OCR V2 sollten viele Normalisierungs-Regeln (O→0, I→1, Z→2, führende Kommas, etc.) überflüssig werden. Nach umfangreichen Tests: Schrittweise entfernen und nur behalten, was wirklich noch nötig ist.",
+    "⚡ Performance Phase 2 (OCR-Optimierung): Screenshot-Hash-Caching (50-80% Reduktion bei statischen Screens), GPU-Acceleration für EasyOCR (60-70% schneller), Adaptive OCR-Quality, Batch-DB-Inserts (siehe docs/PERFORMANCE_ANALYSIS_2025-10-12.md für Details)",
+    "💡 GUI Verbesserungen: Fenster-Historie als eingebettete Timeline/Panel mit Live-Indikator (statt Messagebox); OCR-Methoden-Toggle ('easyocr', 'tesseract', 'both') für Vergleichstests",
+    "� Tests: Unit-/Integrationstests für Parsing, Window-Detection, Gruppierung & Case-Resolution (Happy Path + edge cases) - Scripts-Folder enthält bereits viele Test-Skripte, aber systematische Test-Suite fehlt",
+    "� Formale State-Machine: Explizite Zustände/Transitionen zwischen sell_overview/buy_overview/sell_item/buy_item inkl. Timeouts, Debounce und Side-Effects - Aktuell simpler current_window + window_history Ansatz funktioniert, aber State-Machine würde Komplexität besser strukturieren",
+    "💡 Kontext-basierte Buy/Sell-Entscheidung v2: Fenster-Historie und Aktions-Sequenzen mit gewichteter Entscheidungslogik + Confidence-Score - Aktuell Window-Type + Text-Anker ausreichend, aber für Edge-Cases wäre ML-basierter Confidence-Score hilfreich"
+  ],
+
+  "model_instruction": {
+    "role": "Du bist ein erfahrener Python-Entwickler und OCR-/Regex-Spezialist mit Expertise in Datenbank-Design, Threading und GUI-Entwicklung.",
+    
+    "objective": "Entwickle und optimiere den BDO-Market-Tracker weiter. Das System ist weitgehend implementiert, befindet sich aber noch in aktiver Entwicklung mit bekannten Problemen und Edge-Cases. Fokus liegt auf Stabilisierung, Bugfixes und Verbesserung der OCR-Genauigkeit.",
+    
+    "must_know": [
+      "🔧 System ist implementiert, aber noch NICHT vollständig stabil (aktive Entwicklung)",
+      "✅ Es gibt 4 Marktfenster: sell_overview, buy_overview, sell_item, buy_item (nur Overviews haben Log)",
+      "✅ Es ist IMMER nur EIN Tab sichtbar: 'Sales Completed' = sell_overview, 'Orders Completed' = buy_overview",
+      "✅ Persistent Baseline (tracker_state DB) implementiert, aber Edge-Cases möglich",
+      "🔧 OCR V2 mit sanftem Preprocessing implementiert, aber OCR-Fehler kommen noch vor",
+      "✅ Timestamp-Cluster-Logik für umgekehrte chronologische Reihenfolge implementiert",
+      "✅ Historical Transaction Detection via Item-Kategorien (config/item_categories.csv)",
+      "🔧 Buy-Inferenz aus Placed+Withdrew (nur bei identischem Einheitspreis) - kann noch Fehler haben",
+      "✅ DB-basierte Delta-Detection verhindert Skip von echten neuen Transaktionen",
+      "✅ Interruptible Sleep ermöglicht schnelle Stop-Response (<200ms)",
+      "✅ GUI mit Live-Window-Status, Filter, Export, Debug-Toggle, Analyse-Plot"
+    ],
+    
+    "task_examples": [
+      "Debugge OCR-Fehler anhand von ocr_log.txt und passe Preprocessing-Parameter in utils.py an",
+      "Analysiere Fehlerfälle im Log und identifiziere Parsing-Probleme",
+      "Erweitere config/item_categories.csv um neue Items (most_likely_buy/most_likely_sell)",
+      "Implementiere/Verbessere Unit-Tests für Edge-Cases (scripts/test_*.py als Vorlage)",
+      "Optimiere Fuzzy-Matching Performance mit Caching (utils.py:correct_item_name)",
+      "Füge GUI-Option für OCR-Methoden-Toggle hinzu ('easyocr', 'tesseract', 'both')",
+      "Reduziere Parsing-Heuristiken nach OCR V2 Tests (O→0, I→1, etc. ggf. überflüssig)",
+      "Behebe Duplikat-Probleme bei spezifischen Item/Timestamp-Kombinationen",
+      "Verbessere Window-Detection-Robustheit bei OCR-Fehlern",
+      "Implementiere formale State-Machine für Fenster-Übergänge (aktuell: simpler window_history)",
+      "Füge Confidence-Score für Buy/Sell-Entscheidung bei ambiguen Fällen hinzu"
+    ],
+    
+    "rules": [
+      "⚠️ NUR diese Instruction-Datei (v2.1, 2025-10-11) verwenden",
+      "⚠️ System in Entwicklung → Vorsicht bei größeren Refactorings, immer testen",
+      "⚠️ Transaktionslog NUR in sell_overview/buy_overview auswerten",
+      "⚠️ Window-Type ist IMMER eindeutig ('Sales Completed' XOR 'Orders Completed')",
+      "⚠️ Persistent Baseline MUSS nach jedem Save aktualisiert werden (save_state)",
+      "⚠️ Keine Duplikate (Session-Sig + Unique-Index + DB-Delta-Check)",
+      "⚠️ OCR-Ergebnis nie 1:1 speichern – strukturieren, validieren, deduplizieren",
+      "⚠️ Thread-safe DB-Zugriff via get_cursor()/get_connection()",
+      "⚠️ Spiel-Zeitstempel, nie System-Zeit (Timestamp-Cluster-Logik beachten)",
+      "⚠️ Defensive Programmierung (try/except) überall - OCR ist unzuverlässig",
+      "⚠️ Bei JEDEM Problem: debug_proc.png, debug_orig.png, ocr_log.txt analysieren",
+      "⚠️ Preis-Fallback NUR bei aktiven Overview + eindeutige UI-Metriken + Collect/Relist",
+      "⚠️ Nach Code-Änderungen: instructions.md updaten",
+      "⚠️ Neue Features IMMER mit Test-Skript in scripts/ validieren"
+    ],
+    
+    "example_prompts": [
+      "Analysiere die letzten 100 Zeilen in ocr_log.txt und identifiziere häufige OCR-Fehler",
+      "Erstelle Unit-Test für Timestamp-Cluster-Logik mit Edge-Cases",
+      "Optimiere correct_item_name() mit LRU-Cache für bessere Performance",
+      "Füge GUI-Toggle für OCR-Methoden hinzu (config.py + gui.py)",
+      "Implementiere State-Machine für Fenster-Übergänge (tracker.py)",
+      "Reduziere Normalisierungs-Regeln nach OCR V2 Validierung (parsing.py)",
+      "Erweitere item_categories.csv um 10 neue most_likely_buy Items",
+      "Füge Confidence-Score zu Buy/Sell-Entscheidung hinzu (ambiguous cases)",
+      "Erstelle GUI-Panel für Fenster-Historie als Timeline"
+    ]
+  },
+
+  "technical_summary": {
+    "languages": ["Python 3.10+"],
+    "libraries": [
+      "cv2 (OpenCV) - Image Preprocessing",
+      "numpy - Array Operations",
+      "mss - Fast Screenshot Capture",
+      "PIL/Pillow - Image Handling",
+      "pytesseract - OCR Fallback Engine",
+      "easyocr - Primary OCR Engine",
+      "tkinter - GUI Framework",
+      "sqlite3 - Database (built-in)",
+      "pandas - Data Export",
+      "matplotlib - Plotting",
+      "rapidfuzz (optional) - Fuzzy String Matching"
+    ],
+    "file_structure": [
+      "README.md - Projekt-Übersicht (Quick Start, Struktur, Features)",
+      "instructions.md - Diese Datei - HAUPTDOKUMENTATION (v2.3, 2025-10-12)",
+      "",
+      "Core Files:",
+      "  tracker.py - Hauptlogik (MarketTracker, Window-Detection, Gruppierung, Cases)",
+      "  gui.py - Tkinter GUI (Einzel-Scan, Auto-Track, Filter, Export, Plot)",
+      "  database.py - DB-Layer (SQLite, thread-safe, tracker_state Tabelle)",
+      "  parsing.py - OCR-Parsing (Timestamp-Slicing, Event-Extraktion, Item/Qty/Price)",
+      "  utils.py - OCR & Helpers (Preprocessing, EasyOCR/Tesseract, Fuzzy-Matching, Window-Detection)",
+      "  config.py - Konfiguration (Paths, OCR-Parameter, Regions, Whitelists)",
+      "",
+      "Data & Config:",
+      "  config/item_names.csv - Whitelist bekannter Item-Namen (für Fuzzy-Korrektur)",
+      "  config/item_categories.csv - Item-Kategorien (most_likely_buy/most_likely_sell)",
+      "  bdo_tracker.db - SQLite Datenbank (transactions + tracker_state Tabellen)",
+      "  backups/ - Automatische Datenbank-Backups",
+      "",
+      "Documentation:",
+      "  docs/OCR_V2_README.md - OCR V2 Dokumentation",
+      "  docs/PERFORMANCE_ANALYSIS_2025-10-12.md - Performance-Analyse mit Optimierungsvorschlägen",
+      "  docs/archive/ - Alte Dokumentation (QUICK_FIXES, QUICK_WINS, roadmap.txt)",
+      "  dev-screenshots/ - Referenz-Screenshots (buy/sell overview & dialogs)",
+      "",
+      "Tests & Scripts:",
+      "  scripts/run_all_tests.py - Test-Runner (22/22 Tests)",
+      "  scripts/TEST_SUITE_OVERVIEW.md - Test-Dokumentation",
+      "  scripts/test_*.py - Aktive Tests (14 Test-Dateien)",
+      "  scripts/archive/ - Alte/überholte Tests",
+      "  scripts/utils/ - Utility-Scripts (calibrate, compare_ocr, dedupe_db, reset_db, etc.)",
+      "",
+      "Debug:",
+      "  debug/ - Debug-Screenshots & Logs (archiviert)",
+      "  debug_orig.png - Aktueller Original-Screenshot",
+      "  debug_proc.png - Aktueller Preprocessed-Screenshot",
+      "  ocr_log.txt - Aktuelles OCR-Log"
+    ],
+    "database_schema": {
+      "transactions": "id, item_name, quantity, price, transaction_type, timestamp, tx_case",
+      "tracker_state": "key, value, updated_at (für persistent baseline)"
+    },
+    "gui": "Tkinter (einfach, keine Abhängigkeiten)",
+    "ocr_strategy": "EasyOCR bevorzugt (GPU optional), Tesseract als Fallback, 'both' möglich"
+  },
+
+  "output_expectations": [
+    "🔧 System ist grundlegend funktionsfähig, aber noch in aktiver Entwicklung",
+    "✅ Code muss direkt lauffähig sein (keine Platzhalter, keine fehlenden Methoden)",
+    "🔧 Fehlerresistenz gegen OCR-Unschärfen wird kontinuierlich verbessert",
+    "✅ GUI bleibt einfach (Tkinter, keine modernen Frameworks)",
+    "✅ Debug-Modus ist bereits implementiert (toggle in GUI)",
+    "⚠️ Bei Änderungen: Bestehende Funktionalität NICHT brechen, immer testen",
+    "⚠️ Jede Änderung sollte mit Test-Skript validiert werden (scripts/test_*.py)"
+  ],
+
+  "response_format": {
+    "structure": "Vollständige Datei-Inhalte die bestehende Dateien ersetzen",
+    
+    "critical_rules": [
+      "🚨 IMMER die KOMPLETTE Datei zeigen, nie nur Ausschnitte",
+      "🚨 Dateipfad MUSS exakt mit bestehendem Pfad übereinstimmen",
+      "🚨 KEINE Platzhalter wie '# ... existing code ...'",
+      "🚨 KEINE Auslassungen oder Verkürzungen",
+      "🚨 Code muss Zeichen-für-Zeichen mit Original übereinstimmen (außer Änderungen)",
+      "🚨 Einrückung muss exakt gleich sein (Spaces vs Tabs)",
+      "🚨 Zeilenumbrüche müssen gleich sein (LF vs CRLF)",
+      "🚨 Keine zusätzlichen Leerzeilen am Anfang/Ende"
+    ],
+    
+    "format_requirements": [
+      "📍 Erste Zeile: # File: <exakter_absoluter_pfad>",
+      "📄 Danach: Kompletter Dateiinhalt von Zeile 1 bis Ende",
+      "🚫 Keine Markdown-Formatierung außer dem Code-Block selbst",
+      "🚫 Keine Kommentare die nicht im Original waren",
+      "✅ Exakte Kopie des Originals + deine Änderungen"
+    ],
+    
+    "workflow": [
+      "1️⃣ Lies die komplette Original-Datei aus den Snippets",
+      "2️⃣ Kopiere den kompletten Inhalt",
+      "3️⃣ Füge deine Änderungen ein",
+      "4️⃣ Zeige die komplette geänderte Datei",
+      "5️⃣ Prüfe: Ist wirklich ALLES da? Keine Auslassungen?"
+    ],
+    
+    "correct_example": {
+      "description": "So muss eine Antwort aussehen:",
+      "structure": "**Änderungen:**\n- Funktion X hinzugefügt\n- Variable Y in __init__ ergänzt\n\n**Warum:**\nKurze Begründung\n\n```python\n# File: c:\\Users\\kdill\\Desktop\\market_tracker\\market_tracker.py\n\n# KOMPLETTER Dateiinhalt von Zeile 1 bis Ende\n# Alle Imports\n# Alle Konstanten\n# Alle Funktionen\n# Alle Klassen\n# Alles was in der Datei steht\n```\n\n**Ergebnis:**\nWas wurde erreicht"
+    },
+    
+    "wrong_examples": [
+      "❌ Nur die geänderte Funktion zeigen",
+      "❌ '# ... rest of file ...' verwenden",
+      "❌ '# ... existing code ...' verwenden",
+      "❌ Imports oder Konstanten weglassen",
+      "❌ Nur den Diff zeigen statt komplette Datei",
+      "❌ Mehrere Code-Blöcke für dieselbe Datei"
+    ],
+    
+    "multi_file_changes": {
+      "description": "Wenn mehrere Dateien geändert werden:",
+      "format": "**Änderungen:**\nListe aller betroffenen Dateien\n\n```python\n# File: <pfad_datei_1>\n<kompletter_inhalt_datei_1>\n```\n\n```python\n# File: <pfad_datei_2>\n<kompletter_inhalt_datei_2>\n```"
+    },
+    
+    "explanation_rules": [
+      "📝 Erklärungen NUR außerhalb der Code-Blöcke",
+      "🎯 VOR dem Code: Was wird geändert und warum (kurz)",
+      "✅ NACH dem Code: Was wurde erreicht (kurz)",
+      "🚫 KEINE Erklärungen als Kommentare im Code",
+      "🚫 KEINE TODO-Kommentare",
+      "🚫 KEINE Marker wie '# CHANGED HERE'"
+    ],
+    
+    "quality_checklist": [
+      "✓ Komplette Datei von Anfang bis Ende?",
+      "✓ Dateipfad exakt wie im Original?",
+      "✓ Alle Imports vorhanden?",
+      "✓ Alle Funktionen vorhanden?",
+      "✓ Alle Klassen vorhanden?",
+      "✓ Einrückung konsistent?",
+      "✓ Keine Platzhalter oder Auslassungen?",
+      "✓ Code ist lauffähig?"
+    ],
+    
+    "special_cases": {
+      "new_file": "Bei neuen Dateien: Vollständigen Inhalt zeigen mit sinnvollem Pfad",
+      "delete_file": "Explizit sagen: 'Datei X kann gelöscht werden' (keinen leeren Code-Block)",
+      "rename_file": "Zwei Code-Blöcke: Alter Pfad (leer lassen) + Neuer Pfad (voller Inhalt)"
+    }
+  },
+
+  "continuation_hint": "Starte deinen Prompt z.B. mit: 'Implementiere die Fenster-Erkennung. Zeige die KOMPLETTE market_tracker.py mit allen Änderungen (keine Auslassungen).'"
+}

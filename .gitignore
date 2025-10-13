@@ -1,0 +1,72 @@
+# IDE
+.brokk/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Database
+bdo_tracker.db
+backups/*.backup_*
+
+# Debug Files
+debug/*.png
+debug/*.txt
+debug_orig.png
+debug_proc.png
+debug_*.png
+ocr_log.txt
+
+# Test Files
+scripts/__pycache__/
+scripts/utils/__pycache__/
+scripts/archive/__pycache__/
+scripts/utils/bdo_tracker.db
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

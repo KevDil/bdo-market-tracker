@@ -1,0 +1,319 @@
+## 🎯 **Priorität 1: Robustheit & Zuverlässigkeit** (Kritisch)
+
+### **1.1 Systematische Test-Suite erstellen** ✅ **ERLEDIGT (2025-10-11)**
+**Problem:** 15+ Test-Skripte in scripts, aber keine systematische Test-Suite
+**Lösung:**
+```
+✅ Erstelle scripts/run_all_tests.py - führt alle Tests automatisch aus → DONE
+🔲 Erstelle scripts/test_suite.py - Pytest-basierte Test-Suite → TODO (Sprint 1)
+✅ Tests für kritische Paths: → 22/22 Tests vorhanden und bestehen
+   - Window Detection (alle 4 Fenster-Typen) ✅
+   - Parsing Edge-Cases (OCR-Fehler, fehlende Preise, etc.) ✅
+   - Delta-Detection (DB-Check) ✅
+   - Timestamp-Cluster-Logik ✅
+   - Buy-Inferenz (identischer Unit-Price) ✅
+   - Historical Transaction Detection ✅
+```
+**Status:** run_all_tests.py existiert und läuft (22/22 passing), Pytest-Migration noch ausstehend
+**Impact:** ⭐⭐⭐⭐⭐ - Basis für alle weiteren Verbesserungen
+
+---
+
+### **1.2 OCR-Fehler-Analyse & Monitoring** ⚠️ **TEILWEISE (2025-10-11)**
+**Problem:** OCR-Fehler kommen vor, aber keine systematische Analyse
+**Lösung:**
+```python
+# scripts/analyze_ocr_errors.py → TODO (Sprint 1 Priorität)
+🔲 Parse ocr_log.txt nach häufigen Fehlern
+🔲 Identifiziere Muster (z.B. "O→0", "I→1", "pleted")
+🔲 Erstelle Statistik: Welche Fehler kommen am häufigsten vor?
+🔲 Empfehle Preprocessing-Anpassungen basierend auf Daten
+🔲 Generiere Report mit Beispielen
+
+# tracker.py Erweiterung
+✅ Füge OCR-Confidence-Score hinzu (EasyOCR liefert das bereits) → DONE (utils.py)
+✅ Logge niedrige Confidence-Werte für manuelle Review → DONE (avg/min/max + Warnung <0.5)
+🔲 Optional: GUI-Warnung bei niedriger Confidence → TODO
+```
+**Status:** Confidence-Logging implementiert, aber kein Analyse-Tool vorhanden
+**Impact:** ⭐⭐⭐⭐⭐ - Direkte Verbesserung der Datenqualität
+
+---
+
+### **1.3 Duplikat-Detection härten** ⚠️ **TEILWEISE ERLEDIGT**
+**Problem:** DB-Delta-Check implementiert, aber Edge-Cases möglich
+**Lösung:**
+```python
+# database.py Erweiterung
+🔲 Füge find_similar_transactions() hinzu: → TODO (Sprint 2)
+   - Suche nach "fast identischen" Transaktionen (±5% Preis, ±1min Zeit)
+   - Warne bei verdächtigen Duplikaten
+   - Optionale Auto-Merge-Logik
+
+# tracker.py
+✅ Verbessere Signature-Logik: → TEILWEISE DONE
+   - ✅ Normalisiere Item-Namen (lowercase, stripped) → DONE (utils.py::normalize_item_name)
+   - ✅ DB-basierte Delta-Detection (statt nur Text-Baseline) → DONE
+   - ✅ Cluster-Building FIRST verhindert Split-Processing → DONE (2025-10-11 Fix)
+   - 🔲 Runde Preise auf sinnvolle Genauigkeit → TODO
+   - 🔲 Toleriere kleine Timestamp-Unterschiede (±30s) → TODO
+```
+**Status:** Basis-Duplikat-Schutz implementiert (DB unique index + Delta-Check), aber erweiterte Fuzzy-Detection fehlt
+**Impact:** ⭐⭐⭐⭐ - Verhindert Datenverschmutzung
+
+---
+
+## 🔧 **Priorität 2: Stabilität & Error Handling**
+
+### **2.1 Robustes Error Handling & Recovery** ✅ **ERLEDIGT (2025-10-11)**
+**Problem:** try/except vorhanden, aber kein Recovery-Mechanismus
+**Lösung:**
+```python
+# tracker.py
+✅ Füge error_count und last_error hinzu → DONE (tracker.py line 53)
+✅ Bei wiederholten OCR-Fehlern: → TEILWEISE DONE
+   - ✅ error_count erhöht sich bei Fehlern → DONE
+   - ✅ Automatische Erholung (error_count -= 1 bei Erfolg) → DONE
+   - 🔲 Reduziere Poll-Interval temporär → TODO
+   - ✅ Tesseract Fallback existiert → DONE (utils.py)
+   - ✅ Logge ausführliche Debug-Info → DONE
+✅ Bei DB-Fehlern: → TEILWEISE DONE
+   - ✅ Thread-safe connections → DONE
+   - 🔲 Retry-Logik mit Exponential Backoff → TODO
+   - 🔲 Temporärer Fallback auf In-Memory-Queue → TODO
+   - 🔲 Auto-Recovery nach DB-Wiederherstellung → TODO
+
+# gui.py
+✅ Status-Indikator für Fehler (Rot/Gelb/Grün) → DONE (🟢🟡🔴 Ampel-System)
+🔲 Letzten Fehler in GUI anzeigen → TODO
+🔲 Button "Retry Last Failed Operation" → TODO
+```
+**Status:** Error-Tracking + Health-Indikator implementiert, aber erweiterte Recovery-Features fehlen
+**Impact:** ⭐⭐⭐⭐ - System läuft auch bei Problemen weiter
+
+---
+
+### **2.2 Validierung & Sanity Checks** ⚠️ **TEILWEISE ERLEDIGT**
+**Problem:** Parsing akzeptiert teilweise unrealistische Werte
+**Lösung:**
+```python
+# parsing.py
+✅ Erweitere Validierung: → TEILWEISE DONE
+   - ✅ Basis-Validierung: quantity > 0, price > 0 → DONE
+   - 🔲 Min/Max-Grenzen für Mengen (1-100000) → TODO (derzeit nur > 0)
+   - 🔲 Min/Max-Grenzen für Preise (configurable) → TODO
+   - ✅ Fuzzy-Matching für Item-Namen → DONE (utils.py::correct_item_name)
+   - 🔲 Item-Name-Länge (3-100 Zeichen) → TODO
+   
+🔲 Füge validation_report hinzu: → TODO (Sprint 2)
+   - Logge suspekte Transaktionen
+   - Flag für "needs_manual_review"
+   - GUI-Filter für "flagged" Transaktionen
+
+# config.py
+🔲 Erweitere MIN_UNIT_PRICE/MAX_UNIT_PRICE per Item-Kategorie → TODO
+   (z.B. Saps: 1-100, Crystals: 100k-2B)
+```
+**Status:** Basis-Validierung vorhanden, aber erweiterte Plausibilitäts-Checks fehlen
+**Impact:** ⭐⭐⭐⭐ - Weniger Garbage-Daten
+
+---
+
+## 📊 **Priorität 3: Monitoring & Diagnostics**
+
+### **3.1 Health-Check & Metrics** ✅ **ERLEDIGT (2025-10-11)**
+```python
+# tracker.py
+✅ Füge get_health_status() hinzu: → DONE
+   - ✅ error_count tracking → DONE
+   - ✅ Automatische Erholung bei Erfolg → DONE
+   - 🔲 OCR success rate (last 100 scans) → TODO (derzeit nur error_count)
+   - 🔲 Parse success rate → TODO
+   - 🔲 DB connection status → TODO
+   - 🔲 Last successful transaction timestamp → TODO
+   - 🔲 Window detection accuracy → TODO
+   
+# gui.py
+✅ "System Health" Panel: → DONE (Basis-Version)
+   - ✅ Grafische Anzeige (Ampel-System 🟢🟡🔴) → DONE (gui.py line 78-98)
+   - ✅ Update alle 500ms → DONE
+   - 🔲 Detaillierte Metrics on hover → TODO
+   - 🔲 Warnung bei Verschlechterung → TODO
+```
+**Status:** Basis-Health-Indikator implementiert, aber erweiterte Metriken fehlen
+**Impact:** ⭐⭐⭐ - Früherkennung von Problemen
+
+---
+
+### **3.2 Structured Logging** 🔲 **TODO (Sprint 3)**
+**Problem:** ocr_log.txt ist Plain-Text, schwer zu parsen
+**Lösung:**
+```python
+🔲 Erweitere Logging: → TODO (Sprint 3)
+   - JSON-Format für strukturierte Daten
+   - Severity-Levels (DEBUG, INFO, WARN, ERROR)
+   - Correlation-IDs für Transaction-Flow
+   - Separate Log-Files (ocr.log, db.log, errors.log)
+   
+🔲 scripts/analyze_logs.py: → TODO
+   - Parse strukturierte Logs
+   - Generiere Reports
+   - Filter nach Severity/Zeitraum
+```
+**Status:** Aktuell Plain-Text-Logging in ocr_log.txt
+**Impact:** ⭐⭐⭐ - Bessere Diagnostics
+
+---
+
+## 🚀 **Priorität 4: Performance & Usability**
+
+### **4.1 OCR-Performance optimieren** 🔲 **TODO (Sprint 3)**
+```python
+# utils.py
+🔲 Implementiere Caching: → TODO
+   - Cache preprocessed images (Hash-basiert)
+   - Cache OCR-Ergebnisse für identische Screenshots
+   - Verfallszeit: 5 Sekunden
+   
+🔲 ROI-Detection verbessern: → TODO
+   - ✅ Basis-ROI bereits implementiert (DEFAULT_REGION) → DONE
+   - 🔲 Intelligentere Log-Region-Erkennung → TODO
+   - 🔲 Nur relevante Bereiche OCRen → TODO
+   - 🔲 Skip Header/Footer → TODO
+```
+**Status:** Basis-Region funktioniert, aber kein Caching/intelligente ROI
+**Impact:** ⭐⭐⭐ - Schnellere Scans
+
+---
+
+### **4.2 GUI-Verbesserungen** ⚠️ **TEILWEISE ERLEDIGT**
+```python
+# gui.py
+⚠️ Live-Statistiken: → TEILWEISE DONE
+   - ✅ Basis-Filter nach Item/Side/Type existiert → DONE
+   - ✅ Analyse-Plot-Button → DONE
+   - 🔲 Transaktionen heute/gestern/diese Woche → TODO
+   - 🔲 Profit/Loss (Buy vs Sell) → TODO
+   - 🔲 Top-Items → TODO
+   
+🔲 Quick-Filters: → TODO
+   - "Heute", "Diese Woche", "Letzter Monat"
+   - "Nur Käufe", "Nur Verkäufe"
+   - "Flagged" (suspekte Transaktionen)
+   
+⚠️ Verbesserte Fenster-Historie: → TEILWEISE DONE
+   - ✅ Live Window Status (window_status_var) → DONE
+   - 🔲 Timeline-Ansicht statt Messagebox → TODO
+   - 🔲 Farbcodierung (sell=grün, buy=blau, detail=grau) → TODO
+```
+**Status:** Basis-GUI funktioniert, aber erweiterte Statistiken/Filter fehlen
+**Impact:** ⭐⭐⭐ - Bessere User Experience
+
+---
+
+## 📋 **Empfohlene Reihenfolge:**
+
+### **Sprint 1 (Woche 1): Fundament**
+1. ✅ Systematische Test-Suite (1.1) - 2-3 Tage
+2. ✅ OCR-Fehler-Analyse (1.2) - 1-2 Tage
+3. ✅ Error Handling & Recovery (2.1) - 2 Tage
+
+**Ziel:** Solide Basis für weitere Entwicklung
+
+---
+
+### **Sprint 2 (Woche 2): Robustheit**
+1. ✅ Duplikat-Detection härten (1.3) - 1-2 Tage
+2. ✅ Validierung & Sanity Checks (2.2) - 2 Tage
+3. ✅ Health-Check & Metrics (3.1) - 1 Tag
+
+**Ziel:** System ist selbst-überwachend und robust
+
+---
+
+### **Sprint 3 (Woche 3): Polish**
+1. ✅ Structured Logging (3.2) - 1-2 Tage
+2. ✅ OCR-Performance (4.1) - 1-2 Tage
+3. ✅ GUI-Verbesserungen (4.2) - 2 Tage
+
+**Ziel:** System ist benutzerfreundlich und performant
+
+---
+
+## 🎯 **Quick Wins** ✅ **ALLE ERLEDIGT (2025-10-11)**
+
+### **A. OCR-Confidence in Log schreiben** ✅ **DONE**
+```python
+# utils.py - extract_text() lines 177-207
+# ✅ EasyOCR mit detail=1 → (bbox, text, confidence)
+# ✅ Loggt: avg/min/max confidence
+# ✅ Warnung bei <0.5: "⚠️ LOW CONFIDENCE"
+```
+⏱️ 15 Minuten, ⭐⭐⭐⭐ Impact → **ERLEDIGT**
+
+---
+
+### **B. GUI: Status-Indikator** ✅ **DONE**
+```python
+# gui.py lines 78-98
+# ✅ health_status_var = "🟢 Healthy" | "🟡 Warning" | "🔴 Error"
+# ✅ Update alle 500ms basierend auf error_count
+# ✅ Farbcodierung: green/orange/red
+```
+⏱️ 30 Minuten, ⭐⭐⭐ Impact → **ERLEDIGT**
+
+---
+
+### **C. Basic Test Runner** ✅ **DONE**
+```python
+# scripts/run_all_tests.py
+# ✅ Führt alle test_*.py Dateien aus
+# ✅ Sammelt Ergebnisse und zeigt Summary
+# ✅ Unicode-Fix für Windows
+# ✅ Aktuell: 22/22 Tests bestehen (100%)
+```
+⏱️ 20 Minuten, ⭐⭐⭐⭐⭐ Impact → **ERLEDIGT**
+
+---
+
+## 💡 **Aktueller Stand & Empfehlung (2025-10-12)**
+
+### ✅ **ERLEDIGT:**
+- Quick Wins A+B+C (OCR Confidence, Health Indikator, Test Runner)
+- Test-Suite: 22/22 Tests bestehen (100%)
+- Critical Fixes: Cluster-Building Refactor, Historical Detection V3
+- Error Handling Basis: error_count tracking, automatische Erholung
+
+### 🎯 **NÄCHSTE SCHRITTE - Sprint 1 (diese Woche):**
+
+1. **PRIORITÄT 1: Pytest-Migration** (2-3 Tage)
+   - Erstelle `scripts/test_suite.py` mit pytest-basierter Suite
+   - Organisiere Tests nach Kategorien (window_detection/, parsing/, etc.)
+   - Füge Coverage-Reporting hinzu
+   - **Warum:** Bessere Test-Organisation, CI/CD-ready
+
+2. **PRIORITÄT 2: OCR-Fehler-Analyse Tool** (1-2 Tage)
+   - Erstelle `scripts/analyze_ocr_errors.py`
+   - Parse ocr_log.txt nach Mustern
+   - Generiere Statistik: häufigste Fehler, Confidence-Verteilung
+   - Empfehle item_names.csv Ergänzungen
+   - **Warum:** Datenqualität direkt verbessern
+
+3. **PRIORITÄT 3: GUI Enhancements** (1 Tag)
+   - GUI-Warnung bei niedriger OCR Confidence
+   - Letzten Fehler anzeigen
+   - Quick-Filters (Heute/Woche/Monat)
+   - **Warum:** Bessere User Experience
+
+### 🔄 **Sprint 2 (nächste Woche):**
+- Duplikat-Detection härten (find_similar_transactions)
+- Erweiterte Validierung (Min/Max-Grenzen per Item-Kategorie)
+- Detaillierte Health-Metrics (Success-Rates, DB-Status)
+
+### 🚀 **Sprint 3 (danach):**
+- Structured Logging (JSON-Format)
+- OCR-Performance (Caching, intelligente ROI)
+- GUI-Polish (Timeline, Statistiken, Profit/Loss)
+
+---
+
