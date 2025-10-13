@@ -298,3 +298,48 @@ def transaction_exists_any_side(item_name: str, quantity: int, price: int, times
         return c.fetchone() is not None
     except Exception:
         return False
+
+
+def transaction_exists_by_values_near_time(item_name: str, quantity: int, price: int, timestamp, tolerance_minutes: int = 2) -> bool:
+    """Check whether a transaction exists with same item/qty/price within a time tolerance.
+    
+    CRITICAL: Used to prevent duplicates when OCR gives wrong timestamp.
+    
+    Args:
+        tolerance_minutes: Time window in minutes to check for duplicates (default 2 minutes)
+    
+    Example:
+        - Transaction exists at 22:26 with Magical Shard 200x @ 546M
+        - New scan at 22:42 with same values but different timestamp (OCR error)
+        - If within tolerance (e.g., 2 min): DUPLICATE (skip)
+        - If outside tolerance (e.g., 20 min): DIFFERENT TRANSACTION (save)
+    
+    This allows:
+        - Filtering out OCR-induced duplicates (seconds/minutes apart)
+        - Saving legitimate repeat purchases (hours/days apart)
+    """
+    try:
+        if not isinstance(timestamp, datetime):
+            try:
+                timestamp = datetime.fromisoformat(str(timestamp))
+            except Exception:
+                return False
+        
+        start_time = timestamp - timedelta(minutes=tolerance_minutes)
+        end_time = timestamp + timedelta(minutes=tolerance_minutes)
+        
+        c = get_cursor()
+        c.execute(
+            """
+            SELECT timestamp FROM transactions
+            WHERE item_name = ? AND quantity = ? AND price = ?
+              AND timestamp BETWEEN ? AND ?
+            LIMIT 1
+            """,
+            (item_name, int(quantity), int(price), 
+             start_time.strftime("%Y-%m-%d %H:%M:%S"), 
+             end_time.strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        return c.fetchone() is not None
+    except Exception:
+        return False

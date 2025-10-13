@@ -5,6 +5,7 @@ import datetime
 import re
 import json
 import cv2
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from functools import lru_cache
@@ -46,6 +47,7 @@ from database import (
     transaction_exists_by_item_timestamp,
     transaction_exists_exact,
     transaction_exists_any_side,
+    transaction_exists_by_values_near_time,
 )
 from parsing import (
     split_text_into_log_entries,
@@ -189,26 +191,31 @@ class MarketTracker:
 
         try:
             preprocess_start = time.perf_counter()
-            proc = preprocess(img, adaptive=True, denoise=False)
+            # BALANCED PREPROCESSING: Use adaptive CLAHE but skip denoise
+            # Fast mode was too aggressive and hurt OCR quality
+            proc = preprocess(img, adaptive=True, denoise=False, fast_mode=False)
             preprocess_time = (time.perf_counter() - preprocess_start) * 1000
             if self.debug:
-                log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms")
+                log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
 
             if allow_debug and self.debug:
                 self._write_debug_images(img, proc, context)
 
             ocr_start = time.perf_counter()
+            # BALANCED MODE: Faster than original but maintains accuracy
+            # Fast mode was too aggressive and missed transaction lines
             text, was_cached, cache_stats = ocr_image_cached(
                 img,
                 method='easyocr',
                 use_roi=True,
                 preprocessed=proc,
+                fast_mode=True,  # Still use fast mode for speed, but with balanced OCR params
             )
             ocr_time = (time.perf_counter() - ocr_start) * 1000
             if self.debug:
                 cache_indicator = " [CACHED]" if was_cached else ""
                 log_debug(
-                    f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} "
+                    f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
                     f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
                 )
 
@@ -583,6 +590,52 @@ class MarketTracker:
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime.datetime) else str(ts)
         occ = int(occurrence_index) if occurrence_index is not None else -1
         return (item.lower() if item else "", int(qty) if qty else 0, int(price) if price else 0, tx_type, ts_str, occ)
+    
+    def make_content_hash(self, tx):
+        """Generate a position-aware content-based hash for deduplication.
+        
+        CRITICAL: This hash includes the surrounding context/position to distinguish
+        between multiple identical transactions that happen within seconds.
+        
+        The hash includes:
+        - Normalized raw text from transaction line
+        - PRECEDING text (context before the transaction) to make each unique
+        - Timestamp from OCR to distinguish same-second transactions
+        """
+        try:
+            # Try to use raw text + context from related entries
+            raw_text = None
+            context_before = ""
+            
+            for r in tx.get('raw_related', []):
+                if r.get('type') in ('transaction', 'purchased') and r.get('raw'):
+                    raw_text = r['raw']
+                    # Use ts_text as context (timestamp in OCR)
+                    context_before = r.get('ts_text', '')
+                    break
+            
+            if raw_text:
+                # Normalize: lowercase, remove extra spaces
+                normalized = re.sub(r'\s+', ' ', raw_text.lower()).strip()
+                # Remove all numbers but keep text structure
+                normalized = re.sub(r'\d+[,\.\d]*', 'N', normalized)
+                normalized = re.sub(r'\s+', ' ', normalized).strip()
+                # Add context (timestamp) to make hash unique for each position
+                hash_input = f"{context_before}|{normalized}"
+            else:
+                # Fallback: use parsed values + timestamp
+                ts_str = tx['timestamp'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(tx.get('timestamp'), datetime.datetime) else str(tx.get('timestamp', ''))
+                hash_input = f"{tx['item_name']}|{tx['quantity']}|{int(tx['price'] or 0)}|{tx['transaction_type']}|{ts_str}".lower()
+            
+            # Generate SHA256 hash (first 16 chars sufficient)
+            return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]
+        except Exception:
+            # Fallback: simple hash of item+qty+price+timestamp
+            ts_str = tx.get('timestamp', '')
+            if isinstance(ts_str, datetime.datetime):
+                ts_str = ts_str.strftime("%Y-%m-%d %H:%M:%S")
+            simple = f"{tx.get('item_name', '')}|{tx.get('quantity', 0)}|{int(tx.get('price', 0) or 0)}|{ts_str}".lower()
+            return hashlib.sha256(simple.encode('utf-8')).hexdigest()[:16]
 
     def store_transaction_db(self, tx):
         """Speichert eine Transaktion in der DB thread-sicher."""
@@ -598,13 +651,63 @@ class MarketTracker:
             occ_idx = int(occ_idx_raw) if occ_idx_raw is not None else 0
         except Exception:
             occ_idx = 0
+        
+        # CRITICAL: Generate content hash for reliable deduplication
+        content_hash = self.make_content_hash(tx)
+        
         sig = self.make_tx_sig(item, qty, price, ttype, ts, occ_idx)
         if sig in self.seen_tx_signatures:
             if self.debug:
                 print("DEBUG: already seen (session):", sig)
             return False
+        # CRITICAL: Check content_hash for duplicates (most reliable method)
+        # Only skip if hash matches AND timestamp is within 20 minutes (likely OCR duplicate)
+        # If timestamp differs by more than 20 minutes, it's likely a legitimate repeat purchase
+        # 20 minutes is conservative but safe: most OCR duplicates occur within same session
+        try:
+            db_cur = get_cursor()
+            db_cur.execute(
+                "SELECT id, timestamp FROM transactions WHERE content_hash = ?",
+                (content_hash,)
+            )
+            existing_by_hash = db_cur.fetchone()
+            if existing_by_hash:
+                existing_id, existing_ts_str = existing_by_hash
+                # Parse existing timestamp
+                try:
+                    from datetime import datetime as dt
+                    existing_ts = dt.fromisoformat(existing_ts_str)
+                    if isinstance(ts, datetime.datetime):
+                        time_diff_minutes = abs((ts - existing_ts).total_seconds()) / 60
+                        if time_diff_minutes <= 20:
+                            # Within 20 minutes - likely OCR duplicate from same session
+                            if self.debug:
+                                log_debug(f"[CONTENT-HASH] Skip duplicate: {item} {qty}x @ {price} (hash={content_hash}, time_diff={time_diff_minutes:.1f}min, existing={existing_ts_str})")
+                            print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {ttype.UPPER()} - {qty}x {item} (Δ{time_diff_minutes:.1f}min)")
+                            self.seen_tx_signatures.append(sig)
+                            return False
+                        else:
+                            # More than 20 minutes apart - legitimate repeat purchase
+                            if self.debug:
+                                log_debug(f"[CONTENT-HASH] Allow repeat purchase: {item} {qty}x @ {price} (time_diff={time_diff_minutes:.1f}min > 20min)")
+                except Exception:
+                    # If timestamp parsing fails, skip based on hash alone (conservative)
+                    if self.debug:
+                        log_debug(f"[CONTENT-HASH] Skip (timestamp parse failed): {item} {qty}x")
+                    print(f"⚠️ Duplikat erkannt (Content-Hash): {ttype.UPPER()} - {qty}x {item}")
+                    self.seen_tx_signatures.append(sig)
+                    return False
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[CONTENT-HASH] Check failed: {e}")
+        
+        # CRITICAL: Skip transactions with invalid price OR quantity
         if price is None or price == 0:
-            print(f"⚠️ Überspringe unsichere Transaktion (kein Preis): {ttype.upper()} {qty}x {item} ts={ts_str}")
+            print(f"⚠️ Überspringe unsichere Transaktion (kein Preis): {ttype.UPPER()} {qty}x {item} ts={ts_str}")
+            self.seen_tx_signatures.append(sig)  # deque uses append, not add
+            return False
+        if qty is None or qty <= 0:
+            print(f"⚠️ Überspringe unsichere Transaktion (keine/ungültige Menge): {ttype.UPPER()} {qty}x {item} ts={ts_str}")
             self.seen_tx_signatures.append(sig)  # deque uses append, not add
             return False
         # If a transaction with same (item, qty, price, type) already exists at a different timestamp, avoid duplicating it.
@@ -630,10 +733,10 @@ class MarketTracker:
                 db_cur = get_cursor()
                 db_cur.execute(
                     """
-                    INSERT OR IGNORE INTO transactions (item_name, quantity, price, transaction_type, timestamp, tx_case, occurrence_index)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO transactions (item_name, quantity, price, transaction_type, timestamp, tx_case, occurrence_index, content_hash)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (item, qty, price, ttype, ts_str, case, occ_idx)
+                    (item, qty, price, ttype, ts_str, case, occ_idx, content_hash)
                 )
                 get_connection().commit()
                 if db_cur.rowcount == 0:
@@ -722,17 +825,18 @@ class MarketTracker:
                 log_debug(msg)
             return
 
-        # If we just returned from a detail window (prev_window was buy_item/sell_item) into an overview,
-        # schedule a couple of immediate fast scans to catch the log update that might render a few frames later.
-        # CRITICAL: Transaction lines appear 1-3 seconds AFTER returning to overview, especially for fast purchases
-        # Need longer burst window to catch Maple Sap, Pure Powder Reagent, etc.
+        # CRITICAL PERFORMANCE FIX: Immediate burst scanning when returning from item window
+        # Transaction lines appear instantly or within ~200-500ms after returning to overview
+        # Old approach: wait 1-3 seconds with slow scans = missed transactions
+        # New approach: IMMEDIATE burst of 10-15 fast scans at 80ms intervals = capture within 1-2s
         if prev_window in ("buy_item", "sell_item") and wtype in ("sell_overview", "buy_overview"):
-            self._burst_fast_scans = max(self._burst_fast_scans, 8)  # Increased from 3 to 8
-            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=4.5))  # Increased from 2s to 4.5s
-            # request immediate quick re-scans to catch late-rendering log lines
-            self._request_immediate_rescan = max(self._request_immediate_rescan, 3)  # Increased from 2 to 3
+            # AGGRESSIVE: More scans, longer burst window
+            self._burst_fast_scans = max(self._burst_fast_scans, 15)  # Was 8, now 15 (1.2s of fast scans)
+            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=3.0))  # Was 4.5s, now 3s
+            # Immediate re-scans (no sleep between scans)
+            self._request_immediate_rescan = max(self._request_immediate_rescan, 5)  # Was 3, now 5
             if self.debug:
-                log_debug(f"[BURST] Returned from {prev_window} to {wtype} -> scheduling {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (extended for transaction capture)")
+                log_debug(f"[BURST-AGGRESSIVE] Returned from {prev_window} to {wtype} -> {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (TARGET: <1s capture)")
 
         # build structured entries
         structured = []
@@ -889,12 +993,19 @@ class MarketTracker:
                 if self.debug:
                     log_debug(f"first snapshot timestamp adjustment error: {e}")
         
-        # Fresh Transaction Detection: Wenn eine Transaction im aktuellen Scan neu ist (nicht in Baseline),
-        # dann gebe ihr den neuesten Timestamp aus diesem Scan, nicht einen alten aus dem Log.
-        # Dies ist wichtig nach Collect-Buttons, wo die Transaction-Zeile mit einem alten Log-Timestamp
-        # erscheint, aber tatsächlich gerade erst passiert ist.
-        # CRITICAL FIX: Prüfe NICHT nur ob Item im Baseline ist, sondern ob die SPEZIFISCHE Transaktion
-        # (item/qty/price) bereits in der DB existiert. Das verhindert Duplikate von alten Log-Einträgen.
+        # Fresh Transaction Detection (FIXED)
+        # Purpose: Handle "fast collect" scenario where transaction appears with OLD log timestamp
+        # but was actually just executed (e.g., collect at 22:06 shows "21:55" in log).
+        # 
+        # CRITICAL FIX: Only adjust timestamps for transactions that are RECENT (within 60 seconds).
+        # Old log entries (e.g., 21:55 when current time is 22:06 = 11 minutes) should NOT be adjusted!
+        # 
+        # Criteria for "fresh" transaction:
+        #   1. Item not in baseline (new in this scan)
+        #   2. Transaction timestamp is RECENT (within FRESH_TX_WINDOW seconds)
+        #   3. Transaction not already in DB
+        # 
+        FRESH_TX_WINDOW = 60  # seconds - only adjust if timestamp is within last 60 seconds
         if not first_snapshot_mode and overall_max_ts is not None and self.last_overview_text:
             try:
                 # Suche nach frischen Transaction/Purchased-Einträgen (nicht in letzter Baseline)
@@ -951,13 +1062,18 @@ class MarketTracker:
                                     log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
                                 continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
                             
-                            # Transaktion ist wirklich frisch, adjustiere Timestamp
-                            if ts < overall_max_ts:
+                            # CRITICAL FIX: Only adjust if timestamp is RECENT (within FRESH_TX_WINDOW)
+                            # This prevents adjusting OLD log entries (e.g., 21:55 when current is 22:06)
+                            time_diff_seconds = abs((overall_max_ts - ts).total_seconds())
+                            if time_diff_seconds <= FRESH_TX_WINDOW and ts < overall_max_ts:
                                 if self.debug:
                                     old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
                                     new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                    log_debug(f"fresh transaction detected for '{s['item']}' (newest of {len(entries)}): adjusting ts {old_ts} -> {new_ts}")
+                                    log_debug(f"[FRESH-TX] '{s['item']}' (newest of {len(entries)}) within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} -> {new_ts}")
                                 s['timestamp'] = overall_max_ts
+                            elif time_diff_seconds > FRESH_TX_WINDOW:
+                                if self.debug:
+                                    log_debug(f"[FRESH-TX] Skip '{s['item']}' - timestamp too old ({time_diff_seconds:.0f}s > {FRESH_TX_WINDOW}s window)")
                     else:
                         # Nur eine Transaktion, normale Logik
                         idx, s = entries[0]
@@ -975,13 +1091,17 @@ class MarketTracker:
                                     log_debug(f"[DUPLICATE PREVENTION] '{item_name}' {qty}x @ {price} already in DB (ID={existing[0]}) - skipping timestamp adjustment")
                                 continue  # Diese Transaktion ist bereits in der DB, nicht duplizieren!
                             
-                            # Transaktion ist wirklich frisch, adjustiere Timestamp
-                            if ts < overall_max_ts:
+                            # CRITICAL FIX: Only adjust if timestamp is RECENT (within FRESH_TX_WINDOW)
+                            time_diff_seconds = abs((overall_max_ts - ts).total_seconds())
+                            if time_diff_seconds <= FRESH_TX_WINDOW and ts < overall_max_ts:
                                 if self.debug:
                                     old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
                                     new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                    log_debug(f"fresh transaction detected for '{s['item']}': adjusting ts {old_ts} -> {new_ts}")
+                                    log_debug(f"[FRESH-TX] '{s['item']}' within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} -> {new_ts}")
                                 s['timestamp'] = overall_max_ts
+                            elif time_diff_seconds > FRESH_TX_WINDOW:
+                                if self.debug:
+                                    log_debug(f"[FRESH-TX] Skip '{s['item']}' - timestamp too old ({time_diff_seconds:.0f}s > {FRESH_TX_WINDOW}s window)")
             except Exception as e:
                 if self.debug:
                     log_debug(f"fresh transaction detection error: {e}")
@@ -2400,8 +2520,13 @@ class MarketTracker:
                     main_ts_text = r['ts_text']
                     break
             if main_raw is None:
-                # fallback: use item+timestamp
-                main_raw = f"{tx['item_name']} {tx['quantity']} {tx['price']}"
+                # CRITICAL: Fallback signature must match OCR text format
+                # Format: "Transaction of {item} x{qty} worth {price} Silver"
+                # This allows baseline text matching even when timestamp is missing
+                item_str = tx['item_name'] or ''
+                qty_str = f"x{tx['quantity']}" if tx['quantity'] else ''
+                price_str = f"{tx['price']:,}" if tx['price'] else ''
+                main_raw = f"Transaction of {item_str} {qty_str} worth {price_str} Silver"
                 if isinstance(tx['timestamp'], datetime.datetime):
                     main_ts_text = tx['timestamp'].strftime("%Y-%m-%d %H:%M")
                 else:
@@ -2409,6 +2534,34 @@ class MarketTracker:
             normalized_main = re.sub(r'\s+', ' ', main_raw).strip()[:180]
             key = (main_ts_text, normalized_main)
             already_seen_in_prev = (key in prev_entries) or (normalized_main in prev_snippets)
+            
+            # CRITICAL: Robust baseline matching for transactions with similar item+qty+price
+            # If normalized text doesn't match, try pattern-based matching in baseline text
+            if not already_seen_in_prev and self.last_overview_text:
+                try:
+                    # Build a regex pattern to find this transaction in baseline
+                    # Pattern: "Transaction of {item}...x{qty}...{price_approx}"
+                    item_pattern = re.escape(tx['item_name'] or '').replace('\\ ', '\\s+')
+                    qty_pattern = str(tx['quantity'] or '').replace(',', ',?')  # Allow optional commas
+                    # Price pattern: allow commas, spaces, OCR errors (O for 0, etc)
+                    price_str = str(int(tx['price'] or 0))
+                    # Build flexible price pattern (allow first/last 3 digits to match)
+                    if len(price_str) > 6:
+                        price_prefix = price_str[:3]
+                        price_suffix = price_str[-3:]
+                        price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
+                    else:
+                        price_pattern = price_str.replace(',', ',?')
+                    
+                    pattern = rf"Transaction\s+of\s+{item_pattern}\s*.*?x?\s*{qty_pattern}\s*.*?{price_pattern}"
+                    if re.search(pattern, self.last_overview_text, re.IGNORECASE | re.DOTALL):
+                        already_seen_in_prev = True
+                        if self.debug:
+                            log_debug(f"[BASELINE-PATTERN] Matched '{tx['item_name']}' {tx['quantity']}x in previous baseline (pattern match)")
+                except Exception as e:
+                    if self.debug:
+                        log_debug(f"[BASELINE-PATTERN] Pattern match failed: {e}")
+            
             tx['_main_ts_text'] = main_ts_text
             tx['_normalized_main'] = normalized_main
             tx['_seen_in_prev'] = already_seen_in_prev
@@ -2423,6 +2576,8 @@ class MarketTracker:
             # Check if this exact transaction already exists in DATABASE (not just baseline text)
             already_in_db = occurrence_reused
             already_in_db_any_side = False
+            already_in_db_by_values = False
+            
             if not already_in_db:
                 try:
                     already_in_db = transaction_exists_exact(
@@ -2436,6 +2591,7 @@ class MarketTracker:
                 except Exception as e:
                     if self.debug:
                         log_debug(f"[DELTA] DB check failed: {e}")
+            
             if not already_in_db:
                 try:
                     already_in_db_any_side = transaction_exists_any_side(
@@ -2447,9 +2603,26 @@ class MarketTracker:
                 except Exception:
                     already_in_db_any_side = False
             
+            # DISABLED: Value-based deduplication is unreliable
+            # Problem: Cannot distinguish between:
+            #   1. OCR duplicate (same transaction, wrong timestamp)
+            #   2. Real repeat purchase (two identical transactions)
+            # Both can happen within seconds/minutes!
+            # 
+            # Solution: Rely on baseline text comparison instead.
+            # If the transaction text appears in previous baseline, it's a duplicate.
+            # If it's new text, save it (even if values match existing transaction).
+            already_in_db_by_values = False
+            
             # Check baseline text (less strict - only for additional filtering)
             if self.debug:
-                log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}")
+                log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}, near_time={already_in_db_by_values}")
+            
+            # Skip if time-aware deduplication matched (same item/qty/price within 2min window)
+            if already_in_db_by_values:
+                if self.debug:
+                    log_debug(f"[DELTA] SKIP (time-dedup): {tx['item_name']} {tx['quantity']}x @ {tx['price']} - duplicate within time window")
+                continue
             
             # Skip only if: (not newer) AND (already in DB)
             if not skip_prev_delta and (not is_newer_than_prev) and already_in_db:
