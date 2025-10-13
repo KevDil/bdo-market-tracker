@@ -1178,11 +1178,22 @@ class MarketTracker:
             else:
                 ent = cluster_entries[0]
             
-            # On sell overview, skip listed-only clusters (no confirmed transaction)
+            # On sell overview, skip listed-only clusters UNLESS UI metrics show completed sales
             if wtype == 'sell_overview' and not transaction_entry and listed_entry and ent['type'] == 'listed':
-                if self.debug:
-                    log_debug(f"[CLUSTER] Skip 'listed'-only for '{ent.get('item')}' on sell_overview (no transaction)")
-                continue
+                # Check if UI metrics show salesCompleted > 0 for this item (fast collect scenario)
+                has_sell_ui_evidence = False
+                item_lc_check = (ent.get('item') or '').lower()
+                if item_lc_check in ui_sell:
+                    sc = ui_sell[item_lc_check].get('salesCompleted', 0) or 0
+                    if sc > 0:
+                        has_sell_ui_evidence = True
+                        if self.debug:
+                            log_debug(f"[UI-EVIDENCE] Item '{ent.get('item')}' has salesCompleted={sc} - allowing sell without transaction line (fast collect scenario)")
+                
+                if not has_sell_ui_evidence:
+                    if self.debug:
+                        log_debug(f"[CLUSTER] Skip 'listed'-only for '{ent.get('item')}' on sell_overview (no transaction)")
+                    continue
             # determine case from related types (keep placed/listed separate) and window type
             types_present = {r['type'] for r in related}
             # Do not infer additional types from raw; rely on structured related entries only
@@ -1245,8 +1256,21 @@ class MarketTracker:
             # Case resolution depends on side
             if side == 'sell':
                 # Strict requirement: only consider sell cases when an explicit 'transaction' anchor is present
+                # EXCEPTION: If UI metrics show salesCompleted > 0, allow sell even without transaction line
                 has_transaction_anchor = any(r['type'] == 'transaction' for r in related) or ent['type'] == 'transaction'
+                
+                # Check UI evidence for fast collect scenarios (transaction line scrolled off)
+                has_sell_ui_evidence_anchor = False
                 if not has_transaction_anchor:
+                    item_lc_check = (ent.get('item') or '').lower()
+                    if item_lc_check in ui_sell:
+                        sc = ui_sell[item_lc_check].get('salesCompleted', 0) or 0
+                        if sc > 0:
+                            has_sell_ui_evidence_anchor = True
+                            if self.debug:
+                                log_debug(f"[UI-EVIDENCE] Allowing sell for '{ent.get('item')}' with UI evidence (salesCompleted={sc}) despite missing transaction line")
+                
+                if not has_transaction_anchor and not has_sell_ui_evidence_anchor:
                     if self.debug:
                         log_debug(f"skip sell without transaction anchor for item='{ent['item']}' on {wtype}")
                     continue
@@ -1463,24 +1487,58 @@ class MarketTracker:
                         quantity = tx_rel['qty']
                     if tx_rel.get('price'):
                         price = tx_rel['price']
+                
+                # CRITICAL: If NO transaction line (missing qty or price), use UI metrics directly
+                # This handles fast collect scenarios where transaction line scrolled off before OCR scan
+                if (quantity is None or price is None or price <= 0):
+                    try:
+                        item_name_raw = (ent.get('item') or '')
+                        item_lc2 = item_name_raw.lower()
+                        m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
+                        if (not m_ui) and 'ui_sell_norm' in locals():
+                            m_ui = ui_sell_norm.get(_norm_key(item_name_raw))
+                        
+                        if m_ui:
+                            sc = m_ui.get('salesCompleted') or 0
+                            unit_price = m_ui.get('price') or 0
+                            
+                            if sc > 0 and unit_price > 0:
+                                # Calculate quantity from UI if missing
+                                if quantity is None or quantity <= 0:
+                                    quantity = sc
+                                    if self.debug:
+                                        log_debug(f"[UI-FALLBACK] Using salesCompleted={sc} for quantity (no transaction line)")
+                                
+                                # Calculate price from UI
+                                if price is None or price <= 0:
+                                    price = int(round(unit_price * quantity * 0.88725))
+                                    if self.debug:
+                                        log_debug(f"[UI-FALLBACK] Calculated sell price from UI: {quantity}x * {unit_price} * 0.88725 = {price:,}")
+                    except Exception as e:
+                        if self.debug:
+                            log_debug(f"[UI-FALLBACK] Failed for sell event: {e}")
+                
                 # If price seems truncated (missing leading digit) use UI metrics (per-unit price) to correct:
                 # expected_net = unit_price * quantity * 0.88725, and only adjust if expected endswith current price.
-                try:
-                    item_name_raw = (ent.get('item') or '')
-                    item_lc2 = item_name_raw.lower()
-                    m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
-                    if (not m_ui) and 'ui_sell_norm' in locals():
-                        m_ui = ui_sell_norm.get(_norm_key(item_name_raw))
-                    if m_ui and quantity:
-                        unit_price = m_ui.get('price') or 0
-                        if unit_price > 0:
-                            expected_net = int(round(unit_price * quantity * 0.88725))
-                            if price and expected_net > price:
-                                pstr = str(int(price))
-                                if str(expected_net).endswith(pstr):
-                                    price = expected_net
-                except Exception:
-                    pass
+                elif quantity and price:
+                    try:
+                        item_name_raw = (ent.get('item') or '')
+                        item_lc2 = item_name_raw.lower()
+                        m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
+                        if (not m_ui) and 'ui_sell_norm' in locals():
+                            m_ui = ui_sell_norm.get(_norm_key(item_name_raw))
+                        if m_ui and quantity:
+                            unit_price = m_ui.get('price') or 0
+                            if unit_price > 0:
+                                expected_net = int(round(unit_price * quantity * 0.88725))
+                                if expected_net > price:
+                                    pstr = str(int(price))
+                                    if str(expected_net).endswith(pstr):
+                                        price = expected_net
+                                        if self.debug:
+                                            log_debug(f"[UI-CORRECTION] Corrected truncated sell price: {pstr} → {price:,}")
+                    except Exception:
+                        pass
             elif final_type == 'buy':
                 # Prefer 'purchased' values; if both purchased and transaction exist for same item/ts and differ, we will save both entries.
                 pur_rel = next((r for r in related if r['type'] == 'purchased' and (r.get('qty') or r.get('price'))), None)
