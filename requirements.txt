@@ -25,6 +25,10 @@ matplotlib>=3.7.0
 # Optional: Fuzzy String Matching for Item Names
 rapidfuzz>=3.0.0
 
+# Phase 2: PaddleOCR for enhanced Game-UI OCR
+paddlepaddle>=3.2.0
+paddleocr>=3.2.0
+
 # HTTP Client for BDO API calls
 requests>=2.31.0
 

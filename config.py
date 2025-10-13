@@ -7,7 +7,19 @@ import easyocr
 # -----------------------
 TESS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 pytesseract.pytesseract.tesseract_cmd = TESS_PATH
-USE_EASYOCR = True
+
+# -----------------------
+# OCR Engine Selection (Phase 2 - ML Integration)
+# -----------------------
+# Available engines: 'paddle', 'easyocr', 'tesseract'
+# PaddleOCR: Optimiert für Game-UI (RGB + höhere Confidence-Threshold)
+# EasyOCR: Fallback wenn PaddleOCR fehlschlägt
+# Tesseract: Final fallback (system-level)
+OCR_ENGINE = 'paddle'  # Primäre OCR-Engine (optimiert mit besseren Parametern)
+OCR_FALLBACK_ENABLED = True  # EasyOCR Fallback bei Bedarf
+
+# Legacy compatibility
+USE_EASYOCR = True  # Behalten für Backward-Kompatibilität
 DB_PATH = "bdo_tracker.db"
 LOG_PATH = "ocr_log.txt"
 DEFAULT_REGION = (734, 371, 1823, 1070)
@@ -101,7 +113,7 @@ MAX_ITEM_QUANTITY = 5000
 #   1. USE_GPU = False         → CPU-only (langsamer, aber keine Game-Ruckler)
 #   2. GPU_MEMORY_LIMIT = 2048 → Limitiert VRAM-Nutzung (MB)
 #   3. GPU_LOW_PRIORITY = True → OCR bekommt niedrige GPU-Priorität
-USE_GPU = True  # ⚠️ Auf True setzen wenn GPU verfügbar UND Game-Ruckler akzeptabel
+USE_GPU = True  # ⚠️ Auf True setzen wenn GPU verfügbar 
 
 # GPU-Memory-Limit (MB) - Reduziert VRAM-Nutzung, verhindert Konkurrenz mit Spiel
 # Empfohlen: 2048-4096 MB (2-4 GB) für RTX 4070
@@ -251,6 +263,29 @@ if USE_EASYOCR:
             except UnicodeEncodeError:
                 print(f"EasyOCR CPU fallback error: {cpu_err}")
             reader = None
+
+# -----------------------
+# PaddleOCR Initialization (Phase 2 - ML Integration)
+# -----------------------
+paddle_reader = None
+if OCR_ENGINE == 'paddle' or OCR_FALLBACK_ENABLED:
+    try:
+        from ocr_engines import init_paddle_ocr, init_easyocr
+        
+        # Initialize PaddleOCR (primary engine)
+        paddle_success = init_paddle_ocr(use_gpu=USE_GPU, lang='en', show_log=False)
+        
+        # Initialize EasyOCR (fallback)
+        if OCR_FALLBACK_ENABLED:
+            easyocr_success = init_easyocr(use_gpu=USE_GPU, lang=['en'])
+        
+        if not paddle_success and not OCR_FALLBACK_ENABLED:
+            print("⚠️  PaddleOCR failed and fallback disabled - using EasyOCR")
+            OCR_ENGINE = 'easyocr'  # Fallback to EasyOCR
+            
+    except Exception as e:
+        print(f"⚠️  OCR engine initialization error: {e}")
+        print("⚠️  Falling back to legacy EasyOCR reader")
 
 LETTER_TO_DIGIT = {'O':'0','o':'0','D':'0','Q':'0','I':'1','l':'1','|':'1','i':'1',
                    'S':'5','s':'5','B':'8','Z':'2','z':'2'}

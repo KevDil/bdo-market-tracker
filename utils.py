@@ -30,6 +30,8 @@ from config import (
     ITEM_CATEGORIES_CSV,
     FOCUS_REQUIRED,
     FOCUS_WINDOW_TITLES,
+    OCR_ENGINE,
+    OCR_FALLBACK_ENABLED,
 )
 
 from market_json_manager import (
@@ -242,22 +244,24 @@ def preprocess(img, adaptive=True, denoise=False, fast_mode=False):
     
     return enhanced
 
-def extract_text(img, use_roi=True, method='easyocr', fast_mode=True):
+def extract_text(img, use_roi=True, method='auto', fast_mode=True):
     """
     CRITICAL PERFORMANCE FIX: OCR mit aggressiver ROI und Speed-Optimierung.
+    Phase 2: Multi-Engine-Support (PaddleOCR, EasyOCR, Tesseract)
     
     Args:
         img: Preprocessed image
         use_roi: Nutze ROI-Detection für Log-Region (IMMER True für Performance)
-        method: 'easyocr', 'tesseract', or 'both'
+        method: 'easyocr', 'tesseract', 'both', or 'auto' (uses config.OCR_ENGINE)
         fast_mode: Use fast EasyOCR parameters (default True)
     
     Returns:
         Extracted text string
         
     PERFORMANCE:
-        With ROI + fast_mode: ~400-700ms (was 2000ms)
-        Target: <500ms für 1-2s response time
+        PaddleOCR: ~300-500ms (fastest, best for game UIs)
+        EasyOCR:   ~400-700ms (fallback)
+        Tesseract: ~200-400ms (final fallback, lower accuracy)
     """
     # ALWAYS use ROI for transaction log area
     # This is the SINGLE BIGGEST performance improvement
@@ -271,13 +275,58 @@ def extract_text(img, use_roi=True, method='easyocr', fast_mode=True):
             roi_applied = True
             log_debug(f"[ROI] Applied: region=({x},{y},{w},{h}) - scanning only transaction log area")
     
+    result_paddle = ""
     result_easy = ""
     result_tess = ""
     ocr_confidence = None
+    paddle_confidence = None
     
-    # CRITICAL PERFORMANCE FIX: EasyOCR mit SPEED-optimierten Parametern
-    # Ziel: <500ms OCR statt 2000ms
-    if method in ['easyocr', 'both']:
+    # Determine which OCR engine to use
+    # 'auto' mode uses config.OCR_ENGINE (typically 'paddle')
+    actual_method = method
+    if method == 'auto' or method == OCR_ENGINE:
+        actual_method = OCR_ENGINE
+    
+    # PHASE 2: PaddleOCR (primary engine - fastest for game UIs)
+    # Ziel: ~300-500ms OCR (besser als EasyOCR)
+    if actual_method == 'paddle' or (actual_method in ['both', 'auto'] and OCR_FALLBACK_ENABLED):
+        try:
+            from ocr_engines import ocr_auto
+            
+            # Convert to RGB if needed
+            # CRITICAL: PaddleOCR needs RGB, not grayscale!
+            if target_img.ndim == 2:
+                rgb = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB)
+            elif target_img.shape[2] == 4:
+                rgb = cv2.cvtColor(target_img, cv2.COLOR_BGRA2RGB)
+            elif target_img.shape[2] == 3:
+                # Assume BGR (OpenCV default)
+                rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
+            else:
+                rgb = target_img
+            
+            # Use PaddleOCR with auto-fallback
+            # Higher confidence threshold for better quality
+            result_paddle = ocr_auto(
+                rgb,
+                engine='paddle',
+                fallback_enabled=OCR_FALLBACK_ENABLED,
+                confidence_threshold=0.5  # Higher threshold = better quality
+            )
+            
+            if result_paddle:
+                log_debug(f"PaddleOCR success: length={len(result_paddle)}")
+            else:
+                log_debug("PaddleOCR returned empty result")
+                
+        except Exception as e:
+            log_debug(f"PaddleOCR error: {e}")
+            # Fallback to EasyOCR if PaddleOCR fails
+            if OCR_FALLBACK_ENABLED:
+                actual_method = 'easyocr'
+    
+    # EasyOCR (fallback or explicit)
+    if actual_method in ['easyocr', 'both']:
         try:
             if USE_EASYOCR and reader is not None:
                 # Convert to RGB
@@ -374,31 +423,59 @@ def extract_text(img, use_roi=True, method='easyocr', fast_mode=True):
         except Exception as e:
             log_debug(f"Tesseract error: {e}")
     
-    # Bei 'both': Nimm das längere/bessere Ergebnis
+    # Choose best result based on method and length
     final_result = ""
-    if method == 'both':
-        if len(result_easy) > len(result_tess):
-            final_result = result_easy
-            log_debug(f"Using EasyOCR result (longer: {len(result_easy)} vs {len(result_tess)})")
-        else:
-            final_result = result_tess if result_tess else result_easy
-            log_debug(f"Using Tesseract result (longer: {len(result_tess)} vs {len(result_easy)})")
-    elif method == 'easyocr':
+    chosen_engine = "unknown"
+    
+    if method == 'both' or actual_method == 'both':
+        # Compare all available results and use longest
+        results = [
+            (result_paddle, "paddle"),
+            (result_easy, "easyocr"),
+            (result_tess, "tesseract")
+        ]
+        # Filter out empty results and sort by length
+        non_empty = [(r, eng) for r, eng in results if r]
+        if non_empty:
+            final_result, chosen_engine = max(non_empty, key=lambda x: len(x[0]))
+            log_debug(f"Using {chosen_engine} result (longest: {len(final_result)} chars)")
+    elif actual_method == 'paddle' or method == 'paddle':
+        final_result = result_paddle
+        chosen_engine = "paddle"
+    elif actual_method == 'easyocr' or method == 'easyocr':
         final_result = result_easy
+        chosen_engine = "easyocr"
+    elif actual_method == 'auto':
+        # Auto mode: prefer PaddleOCR, fallback to EasyOCR, then Tesseract
+        if result_paddle:
+            final_result = result_paddle
+            chosen_engine = "paddle"
+        elif result_easy:
+            final_result = result_easy
+            chosen_engine = "easyocr"
+        else:
+            final_result = result_tess
+            chosen_engine = "tesseract"
     else:
         final_result = result_tess
+        chosen_engine = "tesseract"
     
     # Logge finale OCR-Statistiken
     if final_result:
-        log_debug(f"OCR complete: method={method}, length={len(final_result)}, confidence={ocr_confidence if ocr_confidence else 'N/A'}")
+        conf = ocr_confidence if ocr_confidence else paddle_confidence if paddle_confidence else 'N/A'
+        log_debug(f"OCR complete: engine={chosen_engine}, length={len(final_result)}, confidence={conf}")
+    else:
+        log_debug(f"OCR returned empty result (all engines failed)")
     
     return final_result
 
-def ocr_image_cached(img, method='easyocr', use_roi=True, preprocessed=None, fast_mode=True):
+def ocr_image_cached(img, method='auto', use_roi=True, preprocessed=None, fast_mode=True):
     """
     CRITICAL PERFORMANCE FIX: Run OCR with cache support and fast mode.
+    Phase 2: Supports PaddleOCR (default), EasyOCR, and Tesseract.
     
     Args:
+        method: 'auto' (uses config.OCR_ENGINE), 'paddle', 'easyocr', 'tesseract', or 'both'
         fast_mode: Use fast preprocessing and OCR (default True for <1s response)
     """
     global _screenshot_cache
@@ -462,8 +539,8 @@ def ocr_image_cached(img, method='easyocr', use_roi=True, preprocessed=None, fas
     return result, False, cache_stats
 
 
-def capture_and_ocr_cached(region, method='easyocr', use_roi=True):
-    """Capture a region and run cached OCR (thread-safe)."""
+def capture_and_ocr_cached(region, method='auto', use_roi=True):
+    """Capture a region and run cached OCR (thread-safe). Uses PaddleOCR by default."""
     img = capture_region(region)
     return ocr_image_cached(img, method=method, use_roi=use_roi)
 

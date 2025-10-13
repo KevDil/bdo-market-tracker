@@ -210,14 +210,14 @@ class MarketTracker:
                 self._write_debug_images(img, proc, context)
 
             ocr_start = time.perf_counter()
-            # BALANCED MODE: Faster than original but maintains accuracy
-            # Fast mode was too aggressive and missed transaction lines
+            # PHASE 2: Multi-Engine OCR with PaddleOCR (primary)
+            # PaddleOCR is faster and more accurate for game UIs
             text, was_cached, cache_stats = ocr_image_cached(
                 img,
-                method='easyocr',
+                method='auto',  # Uses config.OCR_ENGINE (default: paddle)
                 use_roi=True,
                 preprocessed=proc,
-                fast_mode=True,  # Still use fast mode for speed, but with balanced OCR params
+                fast_mode=True,  # Still use fast mode for speed
             )
             ocr_time = (time.perf_counter() - ocr_start) * 1000
             if self.debug:
