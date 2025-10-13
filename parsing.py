@@ -654,14 +654,23 @@ def extract_details_from_entry(ts_text, entry_text):
                 expected_max = plausibility.get('expected_max')
                 
                 # Mark price as invalid if significantly outside range
+                # This triggers UI fallback in tracker.py
                 if reason in ('too_low', 'too_high'):
-                    # Only invalidate if it's WAY off (not just slightly outside tolerance)
+                    # Strict threshold: invalidate if price is less than 10% of expected minimum
+                    # or more than 10x expected maximum (clear OCR error)
                     if reason == 'too_low' and expected_min and price < expected_min * 0.1:
                         # Price is less than 10% of expected minimum → definitely OCR error
+                        # Common pattern: lost leading digit(s) e.g., "265M" instead of "1265M"
                         price = None
                     elif reason == 'too_high' and expected_max and price > expected_max * 10:
                         # Price is more than 10x expected maximum → definitely OCR error
                         price = None
+                    # Moderate threshold: warn but keep price if within 10-50% of expected range
+                    # This allows tracker.py to attempt UI fallback correction
+                    elif reason == 'too_low' and expected_min and price < expected_min * 0.5:
+                        # Price is 10-50% of expected minimum → possible OCR error
+                        # Keep for now but mark for UI validation
+                        pass  # Keep price, let tracker.py validate with UI
         except Exception:
             pass  # If plausibility check fails, keep original price
     

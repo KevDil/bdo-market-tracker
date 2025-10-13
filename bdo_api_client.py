@@ -25,6 +25,7 @@ import requests
 from typing import Optional, Dict, Tuple
 from datetime import datetime, timedelta
 import time
+from functools import wraps
 
 from market_json_manager import get_item_id_by_name
 
@@ -40,7 +41,65 @@ BDO_API_HEADERS = {
 _price_cache: Dict[str, dict] = {}
 _cache_duration = timedelta(days=7)  # Cache prices for 1 week (until next patch)
 
+# Retry configuration for API calls
+MAX_RETRIES = 3  # Maximum number of retry attempts
+BACKOFF_FACTOR = 1.5  # Exponential backoff multiplier
+RETRY_DELAY_BASE = 0.5  # Base delay in seconds
 
+
+def retry_with_backoff(max_retries=MAX_RETRIES, backoff_factor=BACKOFF_FACTOR, base_delay=RETRY_DELAY_BASE):
+    """
+    Decorator to retry a function with exponential backoff on failure.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Multiplier for exponential backoff
+        base_delay: Base delay in seconds before first retry
+    
+    Returns:
+        Decorated function that retries on RequestException
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    result = func(*args, **kwargs)
+                    # If function returned None due to API error, retry
+                    if result is None and attempt < max_retries - 1:
+                        wait_time = base_delay * (backoff_factor ** attempt)
+                        if attempt > 0:  # Don't log on first attempt
+                            print(f"[API-RETRY] Attempt {attempt + 1}/{max_retries} failed, retrying in {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    return result
+                except requests.RequestException as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = base_delay * (backoff_factor ** attempt)
+                        print(f"[API-RETRY] Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+                        print(f"[API-RETRY] Retrying in {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"[API-RETRY] All {max_retries} attempts failed for {func.__name__}")
+                        raise
+                except Exception as e:
+                    # For non-network exceptions, don't retry
+                    print(f"[API-ERROR] Non-retryable error in {func.__name__}: {e}")
+                    raise
+            
+            # If we exhausted retries
+            if last_exception:
+                raise last_exception
+            return None
+        
+        return wrapper
+    return decorator
+
+
+@retry_with_backoff(max_retries=3, backoff_factor=1.5, base_delay=0.5)
 def get_item_price_range(item_id: str, use_cache: bool = True) -> Optional[Dict[str, int]]:
     """
     Get current min/max price range for an item from BDO API.

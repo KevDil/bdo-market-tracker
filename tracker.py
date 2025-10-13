@@ -1635,12 +1635,33 @@ class MarketTracker:
                                     log_debug(f"[PRICE-TRUNCATED] Detected truncated price for '{item_name}': parsed={price:,} (unit={parsed_unit:.0f}) but UI suggests unit={expected_unit:.0f} - using UI fallback")
                                 needs_fallback = True
                 
+                # CRITICAL: Erkenne ABGESCHNITTENE Preise auch für SELL-Seite
+                # Gleiche Logik wie für Buy, nur mit sell_overview und ui_sell
+                if not needs_fallback and price and quantity and quantity > 0 and wtype == 'sell_overview' and final_type == 'sell':
+                    item_lc_check = (ent.get('item') or '').lower()
+                    if item_lc_check in ui_sell:
+                        m = ui_sell[item_lc_check]
+                        pr = m.get('price') or 0  # Unit-Preis
+                        
+                        if pr > 0:
+                            parsed_unit = price / quantity
+                            expected_unit_after_tax = pr * 0.88725
+                            
+                            # Wenn geparster Unit-Preis viel kleiner ist als erwartet → abgeschnitten!
+                            if expected_unit_after_tax > parsed_unit * 10:  # Mindestens 10x Unterschied
+                                if self.debug:
+                                    log_debug(f"[PRICE-TRUNCATED] Detected truncated price for '{item_name}': parsed={price:,} (unit={parsed_unit:.0f}) but UI suggests unit={expected_unit_after_tax:.0f} - using UI fallback")
+                                needs_fallback = True
+                
                 # CRITICAL: Bei Relist-Cases muss die TRANSACTION-Menge verwendet werden, NICHT ordersCompleted!
                 # Beispiel: Placed 1000x, Withdrew 912x, Transaction 88x → UI zeigt ordersCompleted=1000
                 # aber Transaction-Preis ist für 88x, NICHT für 1000x!
                 # Lösung: Verwende quantity aus Transaction-Zeile statt ordersCompleted aus UI
-                if needs_fallback and (not first_snapshot_mode) and case in ('collect', 'relist_full', 'relist_partial'):
+                if needs_fallback and (not first_snapshot_mode):
                     item_lc = (ent.get('item') or '').lower()
+                    price_success = False
+                    
+                    # BUY-Seite: Verwende UI-Metriken zur Preisberechnung
                     if wtype == 'buy_overview' and final_type == 'buy' and item_lc in ui_buy:
                         m = ui_buy[item_lc]
                         orders = m.get('orders') or 0
@@ -1648,31 +1669,49 @@ class MarketTracker:
                         rem = m.get('remainingPrice') or 0
                         denom = max(0, orders - oc)
                         
-                        # Bei Relist: Verwende quantity aus Transaction (tatsächlich gekaufte Menge)
-                        # Bei Collect: Verwende ordersCompleted aus UI
-                        effective_qty = quantity if case in ('relist_full', 'relist_partial') else oc
+                        # Bei Relist/Collect: Verwende quantity aus Transaction (tatsächlich gekaufte Menge)
+                        # Bei anderen Cases: Verwende ordersCompleted aus UI wenn quantity fehlt
+                        if case in ('collect', 'relist_full', 'relist_partial'):
+                            effective_qty = quantity if quantity and quantity > 0 else oc
+                        else:
+                            effective_qty = oc
                         
                         if effective_qty > 0 and rem > 0 and denom > 0:
                             # effective_qty * (remainingPrice / (orders - ordersCompleted))
                             price_calc = effective_qty * (rem / denom)
                             if price_calc > 0:
                                 price = int(round(price_calc))
-                                log_debug(f"[PRICE] UI fallback (buy, case={case}): qty={effective_qty} * ({rem}/{denom}) = {price_calc:.0f} → {price}")
+                                price_success = True
+                                if self.debug:
+                                    log_debug(f"[PRICE] UI fallback (buy, case={case}): qty={effective_qty} * ({rem}/{denom}) = {price_calc:.0f} → {price}")
+                    
+                    # SELL-Seite: Verwende UI-Metriken zur Preisberechnung
                     elif wtype == 'sell_overview' and final_type == 'sell' and item_lc in ui_sell:
                         m = ui_sell[item_lc]
                         sc = m.get('salesCompleted') or 0
                         pr = m.get('price') or 0
                         
-                        # Bei Relist: Verwende quantity aus Transaction (tatsächlich verkaufte Menge)
-                        # Bei Collect: Verwende salesCompleted aus UI
-                        effective_qty = quantity if case in ('relist_full', 'relist_partial') else sc
+                        # Bei Relist/Collect: Verwende quantity aus Transaction (tatsächlich verkaufte Menge)
+                        # Bei anderen Cases: Verwende salesCompleted aus UI wenn quantity fehlt
+                        if case in ('collect', 'relist_full', 'relist_partial'):
+                            effective_qty = quantity if quantity and quantity > 0 else sc
+                        else:
+                            effective_qty = sc
                         
                         if effective_qty > 0 and pr > 0:
                             # effective_qty * price * 0.88725
                             price_calc = effective_qty * pr * 0.88725
                             if price_calc > 0:
                                 price = int(round(price_calc))
-                                log_debug(f"[PRICE] UI fallback (sell, case={case}): qty={effective_qty} * {pr} * 0.88725 = {price_calc:.0f} → {price}")
+                                price_success = True
+                                if self.debug:
+                                    log_debug(f"[PRICE] UI fallback (sell, case={case}): qty={effective_qty} * {pr} * 0.88725 = {price_calc:.0f} → {price}")
+                    
+                    # FALLBACK: Wenn UI-basierte Korrektur fehlschlägt, verwerfe den Eintrag
+                    if not price_success and needs_fallback:
+                        if self.debug:
+                            log_debug(f"[PRICE-ERROR] UI fallback failed for '{item_name}' - discarding entry (no valid price available)")
+                        continue
             except Exception:
                 pass
 
