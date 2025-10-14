@@ -46,25 +46,25 @@ def _strip_ui_collect_tail(snippet: str) -> str:
     if not snippet:
         return snippet
 
-    lines = snippet.splitlines()
     cleaned_lines = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
+    for raw_line in snippet.splitlines():
+        line = raw_line.strip()
+        if not line:
             continue
-        low = stripped.lower()
-        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(stripped):
+
+        low = line.lower()
+        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(line):
             continue
-        if ("orders completed" in low and "collect" in low) or low in {
-            "collect",
-            "re-list",
-            "relist",
-            "collect re-list",
-            "collect re- list",
-            "collect relist",
-        }:
+        if "collect" in low and "orders completed" in low:
             continue
-        cleaned_lines.append(stripped)
+        if low.startswith("items listed"):
+            continue
+        if low.startswith("sales completed"):
+            continue
+        if low in {"collect", "collect all", "collect al", "re-list", "relist", "collect re-list", "collect re- list", "collect relist"}:
+            continue
+
+        cleaned_lines.append(line)
 
     return "\n".join(cleaned_lines).strip()
 
@@ -244,9 +244,6 @@ def split_text_into_log_entries(text):
     # Filter out UI-only collect/re-list snippets that slipped through without anchors
     filtered = []
     for start, ts_text, snippet in entries:
-        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(snippet.strip()):
-            continue
-
         low = snippet.lower()
         has_anchor = (
             _DETAIL_PATTERNS["transaction_keyword"].search(low)
