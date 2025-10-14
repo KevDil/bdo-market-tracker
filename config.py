@@ -12,11 +12,11 @@ pytesseract.pytesseract.tesseract_cmd = TESS_PATH
 # OCR Engine Selection (Phase 2 - ML Integration)
 # -----------------------
 # Available engines: 'paddle', 'easyocr', 'tesseract'
-# PaddleOCR: Optimiert für Game-UI (RGB + höhere Confidence-Threshold)
-# EasyOCR: Fallback wenn PaddleOCR fehlschlägt
+# PaddleOCR: Zu langsam (5-6s pro Scan) -> Queue Latency Probleme
+# EasyOCR: Schneller (~400-700ms) und stabiler für BDO
 # Tesseract: Final fallback (system-level)
-OCR_ENGINE = 'paddle'  # Primäre OCR-Engine (optimiert mit besseren Parametern)
-OCR_FALLBACK_ENABLED = True  # EasyOCR Fallback bei Bedarf
+OCR_ENGINE = 'easyocr'  # Beste Performance für BDO (PaddleOCR zu langsam)
+OCR_FALLBACK_ENABLED = False  # Fallback bei Bedarf
 
 # Legacy compatibility
 USE_EASYOCR = True  # Behalten für Backward-Kompatibilität
@@ -40,7 +40,10 @@ FOCUS_WINDOW_TITLES = [
 # -----------------------
 # Async Pipeline Feature Flag
 # -----------------------
-USE_ASYNC_PIPELINE = True
+# CRITICAL: Async Pipeline deaktiviert wegen hoher Queue-Latenz mit PaddleOCR
+# PaddleOCR braucht 5-6s pro Scan -> Queue Latency zu hoch
+# Mit synchronem Processing: OCR blockiert, aber keine Queue-Latenz
+USE_ASYNC_PIPELINE = False  # Deaktiviert für bessere Latenz
 # CRITICAL FIX: Queue size = 1 to prevent stale frames
 # Old frames are USELESS - we only care about the LATEST state
 # Queue latency was 10+ seconds with size=3, now <1s with size=1
