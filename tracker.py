@@ -2653,10 +2653,25 @@ class MarketTracker:
 
             occurrence_reused = self._resolve_occurrence_index(tx)
 
-            # robust delta: always allow if tx timestamp is newer than any in previous snapshot
+            # CRITICAL FIX: Intelligent baseline handling for old transactions
+            # Problem: When user first opens market, old transactions (09:43, 09:48) appear
+            # but baseline had newer timestamp (10:12) -> old transactions were skipped
+            # 
+            # Solution: If we see transactions OLDER than baseline's prev_max_ts,
+            # these are "historical" transactions from reopening the market window.
+            # We should process them if they're not in DB yet.
             is_newer_than_prev = False
+            is_historical = False  # Transactions older than baseline but newly visible
+            
             if isinstance(tx['timestamp'], datetime.datetime) and prev_max_ts is not None:
                 is_newer_than_prev = tx['timestamp'] > prev_max_ts
+                
+                # Check if this is a historical transaction (older than baseline but newly visible)
+                # Criteria: timestamp < prev_max_ts AND not seen in previous baseline text
+                if tx['timestamp'] < prev_max_ts and not already_seen_in_prev:
+                    is_historical = True
+                    if self.debug:
+                        log_debug(f"[HISTORICAL] Detected old transaction: {tx['item_name']} @ {tx['timestamp']} (baseline was at {prev_max_ts})")
             
             # Check if this exact transaction already exists in DATABASE (not just baseline text)
             already_in_db = occurrence_reused
@@ -2709,8 +2724,9 @@ class MarketTracker:
                     log_debug(f"[DELTA] SKIP (time-dedup): {tx['item_name']} {tx['quantity']}x @ {tx['price']} - duplicate within time window")
                 continue
             
-            # Skip only if: (not newer) AND (already in DB)
-            if not skip_prev_delta and (not is_newer_than_prev) and already_in_db:
+            # CRITICAL FIX: Allow historical transactions if not in DB
+            # Skip only if: (not newer AND not historical) AND (already in DB)
+            if not skip_prev_delta and (not is_newer_than_prev) and (not is_historical) and already_in_db:
                 # Special-case: On buy_overview, if both 'purchased' and 'transaction' exist for this item+timestamp,
                 # allow the second entry to be saved even if it appeared in the previous snapshot text (paired buy flow).
                 delta_bypass = False

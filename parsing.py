@@ -1,4 +1,6 @@
 import re
+from collections import deque
+from config import MAX_ITEM_QUANTITY
 from utils import normalize_numeric_str, clean_item_name, parse_timestamp_text, find_all_timestamps, correct_item_name
 
 # -----------------------
@@ -24,7 +26,7 @@ _PURCHASED_PATTERN = re.compile(r"purchased\s+(.+?)\s+(?:for|worth)", re.IGNOREC
 _LISTED_PATTERN = re.compile(r"(?:listed|re-?list(?:ed)?)\s+(.+?)\s+for", re.IGNORECASE)
 _WITHDREW_PATTERN = re.compile(r"(?:withdrew?|withdraw(?:n|ed)?)\s+(?:order\s+of\s+)?(.+?)\s+(?:for|worth)", re.IGNORECASE)
 
-_MULTIPLIER_SYMBOL = r"(?:(?<=\s)|^)(?:[x×X\*]|[lI\|])(?=\s*[0-9OolI\|SsZzBb,\.]{1,6}(?:\b|$))"
+_MULTIPLIER_SYMBOL = r"(?:(?<=\s)|^)(?:[x×X\*]|[lI\|])(?=\s*[0-9OolI\|SsZzBb,\.]{1,4}(?:\b|$))"
 _MULTIPLIER_WITH_QTY_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*([0-9OolI\|SsZzBb,\.]+)", re.IGNORECASE)
 _MULTIPLIER_PRESENCE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*[0-9OolI\|SsZzBb,\.]+", re.IGNORECASE)
 
@@ -135,13 +137,14 @@ def split_text_into_log_entries(text):
     Teilt den OCR-Text in Log-Einträge anhand gefundener Timestamps.
     Robust auch dann, wenn die OCR alle Zeilen zu einer einzigen Zeile zusammenfasst.
     
-    WICHTIG: Intelligente Zuordnung für Timestamp-Cluster.
-    Wenn mehrere Timestamps als Cluster am Anfang stehen (typisch: '11.05 10.56 10.50 10.50'),
-    gefolgt von Events, werden Events per Index zugeordnet:
-    - 1. Event → 1. Timestamp im Cluster (neuester)
-    - 2. Event → 2. Timestamp im Cluster
-    - 3. Event → 3. Timestamp im Cluster
-    Dies löst das Problem bei umgekehrter chronologischer Reihenfolge.
+    KRITISCH: In BDO Market steht jeder Timestamp AM ANFANG seiner Zeile.
+    Aber OCR fasst oft alle Zeilen zusammen, sodass Timestamps falsch positioniert sind.
+    
+    Strategie:
+    1. Wenn N Events gefunden werden, brauchen wir N Timestamps
+    2. Nutze Timestamps VOR den Events (wenn vorhanden)
+    3. Für Events ohne vorherigen Timestamp: Nutze Timestamps NACH allen Events
+    4. Ordne die restlichen Timestamps sequenziell zu (1. Event ohne TS → 1. nachfolgender TS, etc.)
     """
     ts_positions = find_all_timestamps(text)
     if not ts_positions:
@@ -161,59 +164,48 @@ def split_text_into_log_entries(text):
                 entries.append((start, ts_text, snippet))
         return entries
     
-    # Prüfe ob Timestamps ein Cluster am Anfang bilden (alle vor dem ersten Event)
-    first_event_pos = all_anchors[0][0]
-    ts_cluster = [ts for ts in ts_positions if ts[0] < first_event_pos]
-    
-    if len(ts_cluster) >= 2:
-        # Timestamp-Cluster erkannt! Verwende Index-basierte Zuordnung
-        # Events werden der Reihe nach den Timestamps im Cluster zugeordnet
-        for event_idx, (anchor_start, anchor_end, anchor_text) in enumerate(all_anchors):
-            # Wähle Timestamp aus Cluster basierend auf Event-Index
-            ts_idx = min(event_idx, len(ts_cluster) - 1)  # Clip to cluster size
-            best_ts_pos, best_ts_text = ts_cluster[ts_idx]
-            
-            # Finde Event-Ende (bis zum nächsten Anker oder max 300 Zeichen)
-            next_anchor_start = None
-            for next_a_start, _, _ in all_anchors:
-                if next_a_start > anchor_start:
-                    next_anchor_start = next_a_start
-                    break
-            
-            event_end = anchor_end + 300  # Max 300 Zeichen
-            if next_anchor_start and next_anchor_start < event_end:
-                event_end = next_anchor_start
-            
-            snippet = text[anchor_start:event_end].strip()
-            if snippet:
-                entries.append((anchor_start, best_ts_text, snippet))
-    else:
-        # Kein Cluster - Fallback: Proximity-basierte Zuordnung (alte Logik)
-        for anchor_start, anchor_end, anchor_text in all_anchors:
-            # Finde alle Timestamps VOR diesem Event
-            preceding_ts = [(pos, ts_txt) for pos, ts_txt in ts_positions if pos < anchor_start]
-            
-            if not preceding_ts:
-                # Kein Timestamp vor diesem Event - überspringe
-                continue
-            
-            # Wähle den letzten Timestamp vor dem Event (kleinste Distanz)
-            best_ts_pos, best_ts_text = max(preceding_ts, key=lambda x: x[0])
-            
-            # Finde Event-Ende
-            next_anchor_start = None
-            for next_a_start, _, _ in all_anchors:
-                if next_a_start > anchor_start:
-                    next_anchor_start = next_a_start
-                    break
-            
-            event_end = anchor_end + 300
-            if next_anchor_start and next_anchor_start < event_end:
-                event_end = next_anchor_start
-            
-            snippet = text[anchor_start:event_end].strip()
-            if snippet:
-                entries.append((anchor_start, best_ts_text, snippet))
+    # Intelligente Timestamp-Zuordnung: Verwende Timestamps in Reihenfolge ihres Auftretens
+    # und weise sie den Events sequentiell zu. Damit erwischen wir OCR-Blöcke wie
+    # "11.46 11.46 11.30 11.30 Placed ..." korrekt (erst 11.46 für das erste Event usw.).
+    ts_queue = deque(ts_positions)
+    last_assigned = None  # (pos, ts_text)
+
+    for anchor_start, anchor_end, anchor_text in all_anchors:
+        best_ts_text = None
+        best_ts_pos = None
+
+        # Primär: erster noch nicht verwendeter Timestamp, der VOR dem Event steht
+        while ts_queue and ts_queue[0][0] <= anchor_start:
+            best_ts_pos, best_ts_text = ts_queue.popleft()
+            last_assigned = (best_ts_pos, best_ts_text)
+            break
+
+        # Fallback: timestamp steht nach dem Event (OCR verschob Zeile)
+        if best_ts_text is None and ts_queue:
+            best_ts_pos, best_ts_text = ts_queue.popleft()
+            last_assigned = (best_ts_pos, best_ts_text)
+
+        # Letzter Fallback: kein neuer Timestamp verfügbar → reuse letzten (gleiche Zeit)
+        if best_ts_text is None and last_assigned:
+            best_ts_pos, best_ts_text = last_assigned
+
+        if best_ts_text is None:
+            continue
+
+        # Finde Event-Ende
+        next_anchor_start = None
+        for next_a_start, _, _ in all_anchors:
+            if next_a_start > anchor_start:
+                next_anchor_start = next_a_start
+                break
+
+        event_end = anchor_end + 300
+        if next_anchor_start and next_anchor_start < event_end:
+            event_end = next_anchor_start
+
+        snippet = text[anchor_start:event_end].strip()
+        if snippet:
+            entries.append((anchor_start, best_ts_text, snippet))
     
     return entries
 
@@ -284,14 +276,69 @@ def extract_details_from_entry(ts_text, entry_text):
         seg = segment if boundary_pos is None else segment[:boundary_pos]
         # remove obvious UI decimals like 31.590 near 'Pearl Item Selling Limit'
         seg = _UI_DECIMAL_PATTERN.sub(' ', seg)
-        # choose the last plausible xN before price context; prefer values in [1..100000]
+        
+        # PRIORITY 1: Try to find quantity with explicit 'x' prefix (most reliable)
         last = None
         for match in _MULTIPLIER_WITH_QTY_PATTERN.finditer(seg):
             last = match
         if last:
             val = normalize_numeric_str(last.group(1))
-            if val and 1 <= val <= 100000:
+            if val and 1 <= val <= MAX_ITEM_QUANTITY:
                 return val
+        
+        # PRIORITY 2: CRITICAL FIX - Find quantity WITHOUT 'x' prefix
+        # Pattern: "Transaction of ItemName 2386 worth" or "Transaction of ItemName 386 worth"
+        # This handles OCR errors where leading digits are dropped ("2386" -> "386")
+        # 
+        # IMPORTANT: Item names can be multi-word ("Powder of Time", "Special Bluffer Mushroom")
+        # So we need a GREEDY match for item name, then look for NUMBER before 'worth'
+        # 
+        # Strategy: Match from end backwards:
+        #   1. Find 'worth' or 'for'
+        #   2. Look back for NUMBER (1-6 digits)
+        #   3. That's the quantity!
+        
+        # Look backwards from 'worth/for' to find the last number
+        # This avoids the problem of multi-word item names
+        worth_match = re.search(r'\b(worth|for)\b', seg, re.IGNORECASE)
+        if worth_match:
+            # Get text BEFORE 'worth' keyword
+            text_before_worth = seg[:worth_match.start()]
+            
+            # Find the LAST number (1-4 digits, matching MAX_ITEM_QUANTITY) in that text
+            # This should be the quantity
+            number_matches = list(re.finditer(r'\b(\d{1,4})\b', text_before_worth))
+            if number_matches:
+                # Take the LAST number before 'worth'
+                last_number = number_matches[-1]
+                val = int(last_number.group(1))
+                
+                # Sanity checks:
+                # 1. Must be reasonable quantity (1-MAX_ITEM_QUANTITY)
+                # 2. Should not be preceded by UI keywords
+                if 1 <= val <= MAX_ITEM_QUANTITY:
+                    # Check context before number - reject if it's a UI number
+                    context_start = max(0, last_number.start() - 30)
+                    context = text_before_worth[context_start:last_number.start()].lower()
+                    
+                    # Reject if preceded by UI keywords
+                    ui_keywords = ['balance', 'capacity', 'warehouse', 'limit', 'completed', 'orders']
+                    if not any(kw in context for kw in ui_keywords):
+                        return val
+        
+        # PRIORITY 3: Fallback - any reasonable number before 'worth' (last resort)
+        # This catches cases where the pattern above doesn't match
+        fallback_pattern = re.compile(r'(\d{1,4})\s+(?:worth|for)', re.IGNORECASE)
+        matches = list(fallback_pattern.finditer(seg))
+        if matches:
+            # Take the LAST match (closest to 'worth')
+            val = int(matches[-1].group(1))
+            if 1 <= val <= MAX_ITEM_QUANTITY:
+                # Additional sanity check: reject if this looks like a price
+                # Prices are usually >100,000 but quantities are usually <10,000
+                # Exception: bulk purchases can be up to MAX_ITEM_QUANTITY
+                return val
+        
         return None
 
     explicit_qty = False  # tracks whether a multiplier like 'xN' was explicitly found
@@ -606,14 +653,14 @@ def extract_details_from_entry(ts_text, entry_text):
         search_scope = tx_segment if (typ == 'transaction' and tx_segment is not None) else (purch_segment if (typ == 'purchased' and purch_segment is not None) else entry_text)
         # Allow optional multiplier symbol and capture the numeric token immediately before worth/for/silver
         m_qty_fallback = re.search(
-            fr"(?:transact[il1]on\s+of|sold|purchased|bought)\s+([\s\S]*?)\s+(?:{_MULTIPLIER_SYMBOL}\s*)?([0-9OolI\|,\.]{1,6})\s+(?:worth|for|{silver_pat})\b",
+            fr"(?:transact[il1]on\s+of|sold|purchased|bought)\s+([\s\S]*?)\s+(?:{_MULTIPLIER_SYMBOL}\s*)?([0-9OolI\|,\.]{1,4})\s+(?:worth|for|{silver_pat})\b",
             search_scope,
             re.IGNORECASE,
         )
         if m_qty_fallback:
             qty_cand = normalize_numeric_str(m_qty_fallback.group(2))
-            # Only accept plausible quantities (1..100000)
-            if qty_cand and 1 <= qty_cand <= 100000:
+            # Only accept plausible quantities (1..MAX_ITEM_QUANTITY)
+            if qty_cand and 1 <= qty_cand <= MAX_ITEM_QUANTITY:
                 qty = qty_cand
                 # Use the trimmed item name from the capture group (group 1)
                 item = clean_item_name(m_qty_fallback.group(1)) or item
@@ -643,7 +690,7 @@ def extract_details_from_entry(ts_text, entry_text):
     if item:
         item = re.sub(r"\s+(?:x\s*s?)?\s*[0OoIl\|]{2,}$", "", item.strip(), flags=re.IGNORECASE)
         # additionally strip trailing multiplier artifacts like 'xS'/'x5'/'X5' at the end of the item name
-        item = re.sub(r"\s*[x×X\*]\s*[0-9OolI\|Ss]{1,6}$", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\s*[x×X\*]\s*[0-9OolI\|Ss]{1,4}$", "", item, flags=re.IGNORECASE)
         # strip common OCR noise where the multiplier + quantity 'x12' was misread and glued to the name as 'Xlz'
         item = re.sub(r"\s*[x×X]\s*[lI1]\s*[zZ2]$", "", item, flags=re.IGNORECASE)
         # Fuzzy-Korrektur gegen Whitelist (sofern verfügbar)
@@ -678,12 +725,10 @@ def extract_details_from_entry(ts_text, entry_text):
                     elif reason == 'too_high' and expected_max and price > expected_max * 10:
                         # Price is more than 10x expected maximum → definitely OCR error
                         price = None
-                    # Moderate threshold: warn but keep price if within 10-50% of expected range
-                    # This allows tracker.py to attempt UI fallback correction
-                    elif reason == 'too_low' and expected_min and price < expected_min * 0.5:
-                        # Price is 10-50% of expected minimum → possible OCR error
-                        # Keep for now but mark for UI validation
-                        pass  # Keep price, let tracker.py validate with UI
+                    # Moderate threshold: if price is still far below the allowed minimum (e.g. missing leading digit)
+                    # mark it invalid so tracker.py can reconstruct it via UI metrics instead of persisting garbage.
+                    elif reason == 'too_low' and expected_min and price < expected_min * 0.6:
+                        price = None
         except Exception:
             pass  # If plausibility check fails, keep original price
     
