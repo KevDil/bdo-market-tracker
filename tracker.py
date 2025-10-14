@@ -1843,7 +1843,7 @@ class MarketTracker:
                             if self._is_unit_price_plausible(r.get('item') or ent.get('item'), u):
                                 guide_unit = u
                                 break
-                    bump_candidates = [1_000_000_000, 100_000_000, 10_000_000]
+                    bump_candidates = [2_000_000_000, 1_000_000_000, 100_000_000, 10_000_000]
                     chosen = None
                     for bump in bump_candidates:
                         newp = price + bump

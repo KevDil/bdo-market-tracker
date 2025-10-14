@@ -270,4 +270,4 @@ def search_items(query: str, limit: int = 10, min_score: int = 60) -> list[Tuple
 try:
     load_market_json()
 except Exception as e:
-    print(f"⚠️  Warning: Could not load market.json: {e}")
+    print(f"Warning: Could not load market.json: {e}")

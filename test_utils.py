@@ -1,11 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Unicode-Fix Helper für Windows Tests
-
-Dieses Modul sollte am Anfang jeder Test-Datei importiert werden,
-um Unicode/Emoji-Probleme auf Windows zu vermeiden.
-"""
-
 import io
 import os
 import sys
@@ -16,11 +8,11 @@ def fix_windows_unicode():
     if sys.platform != "win32":
         return
 
-    # Skip adjustments when running under pytest capture to avoid closing buffers
+    # Skip adjustments when pytest is managing the streams to avoid teardown issues
     if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
         return
 
-    # Try enabling UTF-8 code page
+    # Switch console code page to UTF-8 when possible
     try:
         os.system("chcp 65001 > nul")
     except Exception:
@@ -47,7 +39,3 @@ def fix_windows_unicode():
                 continue
     except Exception:
         pass
-
-
-# Auto-apply beim Import
-fix_windows_unicode()

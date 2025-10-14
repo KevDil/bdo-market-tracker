@@ -13,7 +13,6 @@ _ANCHOR_PATTERN = re.compile(
     r"|(?:\bre-?list(?:ed)?\b|\blisted\b)"           # relist/listed variants
     r"|(?:\bwith\s*draw\b|\bwithdrew\b|\bwithdraw(?:n|ed)?\b)"  # withdrew
     r"|(?:\bpurchased\b|\bbought\b)"                 # purchased/bought
-    r"|\bcollect\b"                                    # collect indicator
     r")",
     re.IGNORECASE,
 )
@@ -35,6 +34,39 @@ _SILVER_PATTERN = re.compile(_SILVER_PATTERN_RAW, re.IGNORECASE)
 _WORTH_SILVER_PATTERN = re.compile(fr"\bworth\s+[0-9OolI\|\s,\.]+\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _PRICE_WITH_SILVER_PATTERN = re.compile(fr"([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _MULTIPLIER_THEN_PRICE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}[\s\S]*?([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
+
+_UI_COLLECT_BLOCK_PATTERN = re.compile(
+    r"(?:\s|^)[^\n]*?Orders\s+[0-9OolI\|,\.]+\s+Orders\s+Completed\s+[0-9OolI\|,\.]+\s+Collect(?:\s+Re-?list)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_ui_collect_tail(snippet: str) -> str:
+    """Remove UI-only collect/re-list blocks while preserving transaction text."""
+    if not snippet:
+        return snippet
+
+    lines = snippet.splitlines()
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        low = stripped.lower()
+        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(stripped):
+            continue
+        if ("orders completed" in low and "collect" in low) or low in {
+            "collect",
+            "re-list",
+            "relist",
+            "collect re-list",
+            "collect re- list",
+            "collect relist",
+        }:
+            continue
+        cleaned_lines.append(stripped)
+
+    return "\n".join(cleaned_lines).strip()
 
 _UI_DECIMAL_PATTERN = re.compile(r"\b\d{1,2}\.(?:\d{3})\b")
 
@@ -205,9 +237,35 @@ def split_text_into_log_entries(text):
 
         snippet = text[anchor_start:event_end].strip()
         if snippet:
-            entries.append((anchor_start, best_ts_text, snippet))
-    
-    return entries
+            cleaned = _strip_ui_collect_tail(snippet)
+            if cleaned:
+                entries.append((anchor_start, best_ts_text, cleaned))
+
+    # Filter out UI-only collect/re-list snippets that slipped through without anchors
+    filtered = []
+    for start, ts_text, snippet in entries:
+        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(snippet.strip()):
+            continue
+
+        low = snippet.lower()
+        has_anchor = (
+            _DETAIL_PATTERNS["transaction_keyword"].search(low)
+            or _DETAIL_PATTERNS["sold_keyword"].search(low)
+            or _DETAIL_PATTERNS["placed_order"].search(low)
+            or _DETAIL_PATTERNS["order_placed"].search(low)
+            or _DETAIL_PATTERNS["relist"].search(low)
+            or _DETAIL_PATTERNS["withdrew"].search(low)
+            or _DETAIL_PATTERNS["purchased"].search(low)
+        )
+        looks_like_ui = (
+            ("collect" in low and "orders completed" in low)
+            or ("collect" in low and "re-list" in low)
+        )
+        if looks_like_ui and not has_anchor:
+            continue
+        filtered.append((start, ts_text, snippet))
+
+    return filtered
 
 def extract_details_from_entry(ts_text, entry_text):
     """
