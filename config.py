@@ -1,4 +1,6 @@
 import os
+import json
+import sqlite3
 import pytesseract
 import easyocr
 
@@ -22,7 +24,154 @@ OCR_FALLBACK_ENABLED = False  # Fallback bei Bedarf
 USE_EASYOCR = True  # Behalten für Backward-Kompatibilität
 DB_PATH = "bdo_tracker.db"
 LOG_PATH = "ocr_log.txt"
-DEFAULT_REGION = (734, 371, 1823, 1070)
+
+
+# -----------------------
+# Persistent Settings Helpers
+# -----------------------
+
+_SETTINGS_CACHE: dict[str, str] | None = None
+
+
+def _load_tracker_settings() -> dict[str, str]:
+    """Load tracker settings persisted in the SQLite database."""
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+
+    results: dict[str, str] = {}
+    try:
+        with sqlite3.connect(
+            DB_PATH,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        ) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tracker_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute("SELECT key, value FROM tracker_settings")
+            rows = cursor.fetchall()
+            for key, value in rows:
+                results[str(key)] = value
+    except Exception:
+        # Fail gracefully and use defaults
+        results = {}
+
+    _SETTINGS_CACHE = results
+    return results
+
+
+def _persist_tracker_setting(key: str, value: str) -> None:
+    """Persist a tracker setting in the SQLite database."""
+    try:
+        with sqlite3.connect(
+            DB_PATH,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        ) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tracker_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO tracker_settings (key, value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                """,
+                (key, value),
+            )
+    except Exception:
+        pass
+
+
+def _get_bool_setting(key: str, default: bool) -> bool:
+    settings = _load_tracker_settings()
+    raw = settings.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    lower = str(raw).strip().lower()
+    if lower in {"1", "true", "yes", "on"}:
+        return True
+    if lower in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _set_bool_setting(key: str, value: bool) -> None:
+    _persist_tracker_setting(key, "1" if value else "0")
+    settings = _load_tracker_settings()
+    settings[key] = "1" if value else "0"
+
+
+def _get_region_setting(default_region: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    settings = _load_tracker_settings()
+    raw = settings.get("capture_region")
+    if not raw:
+        return default_region
+    try:
+        coords = json.loads(raw)
+        if isinstance(coords, list) and len(coords) == 4:
+            ints = [int(v) for v in coords]
+            return tuple(ints)  # type: ignore[return-value]
+    except Exception:
+        pass
+    return default_region
+
+
+def _set_region_setting(region: tuple[int, int, int, int]) -> None:
+    try:
+        data = json.dumps(list(region))
+        _persist_tracker_setting("capture_region", data)
+        settings = _load_tracker_settings()
+        settings["capture_region"] = data
+    except Exception:
+        pass
+
+
+def get_use_gpu(default: bool = True) -> bool:
+    """Return the persisted USE_GPU value (fallback to default)."""
+    return _get_bool_setting("use_gpu", default)
+
+
+def set_use_gpu(value: bool) -> None:
+    """Persist the USE_GPU value."""
+    _set_bool_setting("use_gpu", value)
+
+
+def get_debug_mode(default: bool = True) -> bool:
+    """Return the persisted debug flag."""
+    return _get_bool_setting("debug_mode", default)
+
+
+def set_debug_mode(value: bool) -> None:
+    """Persist the debug flag."""
+    _set_bool_setting("debug_mode", value)
+
+
+def get_capture_region(default_region: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Return the persisted capture region tuple."""
+    return _get_region_setting(default_region)
+
+
+def set_capture_region(region: tuple[int, int, int, int]) -> None:
+    """Persist the capture region."""
+    _set_region_setting(region)
+
+
+DEFAULT_REGION = get_capture_region((734, 371, 1823, 1070))
 # CRITICAL FIX: Reduced from 0.3s to 0.15s for faster real-time tracking
 # Even with slower OCR (2s), faster polling ensures we capture transaction lines quickly
 # Old: 0.3s = ~3 scans/sec, New: 0.15s = ~6-7 scans/sec
@@ -116,7 +265,7 @@ MAX_ITEM_QUANTITY = 5000
 #   1. USE_GPU = False         → CPU-only (langsamer, aber keine Game-Ruckler)
 #   2. GPU_MEMORY_LIMIT = 2048 → Limitiert VRAM-Nutzung (MB)
 #   3. GPU_LOW_PRIORITY = True → OCR bekommt niedrige GPU-Priorität
-USE_GPU = True  # ⚠️ Auf True setzen wenn GPU verfügbar 
+USE_GPU = get_use_gpu(True)  # ⚠️ Auf True setzen wenn GPU verfügbar 
 
 # GPU-Memory-Limit (MB) - Reduziert VRAM-Nutzung, verhindert Konkurrenz mit Spiel
 # Empfohlen: 2048-4096 MB (2-4 GB) für RTX 4070

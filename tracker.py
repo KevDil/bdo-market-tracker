@@ -22,6 +22,8 @@ from config import (
     ASYNC_WORKER_COUNT,
     MIN_ITEM_QUANTITY,
     MAX_ITEM_QUANTITY,
+    get_debug_mode,
+    set_debug_mode,
 )
 from utils import (
     capture_region,
@@ -67,7 +69,10 @@ _TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{pr
 # Entscheidungslogik: Fälle erkennen & speichern
 # -----------------------
 class MarketTracker:
-    def __init__(self, region=DEFAULT_REGION, poll_interval=POLL_INTERVAL, debug=True):
+    def __init__(self, region=DEFAULT_REGION, poll_interval=POLL_INTERVAL, debug=None):
+        if debug is None:
+            debug = get_debug_mode(True)
+        self.debug = bool(debug)
         self.region = region
         # Game-Friendly Mode: Längeres Poll-Interval bei GPU-Modus reduziert Ruckler
         if GAME_FRIENDLY_MODE and USE_GPU:
@@ -84,7 +89,6 @@ class MarketTracker:
         self._burst_until = None
         self._burst_fast_scans = 0
         self._request_immediate_rescan = 0
-        self.debug = debug
         self.running = False
         self.lock = threading.Lock()
         self._debug_image_lock = threading.Lock()

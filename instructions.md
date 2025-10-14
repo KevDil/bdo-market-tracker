@@ -299,8 +299,9 @@ applyTo: '**'
         "Export: CSV/JSON",
         "Analyse: Summary + Matplotlib-Plot",
         "Fenster-Historie-Dialog",
-        "Debug-Toggle",
-        "Region-Button: Nutzer klickt obere linke & untere rechte Ecke um Scan-Region festzulegen",
+      "Debug-Toggle + persistenter Debug-Flag (GUI, tracker_state)",
+      "GPU-/Debug-Optionen in GUI (persistente Speicherung in tracker_settings)",
+      "Region-Button: Nutzer klickt obere linke & untere rechte Ecke um Scan-Region festzulegen (persistiert)",
         "Datenanzeige-Fenster: Übersicht mit Kennzahlen, Tabelle und Preisverlauf-Plot",
         "SQLite: thread-safe connections, tracker_state, tx_case, 4 Indizes"
       ]
@@ -368,7 +369,7 @@ applyTo: '**'
     "• Mixed Context Detection: Buy-Events auf Sell-Tab werden korrekt erkannt",
     "• 29/32 Tests bestehen (3 deprecated Tests: test_listed_fix_targeted, test_listed_transaction_fix, test_user_scenario_lion_blood)",
     "",
-    "✅ 2025-10-11 Architecture & Stability:",
+  "✅ 2025-10-11 Architecture & Stability:",
     "• Cluster-Building Refactor: ALLE Cluster ZUERST, dann Case-Resolution (verhindert Partial-Processing)",
     "• OCR V2: Sanftes Preprocessing (CLAHE clipLimit=1.5, keine Binarisierung), EasyOCR+Tesseract Hybrid",
     "• Persistent Baseline: tracker_state DB-Tabelle, überlebt App-Restart",
@@ -376,6 +377,11 @@ applyTo: '**'
     "• Intelligent Timestamps: Cluster-basierte Zuordnung (neuester→ältester), Proximity-Fallback",
     "• Fast Stop: Interruptible Sleep (<200ms Response), self.running-Check vor OCR",
     "• UI-Fallback: NUR bei Collect (NICHT bei Relist), verwendet Transaction-Menge",
+
+  "✅ 2025-10-14 GUI Settings Persistence:",
+  "• GUI persistiert GPU-/Debug-Flags und Region in tracker_settings",
+  "• config.DEFAULT_REGION lädt gespeicherte Koordinaten; Tracker initialisiert Debug-Modus aus DB",
+  "• GUI-Checkboxen erlauben Umschalten (GPU-Änderungen erfordern App-Neustart)",
     "",
     "=== DEPRECATION NOTES ===",
     "",

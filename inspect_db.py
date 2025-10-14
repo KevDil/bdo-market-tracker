@@ -1,13 +1,13 @@
 import sqlite3
 
-conn = sqlite3.connect('market_data.db')
+conn = sqlite3.connect('bdo_tracker.db')
 c = conn.cursor()
 
 # List all tables
 c.execute("SELECT name FROM sqlite_master WHERE type='table'")
 tables = c.fetchall()
 
-print("Tables in market_data.db:")
+print("Tables in bdo_tracker.db:")
 for table in tables:
     print(f"  - {table[0]}")
 

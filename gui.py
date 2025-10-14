@@ -7,14 +7,23 @@ import matplotlib.pyplot as plt
 import datetime
 
 from tracker import MarketTracker
-from config import DEFAULT_REGION
+from config import (
+    DEFAULT_REGION,
+    USE_GPU,
+    get_capture_region,
+    get_debug_mode,
+    get_use_gpu,
+    set_capture_region,
+    set_debug_mode,
+    set_use_gpu,
+)
 from database import conn, get_connection
 
 # -----------------------
 # GUI
 # -----------------------
 def start_gui():
-    tracker = MarketTracker(debug=True)
+    tracker = MarketTracker(debug=get_debug_mode(True))
 
     root = tk.Tk()
     root.title("BDO Market Tracker")
@@ -25,15 +34,28 @@ def start_gui():
     region_entry.insert(0, ",".join(map(str, DEFAULT_REGION)))
     region_entry.pack()
 
+    use_gpu_var = tk.BooleanVar(value=get_use_gpu(USE_GPU))
+    debug_var = tk.BooleanVar(value=tracker.debug)
+
     status_var = tk.StringVar(value="Idle")
 
     def _apply_region_from_entry():
         try:
             parts = [int(p.strip()) for p in region_entry.get().split(',')]
             if len(parts) == 4:
-                tracker.region = tuple(parts)
+                region = tuple(parts)
+                tracker.region = region
+                set_capture_region(region)
         except Exception:
             pass
+
+    def _apply_settings():
+        use_gpu = use_gpu_var.get()
+        debug_mode = debug_var.get()
+        set_use_gpu(use_gpu)
+        set_debug_mode(debug_mode)
+        tracker.debug = debug_mode
+        messagebox.showinfo("Einstellungen", "Einstellungen gespeichert. Bitte Anwendung neu starten, damit GPU-Änderungen wirksam werden.")
 
     def run_single():
         try:
@@ -70,6 +92,8 @@ def start_gui():
     # Debug Toggle
     def toggle_debug():
         tracker.debug = not tracker.debug
+        debug_var.set(tracker.debug)
+        set_debug_mode(tracker.debug)
         messagebox.showinfo("Debug", f"Debug ist nun {'AN' if tracker.debug else 'AUS'}")
 
     def start_region_selection():
@@ -105,6 +129,7 @@ def start_gui():
                 region_entry.delete(0, tk.END)
                 region_entry.insert(0, ",".join(map(str, region)))
                 tracker.region = region
+                set_capture_region(region)
                 finish_selection()
 
         overlay.bind("<Button-1>", on_click)
@@ -114,7 +139,13 @@ def start_gui():
     tk.Button(root, text="Einmal scannen", command=run_single).pack(pady=6)
     tk.Button(root, text="Auto-Tracking starten", command=start_auto).pack(pady=6)
     tk.Button(root, text="Auto-Tracking stoppen", command=stop_auto).pack(pady=6)
-    tk.Button(root, text="Debug umschalten", command=toggle_debug).pack(pady=6)
+
+    settings_frame = tk.LabelFrame(root, text="Einstellungen", padx=8, pady=8)
+    settings_frame.pack(fill="x", padx=12, pady=8)
+
+    tk.Checkbutton(settings_frame, text="GPU-Modus verwenden", variable=use_gpu_var).pack(anchor="w")
+    tk.Checkbutton(settings_frame, text="Debug-Modus", variable=debug_var).pack(anchor="w")
+    tk.Button(settings_frame, text="Übernehmen", command=_apply_settings).pack(pady=(8, 0))
     tk.Label(root, textvariable=status_var).pack(pady=4)
     
     # System Health Status

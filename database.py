@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS tracker_state (
 )
 """)
 
+# Store tracker settings in dedicated table
+_base_cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS tracker_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+)
+
 _base_conn.commit()
 
 # Thread-local connections
