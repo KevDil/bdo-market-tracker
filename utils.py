@@ -853,13 +853,25 @@ def parse_timestamp_text(ts_text):
 
 def find_all_timestamps(text):
     """
-    Findet alle Timestamp-Vorkommen (Position, text).
+    Findet alle Timestamp-Vorkommen (Position, normalisierten text).
     Format erwartet: 20YY.MM.DD hh:mm oder mit - oder /
+    OCR-Fehler wie 'O0.01' oder '1C-15' werden tolerant behandelt.
     """
+    if not text:
+        return []
+
+    extra_map = {'C': '0', 'c': '0', 'T': '7'}
+    mapping = {**LETTER_TO_DIGIT, **extra_map}
+    normalized_chars = [mapping.get(ch, ch) for ch in text]
+    normalized_text = ''.join(normalized_chars)
+
     pattern = re.compile(r'20\d{2}[.\-/\s]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2}')
     res = []
-    for m in pattern.finditer(text):
-        res.append((m.start(), m.group(0)))
+    for m in pattern.finditer(normalized_text):
+        start = m.start()
+        end = m.end()
+        ts = normalized_text[start:end]
+        res.append((start, ts))
     return res
 
 def detect_tab_from_text(text):

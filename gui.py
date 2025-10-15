@@ -210,7 +210,7 @@ def start_gui():
             error_count = getattr(tracker, 'error_count', 0)
             last_error_time = getattr(tracker, 'last_error_time', None)
             
-            # Health logic
+            # Health logic+
             if error_count == 0:
                 health_status_var.set("🟢 Healthy")
                 health_label.config(fg="green")

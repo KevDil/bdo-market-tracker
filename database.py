@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     transaction_type TEXT,
     timestamp DATETIME,
     tx_case TEXT,
-    occurrence_index INTEGER DEFAULT 0
+    occurrence_index INTEGER DEFAULT 0,
+    content_hash TEXT
 )
 """)
 # Migration: ensure 'tx_case' column exists; if legacy 'case' exists, rename it
@@ -40,6 +41,11 @@ try:
             _base_cur.execute("ALTER TABLE transactions ADD COLUMN occurrence_index INTEGER DEFAULT 0")
         except Exception:
             pass
+    if 'content_hash' not in cols:
+        try:
+            _base_cur.execute("ALTER TABLE transactions ADD COLUMN content_hash TEXT")
+        except Exception:
+            pass
 except Exception:
     pass
 try:
@@ -48,7 +54,7 @@ except Exception:
     pass
 _base_cur.execute("""
 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_tx_full
-ON transactions(item_name, quantity, price, transaction_type, timestamp, occurrence_index)
+ON transactions(item_name, quantity, price, transaction_type, timestamp, occurrence_index, content_hash)
 """)
 
 # Performance: Additional indexes for common queries (30-40% faster filtering)

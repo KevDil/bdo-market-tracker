@@ -64,6 +64,7 @@ from parsing import (
 _WHITESPACE_PATTERN = re.compile(r'\s+')
 _COMMA_PATTERN = re.compile(r',')
 _TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{price}"
+_HISTORICAL_VALUE_DUP_TOLERANCE_SECONDS = 90  # 1,5 Minuten Puffer für Scroll-Duplikate
 
 # -----------------------
 # Entscheidungslogik: Fälle erkennen & speichern
@@ -101,6 +102,19 @@ class MarketTracker:
         # letzter Overview-OCR-Text (nur Overview, für Delta-Vergleich)
         # Load from persistent state if available
         self.last_overview_text = load_state('last_overview_text', default="")
+        baseline_loaded = bool(self.last_overview_text)
+        db_empty = False
+        try:
+            cur = get_cursor()
+            cur.execute("SELECT COUNT(*) FROM transactions")
+            row = cur.fetchone()
+            db_empty = (not row) or (row[0] == 0)
+        except Exception:
+            db_empty = False
+        if baseline_loaded and db_empty:
+            self.last_overview_text = ""
+            save_state('last_overview_text', "")
+            baseline_loaded = False
         if self.debug and self.last_overview_text:
             log_debug(f"[INIT] Loaded persistent baseline: {len(self.last_overview_text)} chars, preview: {self.last_overview_text[:100]}...")
         elif self.debug:
@@ -141,7 +155,8 @@ class MarketTracker:
         self.last_processed_game_ts = None
         # Session-Baseline: erster Overview-Snapshot importiert keine Historie
         # If we have a saved baseline, we consider it initialized
-        self._baseline_initialized = bool(self.last_overview_text)
+        self._baseline_initialized = baseline_loaded
+
         # Error tracking for health monitoring
         self.error_count = 0
         self.last_error_time = None
@@ -698,7 +713,7 @@ class MarketTracker:
                             # Within 20 minutes - likely OCR duplicate from same session
                             if self.debug:
                                 log_debug(f"[CONTENT-HASH] Skip duplicate: {item} {qty}x @ {price} (hash={content_hash}, time_diff={time_diff_minutes:.1f}min, existing={existing_ts_str})")
-                            print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {ttype.UPPER()} - {qty}x {item} (Δ{time_diff_minutes:.1f}min)")
+                            print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {str(ttype or '').upper()} - {qty}x {item} (Δ{time_diff_minutes:.1f}min)")
                             self.seen_tx_signatures.append(sig)
                             return False
                         else:
@@ -709,7 +724,7 @@ class MarketTracker:
                     # If timestamp parsing fails, skip based on hash alone (conservative)
                     if self.debug:
                         log_debug(f"[CONTENT-HASH] Skip (timestamp parse failed): {item} {qty}x")
-                    print(f"⚠️ Duplikat erkannt (Content-Hash): {ttype.UPPER()} - {qty}x {item}")
+                    print(f"⚠️ Duplikat erkannt (Content-Hash): {str(ttype or '').upper()} - {qty}x {item}")
                     self.seen_tx_signatures.append(sig)
                     return False
         except Exception as e:
@@ -718,11 +733,11 @@ class MarketTracker:
         
         # CRITICAL: Skip transactions with invalid price OR quantity
         if price is None or price == 0:
-            print(f"⚠️ Überspringe unsichere Transaktion (kein Preis): {ttype.UPPER()} {qty}x {item} ts={ts_str}")
+            print(f"⚠️ Überspringe unsichere Transaktion (kein Preis): {str(ttype or '').upper()} {qty}x {item} ts={ts_str}")
             self.seen_tx_signatures.append(sig)  # deque uses append, not add
             return False
         if qty is None or qty <= 0:
-            print(f"⚠️ Überspringe unsichere Transaktion (keine/ungültige Menge): {ttype.UPPER()} {qty}x {item} ts={ts_str}")
+            print(f"⚠️ Überspringe unsichere Transaktion (keine/ungültige Menge): {str(ttype or '').upper()} {qty}x {item} ts={ts_str}")
             self.seen_tx_signatures.append(sig)  # deque uses append, not add
             return False
         # If a transaction with same (item, qty, price, type) already exists at a different timestamp, avoid duplicating it.
@@ -899,50 +914,9 @@ class MarketTracker:
                 items_ts_types[key] = st
             st.add(s.get('type'))
 
-        # If returning from item dialog, correct timestamps of relevant anchors to the latest snapshot ts
         returning_from_item = prev_window in ("buy_item", "sell_item") and wtype in ("sell_overview", "buy_overview")
-        # Only adjust timestamps for buy anchors when returning from the buy item dialog to the buy overview.
-        # A buy anchor is: explicit 'purchased' OR 'transaction' that co-occurs with a 'placed' or 'withdrew' of the same item+timestamp.
-        if returning_from_item and prev_window == 'buy_item' and wtype == 'buy_overview':
-            buy_anchor_items = set()
-            try:
-                for (it_lc, ts_key), tset in items_ts_types.items():
-                    # CRITICAL FIX: Only classify as buy anchor if it's NOT a sell cluster
-                    # Sell cluster = transaction + listed (clear sell pattern)
-                    # Buy anchor = purchased OR (transaction + placed/withdrew WITHOUT listed)
-                    is_sell_cluster = ('transaction' in tset and 'listed' in tset)
-                    if not is_sell_cluster:
-                        if ('purchased' in tset) or ('transaction' in tset and (('placed' in tset) or ('withdrew' in tset))):
-                            buy_anchor_items.add(it_lc)
-            except Exception:
-                buy_anchor_items = set()
-            if overall_max_ts is not None and buy_anchor_items:
-                for s in structured:
-                    itlc = (s.get('item') or '').lower()
-                    if itlc in buy_anchor_items and s.get('type') in ('purchased','transaction','placed','listed','withdrew'):
-                        if isinstance(s.get('timestamp'), datetime.datetime) and s['timestamp'] < overall_max_ts:
-                            s['timestamp'] = overall_max_ts
-        # Symmetric adjustment for sell flow: when returning from sell_item to sell_overview, align
-        # timestamps of sell anchors (explicit transaction and related listed/withdrew) for the same items
-        # to the latest snapshot timestamp. This helps when the game displays the sale one minute earlier
-        # in the log line while the user just clicked Relist/Collect.
-        if returning_from_item and prev_window == 'sell_item' and wtype == 'sell_overview':
-            # Align only when we see a clear relist/collect cluster: transaction + listed for same item timestamp
-            sell_anchor_items = set()
-            try:
-                for (it_lc, ts_key), tset in items_ts_types.items():
-                    if 'transaction' in tset and 'listed' in tset:
-                        sell_anchor_items.add(it_lc)
-            except Exception:
-                sell_anchor_items = set()
-            if overall_max_ts is not None and sell_anchor_items:
-                for s in structured:
-                    itlc = (s.get('item') or '').lower()
-                    if itlc in sell_anchor_items and s.get('type') in ('transaction','listed','withdrew'):
-                        if isinstance(s.get('timestamp'), datetime.datetime) and s['timestamp'] < overall_max_ts:
-                            s['timestamp'] = overall_max_ts
 
-    # Ersten Overview-Snapshot behandeln:
+        # Ersten Overview-Snapshot behandeln:
         # Ab jetzt: Beim ersten erkannten Overview-Snapshot werden die sichtbareren Logzeilen sofort
         # ausgewertet und gespeichert. Anschließend wird die Baseline initialisiert, sodass weitere
         # Scans nur neue Einträge verarbeiten. Kein Early-Return mehr.
@@ -1381,11 +1355,15 @@ class MarketTracker:
             # Determine transaction side with strong text anchors first, fallback to window type
             side = None
             # Prefer explicit 'sold' over any 'purchased' presence when both appear due to OCR merges
-            try:
-                if re.search(r'\bsold\b', (ent.get('raw') or '').lower()):
-                    side = 'sell'
-            except Exception:
-                pass
+            if side is None and ent.get('sold_flag'):
+                side = 'sell'
+            if side is None:
+                try:
+                    raw_text = (ent.get('raw') or '').lower()
+                    if re.search(r'\bsold\b', raw_text):
+                        side = 'sell'
+                except Exception:
+                    pass
             if side is None and (has_purchased or ent['type'] == 'purchased'):
                 side = 'buy'
             # If only sell-side signals are present (listed/withdrew) and no buy-side (placed/purchased), treat as sell even on buy_overview
@@ -1625,6 +1603,7 @@ class MarketTracker:
 
             # final transaction type strictly from side; do not override with presence of listed/placed
             final_type = side
+            ui_backfill_needed = False
 
             # On buy overview, avoid saving sell-side entries unless there is a strong sell cluster OR item is known to be sell-side
             # Allow sell saves if:
@@ -1632,10 +1611,10 @@ class MarketTracker:
             # 2. The item is in most_likely_sell category (historical transaction without listed)
             if wtype == 'buy_overview' and final_type == 'sell':
                 anchor_item_lc = (ent['item'] or '').lower()
-                def same_item(r):
+                def same_item3(r):
                     return (r.get('item') or '').lower() == anchor_item_lc if anchor_item_lc else False
-                has_tx_same = any(r['type'] == 'transaction' and same_item(r) for r in related)
-                has_listed_same = any(r['type'] == 'listed' and same_item(r) for r in related)
+                has_tx_same = any(r['type'] == 'transaction' and same_item3(r) for r in related)
+                has_listed_same = any(r['type'] == 'listed' and same_item3(r) for r in related)
                 
                 # Check if item is categorized as sell-side
                 from utils import get_item_likely_type
@@ -2016,7 +1995,7 @@ class MarketTracker:
             #              This handles fast window switches where placed event is visible but transaction already scrolled off
             # IMPORTANT: Apply this check for buy events regardless of window type (buy_overview OR sell_overview)
             #            because fast tab switches can cause buy events to appear on sell_overview
-            if final_type == 'buy' and not first_snapshot_mode and wtype in ('buy_overview', 'sell_overview'):
+            if final_type == 'buy' and wtype in ('buy_overview', 'sell_overview'):
                 anchor_item_lc = (ent['item'] or '').lower()
                 def same_item2(r):
                     return (r.get('item') or '').lower() == anchor_item_lc if anchor_item_lc else False
@@ -2034,10 +2013,15 @@ class MarketTracker:
                             log_debug(f"[UI-EVIDENCE] Item '{ent['item']}' has ordersCompleted={oc} - allowing without transaction anchor (wtype={wtype})")
                 
                 # allow inferred anchors from placed-withdrew logic OR UI evidence
-                if not has_buy_anchor_same and not ent.get('_inferred_buy_anchor') and not has_ui_evidence:
-                    if self.debug:
-                        log_debug(f"skip buy relist without purchase anchor for item='{ent['item']}' on buy_overview")
-                    continue
+                if not has_buy_anchor_same and not ent.get('_inferred_buy_anchor'):
+                    if has_ui_evidence:
+                        ui_backfill_needed = True
+                        if self.debug:
+                            log_debug(f"[UI-EVIDENCE] Accepting '{ent['item']}' without anchor; will backfill price from UI")
+                    else:
+                        if self.debug:
+                            log_debug(f"skip buy relist without purchase anchor for item='{ent['item']}' on buy_overview")
+                        continue
 
             # Still fill missing values with type-aware rules
             # Quantity can be backfilled from any related entry (placed/purchased/transaction all OK)
@@ -2110,9 +2094,12 @@ class MarketTracker:
             # Verhindert dass OCR-Fehler mit fehlenden führenden Ziffern falsche Preise speichern
             # (z.B. "126,184" statt "585,585,000" bei qty=200)
             if price is None or price <= 0:
-                if self.debug:
-                    log_debug(f"drop candidate: invalid/missing price ({price}) for item='{ent.get('item')}' qty={quantity}")
-                continue
+                if ui_backfill_needed:
+                    price = None  # trigger UI fallback below
+                else:
+                    if self.debug:
+                        log_debug(f"drop candidate: invalid/missing price ({price}) for item='{ent.get('item')}' qty={quantity}")
+                    continue
 
             # Validate and correct item name before saving
             item_name = ent['item'] or ""
@@ -2357,7 +2344,6 @@ class MarketTracker:
                 # CRITICAL FIX: Validate inferred price against market data
                 # This prevents using stale UI metrics that produce wrong prices
                 try:
-                    from utils import check_price_plausibility
                     plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price)
                     if not plausibility.get('plausible', True):
                         reason = plausibility.get('reason', 'unknown')
@@ -2582,6 +2568,7 @@ class MarketTracker:
         # Process candidates: if candidate's (ts_text, snippet) not in prev_entries -> treat as new
         baseline_ts_snapshot = self.last_processed_game_ts
         saved_any_ts = []
+        batch_seen_sigs = set()
         for tx in tx_candidates:
             saved = False
             # Only process entries within the effective recent time window
@@ -2594,11 +2581,14 @@ class MarketTracker:
             # prepare signature & baseline comparison before assigning occurrence index
             main_raw = None
             main_ts_text = None
-            for r in tx['raw_related']:
-                if r['type'] in ('transaction', 'purchased'):
-                    main_raw = r['raw']
-                    main_ts_text = r['ts_text']
-                    break
+            for r in tx.get('raw_related', []):
+                if r.get('type') in ('transaction', 'purchased'):
+                    raw_val = r.get('raw')
+                    ts_val = r.get('ts_text')
+                    if raw_val:
+                        main_raw = raw_val
+                        main_ts_text = ts_val
+                        break
             if main_raw is None:
                 # CRITICAL: Fallback signature must match OCR text format
                 # Format: "Transaction of {item} x{qty} worth {price} Silver"
@@ -2617,7 +2607,7 @@ class MarketTracker:
             already_seen_in_prev = (key in prev_entries) or (normalized_main in prev_snippets)
             
             # CRITICAL: Robust baseline matching for transactions with similar item+qty+price
-            # If normalized text doesn't match, try pattern-based matching in baseline text
+            # If normalized text doesn't match, try pattern-based matching in baseline
             if not already_seen_in_prev and self.last_overview_text:
                 try:
                     # Build a regex pattern to find this transaction in baseline
@@ -2706,6 +2696,31 @@ class MarketTracker:
                     )
                 except Exception:
                     already_in_db_any_side = False
+
+            if (
+                not already_in_db_by_values
+                and baseline_ts_snapshot
+                and isinstance(tx.get('timestamp'), datetime.datetime)
+                and tx['timestamp'] <= baseline_ts_snapshot
+            ):
+                try:
+                    # Nur für ältere/gleich alte Timestamps prüfen – echte neue Transaktionen (ts > baseline)
+                    # dürfen nicht blockiert werden.
+                    already_in_db_by_values = transaction_exists_by_values_near_time(
+                        tx['item_name'],
+                        tx['quantity'],
+                        int(tx['price'] or 0),
+                        tx['timestamp'],
+                        tolerance_minutes=max(1, _HISTORICAL_VALUE_DUP_TOLERANCE_SECONDS // 60)
+                    )
+                    if already_in_db_by_values and self.debug:
+                        log_debug(
+                            f"[DELTA] Historical duplicate by values: {tx['item_name']} {tx['quantity']}x @ {tx['price']} "
+                            f"ts={tx['timestamp']} (within tolerance)"
+                        )
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[DELTA] Value-based duplicate check failed: {exc}")
             
             # DISABLED: Value-based deduplication is unreliable
             # Problem: Cannot distinguish between:
@@ -2722,10 +2737,13 @@ class MarketTracker:
             if self.debug:
                 log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}, near_time={already_in_db_by_values}")
             
-            # Skip if time-aware deduplication matched (same item/qty/price within 2min window)
+            # Skip if time-aware deduplication matched (same item/qty/price within short window)
             if already_in_db_by_values:
                 if self.debug:
-                    log_debug(f"[DELTA] SKIP (time-dedup): {tx['item_name']} {tx['quantity']}x @ {tx['price']} - duplicate within time window")
+                    log_debug(
+                        f"[DELTA] SKIP (time-dedup): {tx['item_name']} {tx['quantity']}x @ {tx['price']} "
+                        f"ts={tx['timestamp']}"
+                    )
                 continue
             
             # CRITICAL FIX: Allow historical transactions if not in DB
@@ -2787,6 +2805,21 @@ class MarketTracker:
                     )
                 continue
 
+            if (
+                not already_in_db_any_side
+                and baseline_ts_snapshot
+                and isinstance(tx['timestamp'], datetime.datetime)
+                and tx['timestamp'] <= baseline_ts_snapshot
+                and already_in_db_by_values
+            ):
+                # Bereits weiter oben erkannt, hier nur als zusätzlicher Schutz falls DB-Check seitdem geändert wurde.
+                if self.debug:
+                    log_debug(
+                        f"[DELTA] SKIP (value-dup): {tx['item_name']} {tx['quantity']}x @ {tx['timestamp']} "
+                        "matches existing record by value"
+                    )
+                continue
+
             # new entry -> attempt to store
             sig = self.make_tx_sig(tx['item_name'], tx['quantity'], tx['price'], tx['transaction_type'], tx['timestamp'], tx.get('occurrence_index'))
             if sig in self.seen_tx_signatures:
@@ -2795,6 +2828,11 @@ class MarketTracker:
                     print("DEBUG:", msg)
                     log_debug(msg)
                 continue
+            if sig in batch_seen_sigs:
+                if self.debug:
+                    log_debug(f"[DELTA] SKIP (batch duplicate): {sig}")
+                continue
+            batch_seen_sigs.add(sig)
 
             # store in DB
             saved = self.store_transaction_db(tx)
@@ -2862,8 +2900,9 @@ class MarketTracker:
                 except Exception:
                     pass
                 sig = self.make_tx_sig(fallback['item_name'], fallback['quantity'], fallback['price'], fallback['transaction_type'], fallback['timestamp'], fallback.get('occurrence_index'))
-                if sig in self.seen_tx_signatures:
+                if sig in self.seen_tx_signatures or sig in batch_seen_sigs:
                     continue
+                batch_seen_sigs.add(sig)
                 # ensure occurrence index prepared for fallback before storing
                 occurrence_reused_fb = self._resolve_occurrence_index(fallback)
                 if occurrence_reused_fb:

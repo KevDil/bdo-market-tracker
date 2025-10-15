@@ -40,6 +40,28 @@ _UI_COLLECT_BLOCK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_SOLD_PATTERN = re.compile(r"Sold\s+(.+?)\s+x([0-9OolI\|SsZzBb,\.]+)\s+for\s+([0-9,\.]+)\s+Silver", re.IGNORECASE)
+
+
+def _parse_sold_entry(ts_text: str, entry_text: str):
+    match = _SOLD_PATTERN.search(entry_text)
+    if not match:
+        return None
+    item = clean_item_name(match.group(1))
+    qty = normalize_numeric_str(match.group(2))
+    price = normalize_numeric_str(match.group(3))
+    if not item or qty is None or price is None:
+        return None
+    return {
+        "type": "transaction",
+        "item": item,
+        "qty": qty,
+        "price": price,
+        "timestamp": parse_timestamp_text(ts_text),
+        "raw": entry_text,
+        "sold_flag": True,
+    }
+
 
 def _strip_ui_collect_tail(snippet: str) -> str:
     """Remove UI-only collect/re-list blocks while preserving transaction text."""
@@ -53,16 +75,42 @@ def _strip_ui_collect_tail(snippet: str) -> str:
             continue
 
         low = line.lower()
-        if _UI_COLLECT_BLOCK_PATTERN.fullmatch(line):
-            continue
-        if "collect" in low and "orders completed" in low:
-            continue
-        if low.startswith("items listed"):
-            continue
-        if low.startswith("sales completed"):
-            continue
-        if low in {"collect", "collect all", "collect al", "re-list", "relist", "collect re-list", "collect re- list", "collect relist"}:
-            continue
+        has_event_anchor = (
+            _DETAIL_PATTERNS["transaction_keyword"].search(line)
+            or _DETAIL_PATTERNS["sold_keyword"].search(line)
+            or _DETAIL_PATTERNS["placed_order"].search(line)
+            or _DETAIL_PATTERNS["order_placed"].search(line)
+            or _DETAIL_PATTERNS["listed"].search(line)
+            or _DETAIL_PATTERNS["withdrew"].search(line)
+            or _DETAIL_PATTERNS["purchased"].search(line)
+        )
+
+        if has_event_anchor and (
+            "orders completed" in low
+            or "collect" in low
+            or "re-list" in low
+            or "relist" in low
+            or low.startswith("items listed")
+            or low.startswith("sales completed")
+        ):
+            parts = re.split(r"\b(?:orders\s+completed|collect|re-?list|items\s+listed|sales\s+completed)\b", line, 1, flags=re.IGNORECASE)
+            if parts:
+                trimmed = parts[0].strip()
+                if trimmed:
+                    line = trimmed
+                    low = line.lower()
+
+        if not has_event_anchor:
+            if _UI_COLLECT_BLOCK_PATTERN.fullmatch(line):
+                continue
+            if "collect" in low and "orders completed" in low:
+                continue
+            if low.startswith("items listed"):
+                continue
+            if low.startswith("sales completed"):
+                continue
+            if low in {"collect", "collect all", "collect al", "re-list", "relist", "collect re-list", "collect re- list", "collect relist"}:
+                continue
 
         cleaned_lines.append(line)
 
@@ -184,7 +232,12 @@ def split_text_into_log_entries(text):
 
     entries = []
     # Finde alle Event-Anker im gesamten Text mit Positionen (nutzt pre-compiled pattern)
-    all_anchors = [(m.start(), m.end(), m.group()) for m in _ANCHOR_PATTERN.finditer(text)]
+    lowered_text = text.lower()
+    all_anchors = []
+    for m in _ANCHOR_PATTERN.finditer(lowered_text):
+        start, end = m.start(), m.end()
+        original_anchor = text[start:end]
+        all_anchors.append((start, end, original_anchor))
     
     if not all_anchors:
         # Keine Events gefunden - alte Logik: Segmente nach Timestamps
@@ -235,11 +288,26 @@ def split_text_into_log_entries(text):
         if next_anchor_start and next_anchor_start < event_end:
             event_end = next_anchor_start
 
-        snippet = text[anchor_start:event_end].strip()
+        entry_start = anchor_start
+        if best_ts_pos is not None:
+            entry_start = min(best_ts_pos, anchor_start)
+
+        snippet = text[entry_start:event_end].strip()
         if snippet:
             cleaned = _strip_ui_collect_tail(snippet)
             if cleaned:
-                entries.append((anchor_start, best_ts_text, cleaned))
+                if anchor_text and anchor_text.strip().lower().startswith('placed'):
+                    follow_has_transaction = _DETAIL_PATTERNS["transaction_keyword"].search(cleaned)
+                    follow_has_withdrew = _DETAIL_PATTERNS["withdrew"].search(cleaned)
+                    if follow_has_withdrew and not follow_has_transaction:
+                        continue
+                try:
+                    internal_ts = find_all_timestamps(cleaned)
+                except Exception:
+                    internal_ts = []
+                if internal_ts:
+                    best_ts_text = internal_ts[-1][1]
+                entries.append((entry_start, best_ts_text, cleaned))
 
     # Filter out UI-only collect/re-list snippets that slipped through without anchors
     filtered = []
@@ -282,6 +350,10 @@ def extract_details_from_entry(ts_text, entry_text):
     entry_text = re.sub(r'\bSilve[_\s:,\.]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
     entry_text = re.sub(r'\bSilv[:_\.]', 'Silver', entry_text, flags=re.IGNORECASE)
     
+    sold_candidate = _parse_sold_entry(ts_text, entry_text)
+    if sold_candidate:
+        return sold_candidate
+
     low = entry_text.lower()
     typ = "other"
     # classify line type conservatively using shared, pre-compiled patterns
@@ -319,6 +391,8 @@ def extract_details_from_entry(ts_text, entry_text):
     # Prefer purchased over transaction if both appear in the snippet
     if typ == "transaction" and _DETAIL_PATTERNS["purchased"].search(low):
         typ = "purchased"
+    if typ == "transaction" and _DETAIL_PATTERNS["sold_keyword"].search(low):
+        typ = "transaction"
 
     # qty & item: default global search, but scope to transaction/purchased segments when applicable
     qty = None

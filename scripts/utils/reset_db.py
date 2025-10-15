@@ -10,6 +10,7 @@ OCR_LOG_PATH = ROOT_DIR / "ocr_log.txt"
 conn = sqlite3.connect(str(DB_PATH))
 cur = conn.cursor()
 cur.execute("DELETE FROM transactions")
+cur.execute("DELETE FROM tracker_state")
 conn.commit()
 conn.close()
 print("✅ Alle Transaktionen gelöscht (Datenbankstruktur bleibt erhalten).")
