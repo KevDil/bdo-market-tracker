@@ -1632,6 +1632,7 @@ class MarketTracker:
             # Prefer transaction/purchased qty+price over listed/placed to avoid using 'Listed for ... Silver' in sell-side
             quantity = ent['qty'] or None
             price = ent['price'] or None
+            item_name = ent.get('item') or ""
             if final_type == 'sell':
                 # Try to override with a related transaction's values
                 # CRITICAL: Prioritize transaction price even if qty is None (price is more reliable in merged OCR text)
@@ -1649,7 +1650,7 @@ class MarketTracker:
                 # This handles fast collect scenarios where transaction line scrolled off before OCR scan
                 if (quantity is None or price is None or price <= 0):
                     try:
-                        item_name_raw = (ent.get('item') or '')
+                        item_name_raw = item_name
                         item_lc2 = item_name_raw.lower()
                         m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
                         if (not m_ui) and 'ui_sell_norm' in locals():
@@ -1679,7 +1680,7 @@ class MarketTracker:
                 # expected_net = unit_price * quantity * 0.88725, and only adjust if expected endswith current price.
                 elif quantity and price:
                     try:
-                        item_name_raw = (ent.get('item') or '')
+                        item_name_raw = item_name
                         item_lc2 = item_name_raw.lower()
                         m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
                         if (not m_ui) and 'ui_sell_norm' in locals():

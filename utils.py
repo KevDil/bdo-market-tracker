@@ -773,26 +773,29 @@ def check_price_plausibility(item_name: str, quantity: int, total_price: int) ->
         result['reason'] = 'api_error'
         return result
 
-    min_unit_price = price_data['min_price']
-    max_unit_price = price_data['max_price']
-
-    expected_min_total = min_unit_price * quantity
-    expected_max_total = max_unit_price * quantity
-
-    result['expected_min'] = expected_min_total
-    result['expected_max'] = expected_max_total
+    base_price = price_data.get('base_price')
+    if base_price is None or base_price <= 0:
+        result['plausible'] = False
+        result['reason'] = 'no_base_price'
+        return result
 
     unit_price = total_price / quantity
     result['unit_price'] = unit_price
 
-    tolerance = 0.1
-    min_with_tolerance = min_unit_price * (1 - tolerance)
-    max_with_tolerance = max_unit_price * (1 + tolerance)
+    tolerance = 0.15
+    min_unit_price = base_price * (1 - tolerance)
+    max_unit_price = base_price * (1 + tolerance)
 
-    if unit_price < min_with_tolerance:
+    expected_min_total = min_unit_price * quantity
+    expected_max_total = max_unit_price * quantity
+
+    result['expected_min'] = int(round(expected_min_total))
+    result['expected_max'] = int(round(expected_max_total))
+
+    if unit_price < min_unit_price:
         result['plausible'] = False
         result['reason'] = 'too_low'
-    elif unit_price > max_with_tolerance:
+    elif unit_price > max_unit_price:
         result['plausible'] = False
         result['reason'] = 'too_high'
     else:
