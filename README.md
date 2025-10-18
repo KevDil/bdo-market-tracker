@@ -1,8 +1,8 @@
 # BDO Market Tracker
 
 **Version:** 0.2.4  
-**Status:** ✅ BETA - Kernfunktionalität stabil (29/29 Tests), aktive Optimierung  
-**Test Coverage:** 100% (29/29 Tests bestehen)
+**Status:** ✅ BETA - Kernfunktionalität stabil (automatisierte Kern-Regressionen)  
+**Test Coverage:** 5 automatisierte Unit-Tests + kuratierte manuelle Replays
 
 OCR-basierter Market-Tracker für Black Desert Online mit automatischer Transaktionserkennung, Live-API-Integration, GPU-Acceleration und persistenter Baseline.
 
@@ -44,24 +44,11 @@ market_tracker/
 │   └── backups/                   # Automatische DB-Backups
 │
 ├── 🧪 Tests (Validierung)
-│   ├── scripts/
-│   │   ├── run_all_tests.py                        # Test-Runner (22 Tests)
-│   │   ├── test_exact_user_scenario.py            # Reales User-Szenario
-│   │   ├── test_fast_action_timing.py             # Fast Action Timing
-│   │   ├── test_historical_fix.py                 # Historical Detection V3
-│   │   ├── test_historical_placed_with_ui_overview.py  # UI-Overview Interference
-│   │   ├── test_integration.py                    # Integration Tests
-│   │   ├── test_item_validation.py                # Item-Name Whitelist
-│   │   ├── test_multiple_purchased.py             # Multiple Purchased Events
-│   │   ├── test_parsing_crystal.py                # Parsing Edge-Cases
-│   │   ├── test_preorder_and_exact_match.py       # Preorder-Detection
-│   │   ├── test_quantity_bounds.py                # Quantity Limits
-│   │   ├── test_quick_fixes.py                    # Performance-Optimierungen
-│   │   ├── test_user_scenario_lion_blood.py       # Lion Blood Case
-│   │   ├── test_utils.py                          # Utils-Funktionen
-│   │   ├── test_window_detection.py               # Window-Type Detection
-│   │   └── archive/                               # Alte/überholte Tests
-│   │
+│   ├── tests/
+│   │   ├── unit/                                  # Automatisierte Regression (reine Python-Tests)
+│   │   └── manual/                                # Manuelle Replays (OCR/DB/GUI erforderlich)
+│   ├── scripts/run_all_tests.py                   # Aggregierter Runner (führt tests/unit aus)
+│   ├── scripts/archive/                           # Historische Test-Skripte (Legacy)
 │   └── scripts/utils/                             # Utility-Scripts
 │       ├── calibrate_region.py                    # Region-Kalibrierung
 │       ├── compare_ocr.py                         # OCR-Methoden-Vergleich
@@ -111,13 +98,19 @@ market_tracker/
 ## 🧪 Testing
 
 ```bash
-# Alle Tests ausführen (22/22 Tests)
+# Automatisierte Unit-Tests
 python scripts/run_all_tests.py
 
-# Einzelne Tests
-python scripts/test_exact_user_scenario.py
-python scripts/test_item_validation.py
-python scripts/test_window_detection.py
+# Einzelne Unit-Tests
+python tests/unit/test_collect_anchor.py
+python tests/unit/test_parsing_crystal.py
+python tests/unit/test_powder_of_darkness.py
+python tests/unit/test_price_plausibility.py
+
+# Manuelle Replays (schwere Abhängigkeiten)
+python tests/manual/test_window_detection.py
+python tests/manual/test_item_validation.py
+python tests/manual/test_integration.py
 ```
 
 ## 🔧 Utility Scripts
@@ -165,11 +158,11 @@ Siehe `docs/PERFORMANCE_ANALYSIS_2025-10-12.md` für Details.
 2. **Parsing-Probleme:**
    - Aktiviere Debug-Toggle in GUI
    - Prüfe `ocr_log.txt` auf Parsing-Fehler
-   - Teste mit `scripts/test_parsing_crystal.py`
+   - Teste mit `python tests/unit/test_parsing_crystal.py`
 
 3. **Window-Detection:**
    - Prüfe `ocr_log.txt` für "Window changed"
-   - Teste mit `scripts/test_window_detection.py`
+   - Teste mit `python tests/manual/test_window_detection.py`
    - Nutze `scripts/utils/calibrate_region.py`
 
 ## 📝 Dokumentation

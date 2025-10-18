@@ -1,6 +1,6 @@
 # Quick Reference Guide
 
-**Version:** 0.2.4 | **Status:** ✅ BETA (29/29 Tests) | **Last Updated:** 2025-10-12
+**Version:** 0.2.4 | **Status:** ✅ BETA (5 Unit Tests automated) | **Last Updated:** 2025-10-18
 
 ## 🚀 Commands
 
@@ -18,10 +18,15 @@ python scripts/run_all_tests.py
 python scripts/benchmark_performance.py --iterations 10
 
 # Wichtigste Tests
-python scripts/test_exact_user_scenario.py          # Real-World-Szenario
-python scripts/test_market_data_integration.py      # Live-API-Integration
-python scripts/test_item_validation.py              # Whitelist-Validierung
-python scripts/test_window_detection.py             # Window-Type-Detection
+python tests/unit/test_collect_anchor.py            # Parsing: UI-Blocks filtern
+python tests/unit/test_parsing_crystal.py           # Parsing: Crystal-Regression
+python tests/unit/test_powder_of_darkness.py        # Parsing: Powder-Regression
+python tests/unit/test_price_plausibility.py        # Preis-Plausibilität (Netto)
+
+# Manuelle Replays / Heavy
+python tests/manual/test_window_detection.py        # Window-Type-Detection (OCR stack)
+python tests/manual/test_item_validation.py         # Whitelist-Validierung (Tracker)
+python tests/manual/test_integration.py              # Buy/Sell Szenario-Replay
 ```
 
 ### Utilities
@@ -79,14 +84,14 @@ python scripts/utils/compare_ocr.py
 # 1. Debug-Mode aktivieren (GUI oder MarketTracker(debug=True))
 # 2. Prüfe ocr_log.txt für Parsing-Fehler
 # 3. Teste mit Parsing-Tests
-python scripts/test_parsing_crystal.py
+python tests/unit/test_parsing_crystal.py
 ```
 
 ### 3. Window-Detection-Probleme
 ```bash
 # 1. Prüfe ocr_log.txt für "Window changed"
 # 2. Teste Window-Detection
-python scripts/test_window_detection.py
+python tests/manual/test_window_detection.py
 
 # 3. Kalibriere Region
 python scripts/utils/calibrate_region.py
@@ -142,14 +147,14 @@ sqlite3 bdo_tracker.db "SELECT * FROM transactions ORDER BY id DESC LIMIT 10;"
 1. Prüfe Window-Detection: `python scripts/utils/debug_window.py`
 2. Prüfe OCR-Output: `ocr_log.txt`
 3. Aktiviere Debug-Mode in GUI
-4. Teste mit: `python scripts/test_window_detection.py`
+4. Teste mit: `python tests/manual/test_window_detection.py`
 
 ### "Falsche Items"
 1. Prüfe `config/market.json` - Item vorhanden? (4874 Items)
-2. Teste Item-Validation: `python scripts/test_item_validation.py`
+2. Teste Item-Validation: `python tests/manual/test_item_validation.py`
 3. Teste Fuzzy-Matching: `python scripts/test_utils.py`
 4. Prüfe `ocr_log.txt` für Korrektur-Meldungen
-5. Teste Market-API: `python scripts/test_market_data_integration.py`
+5. Teste Market-API: `python tests/manual/test_market_json_system.py`
 
 ### "Duplikate"
 1. DB deduplizieren: `python scripts/utils/dedupe_db.py`

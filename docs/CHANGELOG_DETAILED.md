@@ -333,7 +333,7 @@ Allow SELL on buy_overview wenn Item in most_likely_sell → captured historical
 
 - `calibrate_region.py` - Region-Verification
 - `test_historical_fix.py` - 3-Transaction Integration Test
-- `test_parsing_crystal.py` - Parsing-Verification
+- `tests/unit/test_parsing_crystal.py` - Parsing-Verification
 
 ### Test Results
 

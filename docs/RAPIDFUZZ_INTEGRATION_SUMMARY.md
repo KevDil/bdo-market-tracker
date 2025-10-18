@@ -110,7 +110,7 @@ python scripts/test_market_json_system.py
 
 ### Test 3: Window Detection
 ```bash
-python scripts/test_window_detection.py
+python tests/manual/test_window_detection.py
 ```
 **Ergebnis**: ✅ **2/3 Tests bestanden**
 - Pure SELL overview: ✅

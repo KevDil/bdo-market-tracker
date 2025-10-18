@@ -231,7 +231,7 @@ Doc:   Write → Keep updated → Delete/archive when obsolete
 ### Testing Requirements
 - All new features must have test script in `scripts/test_*.py`
 - Run `scripts/run_all_tests.py` before committing
-- Current status: 29/32 tests passing (3 deprecated)
+- Current status: 5 automated unit tests passing (manual replays available)
 - Deprecated tests (should be updated or archived):
   - `test_listed_fix_targeted` (anchor priority logic replaced this)
   - `test_listed_transaction_fix` (redundant with test_magical_shard_fix_final)
@@ -386,6 +386,6 @@ else:
 
 ## Version History
 
-- **0.2.4** (2025-10-12): Live API integration, performance optimizations, duplicate handling, 29/32 tests passing
+- **0.2.4** (2025-10-18): Live API integration, performance optimizations, duplicate handling, 5 automated unit tests passing
 - **0.2.3** (2025-10-12): Persistent baseline, OCR V2, GPU acceleration
 - **0.2.0** (2025-10-11): Window detection, transaction cases, clustering logic
