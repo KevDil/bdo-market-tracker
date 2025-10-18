@@ -35,8 +35,11 @@
 - Runtime dedupe uses `seen_tx_signatures` (deque max 1000) and `make_content_hash` with a 20-minute tolerance. Identical hashes after 20 minutes count as new transactions.
 - `store_transaction_db` manages `_batch_content_hashes` per run; do not bypass or mutate this set from outside the function.
 - Database schema (see `database.py` migrations): table `transactions` with `item_name`, `quantity`, `price`, `transaction_type`, `timestamp`, `tx_case`, `occurrence_index`, `content_hash`. Unique index `idx_unique_tx_full` spans these fields to guard duplicates.
-- `occurrence_index` plus `_occurrence_slot` differentiate repeated same-second events. Use helpers (`fetch_occurrence_indices`, `transaction_exists_exact`) instead of manual SQL.
+- `occurrence_index` plus `_occurrence_slot` differentiate repeated same-second events. The resolver now only reuses a stored index when the snapshot timestamp trails the latest committed event by ≥1 s (historical import) or when the baseline already contained the line; fresh same-minute transactions continue to receive new indices. Use helpers (`fetch_occurrence_indices`, `transaction_exists_exact`) instead of manual SQL.
+- `store_transaction_db` performs an additional historical guard: if an older snapshot (≤ last processed timestamp) tries to persist an item that already has matching occurrences for that minute, the insert is skipped even if the baseline cache was cleared during an auto-track toggle. This blocks the double-save seen when restarting auto-track mid-session.
 - Persistent state in `tracker_state` tracks `last_overview_text`, UI baselines, and flags; only refresh after successful transaction commits. `tracker_settings` holds toggles (capture region, GPU usage, debug mode).
+- Baseline gaps are repaired automatically: if a transaction line appears in the cached overview text but no matching DB row exists (even with an older timestamp), the next scan re-imports it despite the recency guard.
+- UI-inferred buys trigger only when matching placed/withdrew/transaction anchors exist in the current snapshot; implausible totals are reconstructed from anchor data/base prices or the inference is skipped entirely.
 
 ## Coding Standards & Architecture Notes
 - Follow PEP 8 with 4-space indentation, snake_case for functions/variables, PascalCase for classes. Keep module responsibilities isolated; avoid cross-layer imports that break the pipeline separation.

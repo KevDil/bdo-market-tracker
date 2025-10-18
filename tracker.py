@@ -574,6 +574,48 @@ class MarketTracker:
             return None
         return chosen_qty
 
+    def _reconstruct_ui_price(
+        self,
+        item_name: str,
+        delta_qty: int,
+        observed_delta_price: int,
+        anchor_entries: list[dict],
+    ) -> int | None:
+        if not item_name or delta_qty <= 0:
+            return None
+
+        candidate_units: list[int] = []
+        for entry in anchor_entries:
+            qty = entry.get('qty')
+            price = entry.get('price')
+            if not qty or not price or qty <= 0 or price <= 0:
+                continue
+            try:
+                if price % qty == 0:
+                    unit = price // qty
+                    if unit > 0 and self._is_unit_price_plausible(item_name, unit):
+                        candidate_units.append(unit)
+            except Exception:
+                continue
+
+        if observed_delta_price > 0 and observed_delta_price % delta_qty == 0:
+            unit = observed_delta_price // delta_qty
+            if unit > 0 and self._is_unit_price_plausible(item_name, unit):
+                candidate_units.insert(0, unit)
+
+        if candidate_units:
+            chosen_unit = candidate_units[0]
+            return int(chosen_unit * delta_qty)
+
+        try:
+            base_price = self._get_base_price(item_name)
+        except Exception:
+            base_price = None
+        if base_price and base_price > 0 and self._is_unit_price_plausible(item_name, base_price):
+            return int(base_price * delta_qty)
+
+        return None
+
     def _compile_transaction_pattern(self, item_name, quantity, price):
         parts = []
         if item_name:
@@ -837,20 +879,28 @@ class MarketTracker:
             )
             slot = tx.get('occurrence_slot', 0) or 0
             seen_in_prev = bool(tx.get('_seen_in_prev'))
+            ts_val = tx.get('timestamp')
+            last_processed = self.last_processed_game_ts if isinstance(self.last_processed_game_ts, datetime.datetime) else None
+            ts_datetime = ts_val if isinstance(ts_val, datetime.datetime) else None
 
             if existing:
-                if seen_in_prev and slot < len(existing):
-                    tx['occurrence_index'] = existing[slot]
-                    return True
+                historical_reference = False
+                if ts_datetime and last_processed:
+                    try:
+                        historical_reference = (last_processed - ts_datetime) >= datetime.timedelta(seconds=1)
+                    except Exception:
+                        historical_reference = ts_datetime < last_processed
+                reuse_index = None
 
-                ts_val = tx.get('timestamp')
-                if (
-                    seen_in_prev
-                    and isinstance(ts_val, datetime.datetime)
-                    and isinstance(self.last_processed_game_ts, datetime.datetime)
-                    and ts_val < self.last_processed_game_ts
-                ):
-                    tx['occurrence_index'] = existing[-1]
+                if slot < len(existing) and (seen_in_prev or historical_reference):
+                    reuse_index = existing[slot]
+                elif historical_reference:
+                    reuse_index = existing[-1]
+                elif seen_in_prev and ts_datetime and last_processed and ts_datetime < last_processed:
+                    reuse_index = existing[-1]
+
+                if reuse_index is not None:
+                    tx['occurrence_index'] = reuse_index
                     return True
 
             tx['occurrence_index'] = self._assign_occurrence_index(tx, existing)
@@ -1030,6 +1080,33 @@ class MarketTracker:
         sig = self.make_tx_sig(item, qty, price, ttype, ts, occ_idx)
         # CRITICAL: Generate content hash for reliable deduplication
         content_hash = self.make_content_hash(tx)
+        ts_dt = ts if isinstance(ts, datetime.datetime) else None
+        last_processed = self.last_processed_game_ts if isinstance(self.last_processed_game_ts, datetime.datetime) else None
+
+        if ts_dt and last_processed:
+            try:
+                historical_gap = (last_processed - ts_dt) >= datetime.timedelta(seconds=1)
+            except Exception:
+                historical_gap = ts_dt < last_processed
+        else:
+            historical_gap = False
+
+        if ts_dt and last_processed and historical_gap and (tx.get('occurrence_slot', 0) or 0) == 0:
+            try:
+                existing_indices = fetch_occurrence_indices(item, int(qty), int(price), ttype, ts_dt)
+            except Exception:
+                existing_indices = []
+            if existing_indices:
+                if occ_idx not in existing_indices:
+                    tx['occurrence_index'] = existing_indices[-1]
+                if self.debug:
+                    log_debug(
+                        f"[CONTENT-HASH] Historical duplicate guard skipped {ttype} {qty}x {item} "
+                        f"ts={ts_dt} indices={existing_indices}"
+                    )
+                self.seen_tx_signatures.append(sig)
+                return False
+
         if content_hash in self._batch_content_hashes:
             if self.debug:
                 log_debug(f"[CONTENT-HASH] Skip duplicate in batch: {item} {qty}x @ {price} (hash={content_hash})")
@@ -2744,6 +2821,12 @@ class MarketTracker:
             existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates if t.get('item_name')}
             existing_norm = {_norm_key(t.get('item_name')) for t in tx_candidates if t.get('item_name')}
             scan_ts = datetime.datetime.now()
+            structured_by_norm = {}
+            for entry in structured:
+                nm = _norm_key(entry.get('item') or '')
+                if not nm:
+                    continue
+                structured_by_norm.setdefault(nm, []).append(entry)
             for item_lc, metrics in ui_buy.items():
                 if item_lc in existing_items or _norm_key(metrics.get('item') or item_lc) in existing_norm:
                     continue
@@ -2769,30 +2852,34 @@ class MarketTracker:
                     continue
                 raw_name = metrics.get('item') or item_lc
                 corrected_name = correct_item_name(raw_name) or raw_name
-
-                # Guard: ensure a recent placed entry exists to avoid using stale UI deltas
-                latest_placed_ts = None
                 norm_metric_item = _norm_key(metrics.get('item') or item_lc)
-                for entry in structured:
-                    if entry.get('type') != 'placed':
-                        continue
-                    if _norm_key(entry.get('item') or '') != norm_metric_item:
-                        continue
+                anchor_entries = structured_by_norm.get(norm_metric_item, [])
+                anchor_present = any(
+                    (entry.get('type') in ('transaction', 'purchased', 'placed', 'withdrew'))
+                    for entry in anchor_entries
+                )
+                if not anchor_present:
+                    if self.debug:
+                        log_debug(f"[UI-INFER] Skip '{corrected_name}' - no matching log anchors in snapshot")
+                    continue
+                latest_anchor_ts = None
+                for entry in anchor_entries:
                     ts_entry = entry.get('timestamp')
                     if isinstance(ts_entry, datetime.datetime):
-                        if latest_placed_ts is None or ts_entry > latest_placed_ts:
-                            latest_placed_ts = ts_entry
-                if latest_placed_ts:
+                        if latest_anchor_ts is None or ts_entry > latest_anchor_ts:
+                            latest_anchor_ts = ts_entry
+                if latest_anchor_ts:
                     try:
-                        if (scan_ts - latest_placed_ts).total_seconds() > 120:
+                        if (scan_ts - latest_anchor_ts).total_seconds() > 180:
                             if self.debug:
-                                log_debug(f"[UI-INFER] Skip '{corrected_name}' - latest placed timestamp {latest_placed_ts} older than 120s")
+                                log_debug(f"[UI-INFER] Skip '{corrected_name}' - anchor timestamp too old ({latest_anchor_ts})")
                             continue
                     except Exception:
                         pass
                 
                 # CRITICAL FIX: Validate inferred price against market data
                 # This prevents using stale UI metrics that produce wrong prices
+                plausibility = {}
                 try:
                     plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price, tx_side='buy')
                     if not plausibility.get('plausible', True):
@@ -2812,11 +2899,18 @@ class MarketTracker:
                         elif self.debug:
                             log_debug(f"[UI-INFER] ⚠ '{corrected_name}' price {delta_price:,} is {reason} (expected: {expected_min:,} - {expected_max:,})")
                 except Exception:
-                    pass  # If check fails, proceed anyway
+                    plausibility = {'plausible': True}
                 # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
                 # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
                 # UI-inferred means we're detecting a NEW collect/buy that just happened NOW
-                ts_for_ui = scan_ts
+                if not plausibility.get('plausible', True):
+                    rebuilt_price = self._reconstruct_ui_price(corrected_name, delta_qty, delta_price, anchor_entries)
+                    if rebuilt_price is None:
+                        if self.debug:
+                            log_debug(f"[UI-INFER] Skip '{corrected_name}' - unable to rebuild plausible total from anchors")
+                        continue
+                    delta_price = rebuilt_price
+                ts_for_ui = latest_anchor_ts or scan_ts
                 synthetic_tx = {
                     'item_name': corrected_name,
                     'quantity': delta_qty,
@@ -3104,6 +3198,8 @@ class MarketTracker:
                     if self.debug:
                         log_debug(f"[HISTORICAL] Detected old transaction: {tx['item_name']} @ {tx['timestamp']} (baseline was at {prev_max_ts})")
             
+            baseline_gap = False
+
             # Check if this exact transaction already exists in DATABASE (not just baseline text)
             already_in_db = occurrence_reused
             already_in_db_any_side = False
@@ -3213,7 +3309,20 @@ class MarketTracker:
                         log_debug(f"[DELTA] SKIP (duplicate): {tx['item_name']} {tx['quantity']}x @ {tx['timestamp']} - already in DATABASE")
                     continue
 
-            allow_old_timestamp = not already_in_db and not already_in_db_any_side and not already_seen_in_prev
+            if already_seen_in_prev and not already_in_db and not already_in_db_any_side:
+                baseline_gap = True
+                is_historical = True
+                if self.debug:
+                    log_debug(
+                        f"[DELTA] Baseline gap detected for {tx['item_name']} "
+                        f"{tx['quantity']}x @ {tx['timestamp']} - importing despite previous snapshot"
+                    )
+
+            allow_old_timestamp = (
+                not already_in_db
+                and not already_in_db_any_side
+                and (not already_seen_in_prev or baseline_gap)
+            )
             # Recency guard: verarbeite nur Einträge mit Spiel-Zeitstempel >= baseline,
             # aber überspringe nur strikt ältere. Gleichzeitige (gleiche Minute) sind erlaubt,
             # wenn sie im Delta neu sind (oben bereits geprüft).
@@ -3274,7 +3383,8 @@ class MarketTracker:
             # store in DB
             saved = self.store_transaction_db(tx)
             if saved and isinstance(tx['timestamp'], datetime.datetime):
-                saved_any_ts.append(tx['timestamp'])
+                if not tx.get('_ui_inferred'):
+                    saved_any_ts.append(tx['timestamp'])
                 if self.debug:
                     log_debug(f"[SAVE] ✅ {tx['transaction_type']} {tx['case']} {tx['quantity']}x {tx['item_name']} price={tx['price']} ts={tx['timestamp']}")
             elif self.debug:
@@ -3346,7 +3456,8 @@ class MarketTracker:
                     continue
                 saved = self.store_transaction_db(fallback)
                 if saved and isinstance(fallback['timestamp'], datetime.datetime):
-                    saved_any_ts.append(fallback['timestamp'])
+                    if not fallback.get('_ui_inferred'):
+                        saved_any_ts.append(fallback['timestamp'])
                     if self.debug:
                         log_debug(f"fallback saved tx: {fallback['transaction_type']} {fallback['case']} {fallback['quantity']}x {fallback['item_name']} price={fallback['price']} ts={fallback['timestamp']}")
 
