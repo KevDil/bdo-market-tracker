@@ -28,12 +28,14 @@ _WITHDREW_PATTERN = re.compile(r"(?:withdrew?|withdraw(?:n|ed)?)\s+(?:order\s+of
 _MULTIPLIER_SYMBOL = r"(?:(?<=\s)|^)(?:[x×X\*]|[lI\|])(?=\s*[0-9OolI\|SsZzBb,\.]{1,4}(?:\b|$))"
 _MULTIPLIER_WITH_QTY_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*([0-9OolI\|SsZzBb,\.]+)", re.IGNORECASE)
 _MULTIPLIER_PRESENCE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*[0-9OolI\|SsZzBb,\.]+", re.IGNORECASE)
+_GLUED_MULTIPLIER_PATTERN = re.compile(r"([A-Za-z0-9'\-:\(\)]+)\s*[x×X]\s*([0-9OolI\|SsZzBb,\.]+)", re.IGNORECASE)
 
 _SILVER_PATTERN_RAW = r"s\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]"
 _SILVER_PATTERN = re.compile(_SILVER_PATTERN_RAW, re.IGNORECASE)
 _WORTH_SILVER_PATTERN = re.compile(fr"\bworth\s+[0-9OolI\|\s,\.]+\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _PRICE_WITH_SILVER_PATTERN = re.compile(fr"([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _MULTIPLIER_THEN_PRICE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}[\s\S]*?([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
+_SILVER_VARIANT_PATTERN = re.compile(r"\b(?:silve|silv)[^a-z0-9]{0,2}", re.IGNORECASE)
 
 _UI_COLLECT_BLOCK_PATTERN = re.compile(
     r"(?:\s|^)[^\n]*?Orders\s+[0-9OolI\|,\.]+\s+Orders\s+Completed\s+[0-9OolI\|,\.]+\s+Collect(?:\s+Re-?list)?",
@@ -347,8 +349,9 @@ def extract_details_from_entry(ts_text, entry_text):
     # Match patterns:
     #   1) 'Silve' + non-letter (space, underscore, punctuation)
     #   2) 'Silv' + punctuation (colon, dot, underscore)
-    entry_text = re.sub(r'\bSilve[_\s:,\.]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
-    entry_text = re.sub(r'\bSilv[:_\.]', 'Silver', entry_text, flags=re.IGNORECASE)
+    if _SILVER_VARIANT_PATTERN.search(entry_text):
+        entry_text = re.sub(r'\bSilve[_\s:,\.]+(?![a-z])', 'Silver ', entry_text, flags=re.IGNORECASE)
+        entry_text = re.sub(r'\bSilv[:_\.](?![a-z])', 'Silver', entry_text, flags=re.IGNORECASE)
     
     sold_candidate = _parse_sold_entry(ts_text, entry_text)
     if sold_candidate:
@@ -403,10 +406,9 @@ def extract_details_from_entry(ts_text, entry_text):
     def find_qty_in_segment(segment: str):
         boundary_pos = _find_boundary_offset(_PRICE_BOUNDARIES, segment)
         seg = segment if boundary_pos is None else segment[:boundary_pos]
-        # remove obvious UI decimals like 31.590 near 'Pearl Item Selling Limit'
         seg = _UI_DECIMAL_PATTERN.sub(' ', seg)
-        
-        # PRIORITY 1: Try to find quantity with explicit 'x' prefix (most reliable)
+
+        # PRIORITY 1: explicit multiplier (x27 / ×27 / X27 / accidental |27)
         last = None
         for match in _MULTIPLIER_WITH_QTY_PATTERN.finditer(seg):
             last = match
@@ -414,60 +416,39 @@ def extract_details_from_entry(ts_text, entry_text):
             val = normalize_numeric_str(last.group(1))
             if val and 1 <= val <= MAX_ITEM_QUANTITY:
                 return val
-        
-        # PRIORITY 2: CRITICAL FIX - Find quantity WITHOUT 'x' prefix
-        # Pattern: "Transaction of ItemName 2386 worth" or "Transaction of ItemName 386 worth"
-        # This handles OCR errors where leading digits are dropped ("2386" -> "386")
-        # 
-        # IMPORTANT: Item names can be multi-word ("Powder of Time", "Special Bluffer Mushroom")
-        # So we need a GREEDY match for item name, then look for NUMBER before 'worth'
-        # 
-        # Strategy: Match from end backwards:
-        #   1. Find 'worth' or 'for'
-        #   2. Look back for NUMBER (1-6 digits)
-        #   3. That's the quantity!
-        
-        # Look backwards from 'worth/for' to find the last number
-        # This avoids the problem of multi-word item names
-        worth_match = re.search(r'\b(worth|for)\b', seg, re.IGNORECASE)
+
+        # PRIORITY 2: tolerate OCR where multiplier glued to item ("Magical Shardx27")
+        for match in _GLUED_MULTIPLIER_PATTERN.finditer(seg):
+            val = normalize_numeric_str(match.group(2))
+            if val and 1 <= val <= MAX_ITEM_QUANTITY:
+                return val
+
+        # PRIORITY 3: last standalone number before price marker (worth/for/silver)
+        worth_match = re.search(r'\b(worth|for|silver)\b', seg, re.IGNORECASE)
         if worth_match:
-            # Get text BEFORE 'worth' keyword
             text_before_worth = seg[:worth_match.start()]
-            
-            # Find the LAST number (1-4 digits, matching MAX_ITEM_QUANTITY) in that text
-            # This should be the quantity
-            number_matches = list(re.finditer(r'\b(\d{1,4})\b', text_before_worth))
-            if number_matches:
-                # Take the LAST number before 'worth'
-                last_number = number_matches[-1]
-                val = int(last_number.group(1))
-                
-                # Sanity checks:
-                # 1. Must be reasonable quantity (1-MAX_ITEM_QUANTITY)
-                # 2. Should not be preceded by UI keywords
-                if 1 <= val <= MAX_ITEM_QUANTITY:
-                    # Check context before number - reject if it's a UI number
-                    context_start = max(0, last_number.start() - 30)
-                    context = text_before_worth[context_start:last_number.start()].lower()
-                    
-                    # Reject if preceded by UI keywords
-                    ui_keywords = ['balance', 'capacity', 'warehouse', 'limit', 'completed', 'orders']
-                    if not any(kw in context for kw in ui_keywords):
-                        return val
-        
-        # PRIORITY 3: Fallback - any reasonable number before 'worth' (last resort)
-        # This catches cases where the pattern above doesn't match
-        fallback_pattern = re.compile(r'(\d{1,4})\s+(?:worth|for)', re.IGNORECASE)
+            number_matches = list(re.finditer(r'\b([0-9OolI\|]{1,4})\b', text_before_worth))
+            while number_matches:
+                last_number = number_matches.pop()
+                val = normalize_numeric_str(last_number.group(1))
+                if not val or not (1 <= val <= MAX_ITEM_QUANTITY):
+                    continue
+                context_start = max(0, last_number.start() - 30)
+                context = text_before_worth[context_start:last_number.start()].lower()
+                ui_keywords = ['balance', 'capacity', 'warehouse', 'limit', 'completed', 'orders', 'sell', 'vt']
+                if any(kw in context for kw in ui_keywords):
+                    continue
+                return val
+
+        # PRIORITY 4: fallback - nearest short number before price keywords
+        fallback_pattern = re.compile(r'([0-9OolI\|]{1,4})\s+(?:worth|for|silver)', re.IGNORECASE)
         matches = list(fallback_pattern.finditer(seg))
         if matches:
-            # Take the LAST match (closest to 'worth')
-            val = int(matches[-1].group(1))
-            if 1 <= val <= MAX_ITEM_QUANTITY:
-                # Additional sanity check: reject if this looks like a price
-                # Prices are usually >100,000 but quantities are usually <10,000
-                # Exception: bulk purchases can be up to MAX_ITEM_QUANTITY
-                return val
-        
+            for match in reversed(matches):
+                val = normalize_numeric_str(match.group(1))
+                if val and 1 <= val <= MAX_ITEM_QUANTITY:
+                    return val
+
         return None
 
     explicit_qty = False  # tracks whether a multiplier like 'xN' was explicitly found
@@ -856,7 +837,7 @@ def extract_details_from_entry(ts_text, entry_text):
                         price = None
                     # Moderate threshold: if price is still far below the allowed minimum (e.g. missing leading digit)
                     # mark it invalid so tracker.py can reconstruct it via UI metrics instead of persisting garbage.
-                    elif reason == 'too_low' and expected_min and price < expected_min * 0.6:
+                    elif reason == 'too_low' and expected_min and price < expected_min * 0.3:
                         price = None
         except Exception:
             pass  # If plausibility check fails, keep original price
@@ -865,10 +846,14 @@ def extract_details_from_entry(ts_text, entry_text):
     # (For items not in market_data.csv or if check failed)
     if typ in ('transaction', 'purchased') and price is not None and qty is not None:
         if qty >= 10 and price < 1_000_000:
-            # Price too low for high quantity - likely OCR error with missing leading digits
-            # Common pattern: lost 4-6 leading digits from a price like "585,585,000"
-            # Mark as invalid price to trigger UI fallback in tracker.py
-            price = None
+            avg_price = price / max(qty, 1)
+            # Only treat as invalid when the average unit price is unrealistically low (< 50 Silver)
+            # This keeps legitimate low-total orders (e.g. 577x Powder of Darkness @ 609,830) intact
+            if avg_price < 50:
+                # Price too low for high quantity - likely OCR error with missing leading digits
+                # Common pattern: lost 4-6 leading digits from a price like "585,585,000"
+                # Mark as invalid price to trigger UI fallback in tracker.py
+                price = None
 
     # timestamp: from ts_text if given, else try to find within entry_text
     ts = None

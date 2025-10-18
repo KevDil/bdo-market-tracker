@@ -731,7 +731,16 @@ def get_item_likely_type(item_name: str) -> str:
             return cat
     return None
 
-def check_price_plausibility(item_name: str, quantity: int, total_price: int) -> dict:
+MARKET_SELL_NET_FACTOR = 0.88725  # Net silver after marketplace tax (Value Pack + family fame)
+
+
+def check_price_plausibility(
+    item_name: str,
+    quantity: int,
+    total_price: int,
+    *,
+    tx_side: Optional[str] = None,
+) -> dict:
     """
     Prüft ob der Gesamtpreis für ein Item plausibel ist basierend auf Market-Data.
     
@@ -753,6 +762,8 @@ def check_price_plausibility(item_name: str, quantity: int, total_price: int) ->
         'unit_price': total_price / quantity if quantity > 0 else 0,
         'expected_min': None,
         'expected_max': None,
+        'expected_min_net': None,
+        'expected_max_net': None,
         'reason': 'no_data'
     }
     
@@ -782,7 +793,7 @@ def check_price_plausibility(item_name: str, quantity: int, total_price: int) ->
     unit_price = total_price / quantity
     result['unit_price'] = unit_price
 
-    tolerance = 0.15
+    tolerance = 0.10
     min_unit_price = base_price * (1 - tolerance)
     max_unit_price = base_price * (1 + tolerance)
 
@@ -792,7 +803,19 @@ def check_price_plausibility(item_name: str, quantity: int, total_price: int) ->
     result['expected_min'] = int(round(expected_min_total))
     result['expected_max'] = int(round(expected_max_total))
 
+    net_min_total = expected_min_total * MARKET_SELL_NET_FACTOR
+    net_max_total = expected_max_total * MARKET_SELL_NET_FACTOR
+    result['expected_min_net'] = int(round(net_min_total))
+    result['expected_max_net'] = int(round(net_max_total))
+
     if unit_price < min_unit_price:
+        # Allow net proceeds for sell-side transactions (Marketplace takes a tax cut).
+        allow_net = (tx_side == 'sell') or (tx_side is None)
+        if allow_net and total_price is not None:
+            if result['expected_min_net'] <= total_price <= result['expected_max_net']:
+                result['plausible'] = True
+                result['reason'] = 'ok_net'
+                return result
         result['plausible'] = False
         result['reason'] = 'too_low'
     elif unit_price > max_unit_price:

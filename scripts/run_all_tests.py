@@ -22,7 +22,16 @@ def run_all_tests():
     
     # Finde alle Test-Skripte
     script_dir = Path(__file__).parent
-    test_files = sorted([f for f in os.listdir(script_dir) if f.startswith('test_') and f.endswith('.py')])
+    project_root = script_dir.parent
+    unit_dir = project_root / "tests" / "unit"
+
+    test_files = []
+    if unit_dir.exists():
+        test_files.extend(sorted(str(path.relative_to(project_root)) for path in unit_dir.glob("test_*.py")))
+
+    if not test_files:
+        print("❌ Keine Test-Dateien gefunden!")
+        return 1
     
     if not test_files:
         print("❌ Keine Test-Dateien gefunden!")
@@ -35,8 +44,8 @@ def run_all_tests():
     total_time = 0
     
     for test_file in test_files:
-        test_path = script_dir / test_file
-        test_name = test_file.replace('.py', '')
+        test_path = project_root / test_file
+        test_name = Path(test_file).stem
         
         print(f"\n▶️  Führe aus: {test_name}")
         print("-" * 80)
@@ -51,7 +60,7 @@ def run_all_tests():
             
             result = subprocess.run(
                 [sys.executable, str(test_path)],
-                cwd=script_dir.parent,  # Run from project root
+                cwd=project_root,  # Run from project root
                 capture_output=True,
                 text=True,
                 encoding='utf-8',

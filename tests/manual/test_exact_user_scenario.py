@@ -1,18 +1,13 @@
 """Test: Exact reproduction of user's scenario"""
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+import sys
 
-# Fix Unicode encoding on Windows
-try:
-    from test_utils import fix_windows_unicode
-    fix_windows_unicode()
-except ImportError:
-    pass
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from tracker import MarketTracker
 
-# Exact OCR from user's first scan (11:07:17)
 text1 = """Central Market Ww Warehouse Balance 76,570,794,077 Manage Warehouse 
 2025.10.11 11.05 2025.10.11 10.56 2025.10.11 10.50 2025.10.11 10.50 
 Listed Magical Shard x2OO for 640,000,000 Silver: The price of enhancement m_. 
@@ -42,5 +37,5 @@ print("\n" + "=" * 80)
 print("CHECK THE LOGS ABOVE FOR:")
 print("- 'first snapshot: item 'magical shard' has drift' -> Should NOT appear!")
 print("- 'structured: 2025-10-11 10:XX:00 transaction item='Magical Shard'")
-print("- 'DB SAVE: ... ts=2025-10-11 10:56:00' (or 10:50 depending on parsing)")
+print("- 'DB SAVE: ... ts=2025-10-11 10:56:00'")
 print("=" * 80)

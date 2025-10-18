@@ -31,7 +31,7 @@ def check_all_prices():
         total += 1
         
         try:
-            result = check_price_plausibility(item_name, quantity, price)
+            result = check_price_plausibility(item_name, quantity, price, tx_side=tx_type)
             
             if not result['plausible']:
                 unit_price = result['unit_price']

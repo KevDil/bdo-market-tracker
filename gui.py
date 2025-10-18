@@ -5,6 +5,7 @@ from tkinter import messagebox, ttk
 import pandas as pd
 import matplotlib.pyplot as plt
 import datetime
+from utils import log_debug 
 
 from tracker import MarketTracker
 from config import (
@@ -27,8 +28,8 @@ def start_gui():
 
     root = tk.Tk()
     root.title("BDO Market Tracker")
-    root.geometry("640x720")
-    root.minsize(560, 660)
+    root.geometry("640x740")
+    root.minsize(560, 680)
 
     style = ttk.Style()
     try:
@@ -85,27 +86,25 @@ def start_gui():
 
     auto_thread = {"thread": None}
 
-    def start_auto():
-        if tracker.running:
-            messagebox.showinfo("Auto-Tracking", "Auto-Tracking läuft bereits.")
-            return
-        status_var.set("Status: Running")
-        _apply_region_from_entry()
-        # Log auto-track start in ocr_log.txt
-        from utils import log_debug
-        log_debug("[AUTO-TRACK] ▶️ STARTED - Auto-Track mode enabled")
-        t = threading.Thread(target=tracker.auto_track, daemon=True)
-        auto_thread["thread"] = t
-        t.start()
-        messagebox.showinfo("Auto-Tracking", "Auto-Tracking gestartet.")
-
-    def stop_auto():
-        # Log auto-track stop in ocr_log.txt
-        from utils import log_debug
-        log_debug("[AUTO-TRACK] ⏸️ STOPPED - Auto-Track mode disabled")
-        tracker.stop()
-        status_var.set("Status: Idle")
-        messagebox.showinfo("Auto-Tracking", "Auto-Tracking gestoppt.")
+    def toggle_auto():
+        if not tracker.running:
+            # Start auto-tracking
+            status_var.set("Status: Running")
+            _apply_region_from_entry()
+            # Log auto-track start in ocr_log.txt
+            log_debug("[AUTO-TRACK] ▶️ STARTED - Auto-Track mode enabled")
+            t = threading.Thread(target=tracker.auto_track, daemon=True)
+            auto_thread["thread"] = t
+            t.start()
+            messagebox.showinfo("Auto-Tracking", "Auto-Tracking gestartet.")
+            auto_button.config(text="Auto-Tracking stoppen")
+        else:
+            # Stop auto-tracking
+            log_debug("[AUTO-TRACK] ⏸️ STOPPED - Auto-Track mode disabled")
+            tracker.stop()
+            status_var.set("Status: Idle")
+            messagebox.showinfo("Auto-Tracking", "Auto-Tracking gestoppt.")
+            auto_button.config(text="Auto-Tracking starten")
 
     def start_region_selection():
         selection_state = {"points": []}
@@ -174,8 +173,8 @@ def start_gui():
     controls_row = tk.Frame(region_frame)
     controls_row.pack(fill="x", pady=(10, 0))
     ttk.Button(controls_row, text="Einmal scannen", style="Accent.TButton", command=run_single).pack(side="left")
-    ttk.Button(controls_row, text="Auto-Tracking starten", command=start_auto).pack(side="left", padx=6)
-    ttk.Button(controls_row, text="Stop", command=stop_auto).pack(side="left")
+    auto_button = ttk.Button(controls_row, text="Auto-Tracking starten", style="Accent.TButton", command=toggle_auto)
+    auto_button.pack(side="left", padx=6)
 
     ttk.Label(region_frame, textvariable=status_var, foreground="#3a3a3a").pack(anchor="w", pady=(8, 0))
 

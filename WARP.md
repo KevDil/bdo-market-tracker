@@ -29,15 +29,15 @@ python tracker.py  # MarketTracker.single_scan()
 
 ### Testing
 ```powershell
-# Run all tests (29/32 tests passing)
+# Run automated unit tests
 python scripts/run_all_tests.py
 
 # Run specific tests
-python scripts/test_exact_user_scenario.py
-python scripts/test_integration.py
-python scripts/test_window_detection.py
-python scripts/test_item_validation.py
-python scripts/test_parsing_crystal.py
+python tests/unit/test_collect_anchor.py
+python tests/unit/test_parsing_crystal.py
+python tests/manual/test_window_detection.py
+python tests/manual/test_integration.py
+python tests/manual/test_item_validation.py
 
 # Performance benchmarks
 python scripts/benchmark_performance.py

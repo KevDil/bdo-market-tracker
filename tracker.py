@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 import datetime
+import math
 import re
 import json
 import cv2
@@ -97,6 +98,7 @@ class MarketTracker:
         # Performance-Optimierung: Deque statt Set verhindert unbegrenztes Wachstum
         from collections import deque
         self.seen_tx_signatures = deque(maxlen=1000)  # Max 1000 neueste Signaturen
+        self._batch_content_hashes: set[str] = set()
         # zuletzt gesamter OCR-Text (zum Erkennen von neuen Zeilen)
         self.last_full_text = ""
         # letzter Overview-OCR-Text (nur Overview, für Delta-Vergleich)
@@ -164,6 +166,7 @@ class MarketTracker:
         # Track unit price plausibility lookups to minimise API churn and noisy logs
         self._unit_price_cache = {}
         self._missing_price_items = set()
+        self._base_price_cache = {}
         self._last_focus_state = None
         self._last_foreground_title = ""
 
@@ -295,6 +298,114 @@ class MarketTracker:
         if sleep_iv <= 0.08 and self._burst_fast_scans > 0:
             self._burst_fast_scans -= 1
         return sleep_iv
+
+    def _get_base_price(self, item_name: str) -> int | None:
+        if not item_name:
+            return None
+        key = (item_name or "").lower()
+        if key in self._base_price_cache:
+            cached = self._base_price_cache[key]
+            return cached if cached else None
+
+        candidates: list[str] = []
+        candidates.append(item_name)
+        try:
+            corrected = correct_item_name(item_name, min_score=80)
+            if corrected and corrected.lower() != key:
+                candidates.append(corrected)
+        except Exception as exc:
+            if self.debug:
+                log_debug(f"[PRICE] Item correction failed for base price lookup '{item_name}': {exc}")
+
+        base_price: int | None = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                data = get_item_price_range_by_name(candidate, use_cache=True)
+            except Exception as exc:
+                if self.debug:
+                    log_debug(f"[PRICE] Base price lookup failed for '{candidate}': {exc}")
+                continue
+            if data and data.get('base_price'):
+                base_price = int(data['base_price'])
+                break
+
+        # cache result (including None to avoid repeated lookups)
+        self._base_price_cache[key] = base_price or 0
+        if base_price:
+            for cand in candidates:
+                if cand:
+                    self._base_price_cache[cand.lower()] = base_price
+        return base_price
+
+    def _restore_total_with_base_price(self, item_name: str, quantity: int | None, observed_total: int | None) -> int | None:
+        if not item_name or not quantity or quantity <= 0 or not observed_total or observed_total <= 0:
+            return None
+        base_price = self._get_base_price(item_name)
+        if not base_price or base_price <= 0:
+            return None
+
+        observed_unit = observed_total / quantity
+        tolerance = 0.10
+        lower = base_price * (1 - tolerance)
+        upper = base_price * (1 + tolerance)
+        if observed_unit >= lower:
+            # already within tolerance, no missing digit suspected
+            return None
+
+        magnitude = 10 ** max(0, int(math.log10(base_price)))
+        max_attempts = 3
+        for _ in range(max_attempts):
+            for leading in range(1, 10):
+                candidate_total = observed_total + leading * magnitude
+                if candidate_total % quantity != 0:
+                    continue
+                candidate_unit = candidate_total // quantity
+                if lower <= candidate_unit <= upper:
+                    if self._is_unit_price_plausible(item_name, candidate_unit):
+                        return candidate_total
+                    # Even if unit plausibility fails (e.g., API outage), accept once within tolerance
+                    return candidate_total
+            magnitude *= 10
+
+        expected_total = int(round(base_price * quantity))
+        if expected_total % quantity == 0 and expected_total > observed_total and lower <= expected_total / quantity <= upper:
+            if self._is_unit_price_plausible(item_name, expected_total // quantity):
+                return expected_total
+            return expected_total
+        return None
+
+    def _compile_transaction_pattern(self, item_name, quantity, price):
+        parts = []
+        if item_name:
+            parts = [re.escape(part) for part in _WHITESPACE_PATTERN.split(item_name) if part]
+        item_pattern = r"\s+".join(parts)
+        qty_pattern = re.escape(str(quantity)) if quantity is not None else ""
+        price_pattern = ""
+        if price is not None:
+            price_int = int(round(price))
+            price_str = str(price_int)
+            if len(price_str) > 6:
+                price_prefix = re.escape(price_str[:3])
+                price_suffix = re.escape(price_str[-3:])
+                price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
+            else:
+                price_pattern = _COMMA_PATTERN.sub(',?', re.escape(price_str))
+
+        def _fmt_escape(value: str) -> str:
+            return value.replace('{', '{{').replace('}', '}}')
+
+        item_component = _fmt_escape(item_pattern) if item_pattern else r'.*?'
+        qty_component = _fmt_escape(qty_pattern) if qty_pattern else r'.*?'
+        price_component = _fmt_escape(price_pattern) if price_pattern else r'.*?'
+
+        pattern_str = _TRANSACTION_BASE_PATTERN.format(
+            item=item_component,
+            qty=qty_component,
+            price=price_component,
+        )
+        return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
 
     def _consume_immediate_rescan_request(self):
         if self._request_immediate_rescan > 0:
@@ -584,20 +695,35 @@ class MarketTracker:
                 continue
             evaluated_name = candidate
             try:
-                result = check_price_plausibility(candidate, 1, int(unit_price))
+                result_buy = check_price_plausibility(candidate, 1, int(unit_price), tx_side='buy')
             except Exception as exc:
                 if self.debug:
                     log_debug(f"[PRICE] Plausibility check failed for '{candidate}' @ {unit_price}: {exc}")
                 continue
 
-            reason = result.get('reason')
+            reason = result_buy.get('reason')
             if reason in ('no_data', 'api_error'):
                 continue
 
-            is_plausible = bool(result.get('plausible'))
-            if is_plausible:
+            if result_buy.get('plausible'):
                 self._unit_price_cache[cache_key] = True
                 return True
+
+            # Retry as SELL context to allow for net (post-tax) unit prices
+            if reason == 'too_low':
+                try:
+                    result_sell = check_price_plausibility(candidate, 1, int(unit_price), tx_side='sell')
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[PRICE] Sell plausibility failed for '{candidate}' @ {unit_price}: {exc}")
+                else:
+                    reason_sell = result_sell.get('reason')
+                    if reason_sell in ('no_data', 'api_error'):
+                        continue
+                    if result_sell.get('plausible'):
+                        self._unit_price_cache[cache_key] = True
+                        return True
+                    reason = reason_sell
 
             explicit_rejection = True
             break
@@ -608,9 +734,9 @@ class MarketTracker:
 
         if evaluated_name:
             key = evaluated_name.lower()
-            if key not in self._missing_price_items and self.debug:
-                log_debug(f"[PRICE] No live bounds for '{evaluated_name}', allowing unit={unit_price}")
-                self._missing_price_items.add(key)
+        if key not in self._missing_price_items and self.debug:
+            log_debug(f"[PRICE] No live bounds for '{evaluated_name}', allowing unit={unit_price}")
+            self._missing_price_items.add(key)
 
         self._unit_price_cache[cache_key] = True
         return True
@@ -639,32 +765,48 @@ class MarketTracker:
             for r in tx.get('raw_related', []):
                 if r.get('type') in ('transaction', 'purchased') and r.get('raw'):
                     raw_text = r['raw']
-                    # Use ts_text as context (timestamp in OCR)
-                    context_before = r.get('ts_text', '')
+                    ts_text_val = r.get('ts_text', '') or ''
+                    if ts_text_val:
+                        try:
+                            parsed_ctx = parse_timestamp_text(ts_text_val)
+                        except Exception:
+                            parsed_ctx = None
+                        if parsed_ctx:
+                            context_before = parsed_ctx.strftime("%Y-%m-%d %H:%M")
+                        else:
+                            context_before = ts_text_val.strip()
                     break
-            
+
             if raw_text:
                 # Normalize: lowercase, remove extra spaces
                 # PERFORMANCE: Use precompiled whitespace pattern
                 normalized = _WHITESPACE_PATTERN.sub(' ', raw_text.lower()).strip()
                 # Remove all numbers but keep text structure
-                normalized = re.sub(r'\d+[,\.\d]*', 'N', normalized)
+                normalized = re.sub(r'\d+[\,\.\d]*', 'N', normalized)
                 normalized = _WHITESPACE_PATTERN.sub(' ', normalized).strip()
-                # Add context (timestamp) to make hash unique for each position
-                hash_input = f"{context_before}|{normalized}"
+                context_norm = _WHITESPACE_PATTERN.sub(' ', (context_before or '').lower()).strip()
+                if context_norm:
+                    hash_input = f"{context_norm}|{normalized}"
+                else:
+                    hash_input = normalized
             else:
-                # Fallback: use parsed values + timestamp
-                ts_str = tx['timestamp'].strftime("%Y-%m-%d %H:%M:%S") if isinstance(tx.get('timestamp'), datetime.datetime) else str(tx.get('timestamp', ''))
-                hash_input = f"{tx['item_name']}|{tx['quantity']}|{int(tx['price'] or 0)}|{tx['transaction_type']}|{ts_str}".lower()
-            
+                # Fallback: use parsed values; omit timestamp to favor content-based dedupe
+                context_norm = _WHITESPACE_PATTERN.sub(' ', (context_before or '').lower()).strip()
+                components = [
+                    (tx.get('item_name') or '').lower(),
+                    str(int(tx.get('quantity') or 0)),
+                    str(int(tx.get('price') or 0)),
+                    (tx.get('transaction_type') or '').lower()
+                ]
+                if context_norm:
+                    components.append(context_norm)
+                hash_input = "|".join(components)
+
             # Generate SHA256 hash (first 16 chars sufficient)
             return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]
         except Exception:
             # Fallback: simple hash of item+qty+price+timestamp
-            ts_str = tx.get('timestamp', '')
-            if isinstance(ts_str, datetime.datetime):
-                ts_str = ts_str.strftime("%Y-%m-%d %H:%M:%S")
-            simple = f"{tx.get('item_name', '')}|{tx.get('quantity', 0)}|{int(tx.get('price', 0) or 0)}|{ts_str}".lower()
+            simple = f"{tx.get('item_name', '')}|{tx.get('quantity', 0)}|{int(tx.get('price', 0) or 0)}".lower()
             return hashlib.sha256(simple.encode('utf-8')).hexdigest()[:16]
 
     def store_transaction_db(self, tx):
@@ -682,10 +824,15 @@ class MarketTracker:
         except Exception:
             occ_idx = 0
         
+        sig = self.make_tx_sig(item, qty, price, ttype, ts, occ_idx)
         # CRITICAL: Generate content hash for reliable deduplication
         content_hash = self.make_content_hash(tx)
-        
-        sig = self.make_tx_sig(item, qty, price, ttype, ts, occ_idx)
+        if content_hash in self._batch_content_hashes:
+            if self.debug:
+                log_debug(f"[CONTENT-HASH] Skip duplicate in batch: {item} {qty}x @ {price} (hash={content_hash})")
+            self.seen_tx_signatures.append(sig)
+            return False
+        self._batch_content_hashes.add(content_hash)
         if sig in self.seen_tx_signatures:
             if self.debug:
                 print("DEBUG: already seen (session):", sig)
@@ -731,6 +878,18 @@ class MarketTracker:
             if self.debug:
                 log_debug(f"[CONTENT-HASH] Check failed: {e}")
         
+        # If UI-inferred, double-check database for same item+price in tolerance (ignore qty since UI deltas can drift)
+        if tx.get('_ui_inferred') and price is not None and ts:
+            try:
+                if transaction_exists_by_values_near_time(item, qty or 0, int(price), ts, tolerance_minutes=5, ignore_quantity=True):
+                    if self.debug:
+                        log_debug(f"[CONTENT-HASH] Skip UI-inferred duplicate: {item} {qty}x @ {price}")
+                    self.seen_tx_signatures.append(sig)
+                    return False
+            except Exception as e:
+                if self.debug:
+                    log_debug(f"[CONTENT-HASH] UI-inferred duplicate check failed: {e}")
+
         # CRITICAL: Skip transactions with invalid price OR quantity
         if price is None or price == 0:
             print(f"⚠️ Überspringe unsichere Transaktion (kein Preis): {str(ttype or '').upper()} {qty}x {item} ts={ts_str}")
@@ -870,6 +1029,7 @@ class MarketTracker:
 
         # build structured entries
         structured = []
+        self._batch_content_hashes.clear()
         for pos, ts_text, snippet in entries:
             details = extract_details_from_entry(ts_text, snippet)
             # include original pos for fallback grouping
@@ -952,6 +1112,12 @@ class MarketTracker:
                 # consider only items where the SAME event type appears with MULTIPLE timestamps
                 # and at least one is close to overall_max_ts (within 5 minutes)
                 anchor_items = set()
+                baseline_items = set()
+                if self.last_overview_text:
+                    baseline_lower = self.last_overview_text.lower()
+                else:
+                    baseline_lower = ""
+
                 for it, type_ts_list in items_type_timestamps.items():
                     # Group by type
                     by_type = {}
@@ -968,10 +1134,16 @@ class MarketTracker:
                                 # Multiple timestamps for the same event type - drift detected!
                                 max_item_ts = max(timestamps)
                                 if abs((overall_max_ts - max_item_ts).total_seconds()) <= 300:  # 5 minutes
-                                    anchor_items.add(it)
-                                    if self.debug:
-                                        log_debug(f"first snapshot: item '{it}' has {anchor_type} drift (multiple ts for same event), will adjust")
-                                    break  # Found drift for this item
+                                    # Only adjust if the item existed in the previous baseline snapshot
+                                    if baseline_lower:
+                                        item_present_before = bool(re.search(re.escape(it), baseline_lower))
+                                    else:
+                                        item_present_before = False
+                                    if item_present_before:
+                                        anchor_items.add(it)
+                                        if self.debug:
+                                            log_debug(f"first snapshot: item '{it}' has {anchor_type} drift (multiple ts for same event), will adjust")
+                                        break  # Found drift for this item
                 
                 # Adjust all entries of items with drift
                 for s in structured:
@@ -981,7 +1153,7 @@ class MarketTracker:
                             if self.debug:
                                 old_ts = s['timestamp'].strftime('%H:%M:%S')
                                 new_ts = overall_max_ts.strftime('%H:%M:%S')
-                                log_debug(f"first snapshot: adjusting '{itlc}' {s.get('type')} ts {old_ts} -> {new_ts}")
+                                log_debug(f"first snapshot: adjusting '{itlc}' {s.get('type')} ts {old_ts} → {new_ts}")
                             s['timestamp'] = overall_max_ts
             except Exception as e:
                 if self.debug:
@@ -1067,7 +1239,7 @@ class MarketTracker:
                                 if self.debug:
                                     old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
                                     new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                    log_debug(f"[FRESH-TX] '{s['item']}' (newest of {len(entries)}) within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} -> {new_ts}")
+                                    log_debug(f"[FRESH-TX] '{s['item']}' (newest of {len(entries)}) within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} → {new_ts}")
                                 s['timestamp'] = overall_max_ts
                             elif time_diff_seconds > FRESH_TX_WINDOW:
                                 if self.debug:
@@ -1098,7 +1270,7 @@ class MarketTracker:
                                 if self.debug:
                                     old_ts = ts.strftime('%Y-%m-%d %H:%M:%S')
                                     new_ts = overall_max_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                    log_debug(f"[FRESH-TX] '{s['item']}' within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} -> {new_ts}")
+                                    log_debug(f"[FRESH-TX] '{s['item']}' within {time_diff_seconds:.0f}s window: adjusting ts {old_ts} → {new_ts}")
                                 s['timestamp'] = overall_max_ts
                             elif time_diff_seconds > FRESH_TX_WINDOW:
                                 if self.debug:
@@ -1124,12 +1296,47 @@ class MarketTracker:
         # The extract functions are safe and return {} if no metrics found
         ui_buy = self._extract_buy_ui_metrics(full_text)  # Always extract, not just on buy_overview
         ui_sell = self._extract_sell_ui_metrics(full_text)  # Always extract, not just on sell_overview
-        # Build normalized lookup (remove non-alphanumerics) to be robust to apostrophes/hyphens in names
+        # Build normalized lookup helper early so UI deltas can reuse it before updates
         def _norm_key(s: str) -> str:
             try:
                 return re.sub(r"[^a-z0-9]", "", (s or "").lower())
             except Exception:
                 return (s or "").lower()
+        # Snapshot previous UI metrics at the very beginning so inference compares against the prior scan
+        prev_ui_buy = {}
+        if wtype == 'buy_overview':
+            if getattr(self, '_last_ui_buy_metrics', None):
+                try:
+                    prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
+                except Exception:
+                    prev_ui_buy = self._last_ui_buy_metrics.copy()
+            elif self.last_overview_text:
+                try:
+                    prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
+                except Exception:
+                    prev_ui_buy = {}
+        prev_ui_sell = {}
+        prev_ui_sell_norm = {}
+        if wtype == 'sell_overview':
+            if getattr(self, '_last_ui_sell_metrics', None):
+                try:
+                    prev_ui_sell = {k: dict(v) for k, v in self._last_ui_sell_metrics.items()}
+                except Exception:
+                    prev_ui_sell = self._last_ui_sell_metrics.copy()
+            elif self.last_overview_text:
+                try:
+                    prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
+                except Exception:
+                    prev_ui_sell = {}
+            if prev_ui_sell:
+                try:
+                    for k, v in prev_ui_sell.items():
+                        prev_ui_sell_norm[_norm_key(k)] = v
+                        nm_prev = (v.get('item') or '')
+                        if nm_prev:
+                            prev_ui_sell_norm[_norm_key(nm_prev)] = v
+                except Exception:
+                    prev_ui_sell_norm = {}
         ui_sell_norm = {}
         if ui_sell:
             for k, v in ui_sell.items():
@@ -1422,7 +1629,7 @@ class MarketTracker:
                         if sc > 0:
                             has_sell_ui_evidence_anchor = True
                             if self.debug:
-                                log_debug(f"[UI-EVIDENCE] Allowing sell for '{ent.get('item')}' with UI evidence (salesCompleted={sc}) despite missing transaction line")
+                                log_debug(f"[UI-EVIDENCE] Allowing sell for '{ent['item']}' with UI evidence (salesCompleted={sc}) despite missing transaction line")
                 
                 if not has_transaction_anchor and not has_sell_ui_evidence_anchor:
                     if self.debug:
@@ -1470,8 +1677,8 @@ class MarketTracker:
                 has_withdrew_same = any(r['type'] == 'withdrew' and same_item(r) for r in related)
                 # In buy_overview, a 'transaction' line is effectively a completed buy, treat it same as 'purchased'
                 has_bought_same = (
-                    any(r['type'] in ('purchased', 'transaction') and same_item(r) for r in related)
-                    or ent['type'] in ('purchased', 'transaction')
+                    any(r['type'] in ('purchased','transaction') and same_item(r) for r in related)
+                    or ent['type'] in ('purchased','transaction')
                 )
                 relist_flag_same = has_listed_same or has_placed_same
                 
@@ -1591,7 +1798,7 @@ class MarketTracker:
                             # set inferred qty if not already set
                             placed_entry = next((r for r in related if r['type'] == 'placed' and same_item(r)), None)
                             withdrew_entry = next((r for r in related if r['type'] == 'withdrew' and same_item(r)), None)
-                            if placed_entry and withdrew_entry and placed_entry.get('qty') and withdrew_entry.get('qty') and placed_entry['qty'] > withdrew_entry['qty']:
+                            if placed_entry and withdrew_entry and placed_entry.get('qty') and withdrew_entry.get('qty'):
                                 ent['qty'] = placed_entry['qty'] - withdrew_entry['qty']
                         if ent.get('qty'):
                             ent['price'] = tx_price_only
@@ -1648,7 +1855,7 @@ class MarketTracker:
                 
                 # CRITICAL: If NO transaction line (missing qty or price), use UI metrics directly
                 # This handles fast collect scenarios where transaction line scrolled off before OCR scan
-                if (quantity is None or price is None or price <= 0):
+                if (quantity is None or price is None or price <= 0 or first_snapshot_mode):
                     try:
                         item_name_raw = item_name
                         item_lc2 = item_name_raw.lower()
@@ -1667,11 +1874,13 @@ class MarketTracker:
                                     if self.debug:
                                         log_debug(f"[UI-FALLBACK] Using salesCompleted={sc} for quantity (no transaction line)")
                                 
-                                # Calculate price from UI
-                                if price is None or price <= 0:
-                                    price = int(round(unit_price * quantity * 0.88725))
+                                # Calculate price from UI. For first snapshot, treat entire line as UI-derived baseline.
+                                if price is None or price <= 0 or first_snapshot_mode:
+                                    price_calc = unit_price * quantity * 0.88725
+                                    price = int(round(price_calc))
+                                    tx['_ui_inferred'] = True
                                     if self.debug:
-                                        log_debug(f"[UI-FALLBACK] Calculated sell price from UI: {quantity}x * {unit_price} * 0.88725 = {price:,}")
+                                        log_debug(f"[UI-FALLBACK] Calculated sell price from UI: {quantity}x * {unit_price} * 0.88725 = {price_calc:.0f} → {price:,}")
                     except Exception as e:
                         if self.debug:
                             log_debug(f"[UI-FALLBACK] Failed for sell event: {e}")
@@ -1737,31 +1946,10 @@ class MarketTracker:
                         # Check if this transaction was in the previous OCR baseline
                         # Use the same pattern-based matching as delta detection
                         try:
-                            # PERFORMANCE: Use precompiled patterns and escape special chars only once
-                            item_escaped = re.escape(ent.get('item') or '')
-                            item_pattern = _WHITESPACE_PATTERN.sub(r'\s+', item_escaped)
-                            qty_pattern = str(quantity or '')
-                            price_str = str(int(price or 0))
-                            
-                            # Build flexible price pattern for long numbers
-                            if len(price_str) > 6:
-                                price_prefix = price_str[:3]
-                                price_suffix = price_str[-3:]
-                                price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
-                            else:
-                                price_pattern = _COMMA_PATTERN.sub(',?', price_str)
-                            
-                            # Build and compile pattern (cached per transaction via pattern string)
-                            pattern_str = _TRANSACTION_BASE_PATTERN.format(
-                                item=item_pattern,
-                                qty=qty_pattern,
-                                price=price_pattern
-                            )
-                            # Compile pattern once per unique transaction signature
-                            pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
+                            pattern = self._compile_transaction_pattern(ent.get('item'), quantity, price)
                             was_in_baseline = pattern.search(self.last_overview_text) is not None
                             is_new_transaction = not was_in_baseline
-                            
+
                             if is_new_transaction and self.debug:
                                 log_debug(f"[NEW-TX] '{ent['item']}' is NEW (not in baseline) - skipping whitelist check")
                         except Exception:
@@ -1849,6 +2037,10 @@ class MarketTracker:
                     if chosen is not None:
                         price = chosen
 
+                    corrected_buy = self._restore_total_with_base_price(item_name, quantity, price)
+                    if corrected_buy is not None:
+                        price = corrected_buy
+
             # Apply fallback price reconstruction using UI metrics when allowed and necessary
             try:
                 # UI-Fallback für fehlende/ungültige Preise (z.B. wenn Itemname zu lang und Preis abgeschnitten)
@@ -1857,7 +2049,7 @@ class MarketTracker:
                 if not needs_fallback and quantity is not None and quantity > 0 and price:
                     # Prüfe ob Preis plausibel ist gemäß BDO Market API min/max ranges
                     try:
-                        plausibility = check_price_plausibility(item_name, quantity, price)
+                        plausibility = check_price_plausibility(item_name, quantity, price, tx_side=final_type)
                         if not plausibility.get('plausible', True):
                             reason = plausibility.get('reason', 'unknown')
                             expected_min = plausibility.get('expected_min')
@@ -2280,59 +2472,30 @@ class MarketTracker:
             log_debug(f"tx_candidates={len(tx_candidates)} allowed_ts={len(allowed_ts)}")
 
         # Try to infer missing buy transactions directly from UI metrics when no log anchors were parsed.
-        prev_ui_buy = {}
-        if wtype == 'buy_overview':
-            if getattr(self, '_last_ui_buy_metrics', None):
-                try:
-                    prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
-                except Exception:
-                    prev_ui_buy = self._last_ui_buy_metrics.copy()
-            elif self.last_overview_text:
-                try:
-                    prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
-                except Exception:
-                    prev_ui_buy = {}
-        prev_ui_sell = {}
-        prev_ui_sell_norm = {}
-        if wtype == 'sell_overview':
-            if getattr(self, '_last_ui_sell_metrics', None):
-                try:
-                    prev_ui_sell = {k: dict(v) for k, v in self._last_ui_sell_metrics.items()}
-                except Exception:
-                    prev_ui_sell = self._last_ui_sell_metrics.copy()
-            elif self.last_overview_text:
-                try:
-                    prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
-                except Exception:
-                    prev_ui_sell = {}
-            if prev_ui_sell:
-                try:
-                    for k, v in prev_ui_sell.items():
-                        prev_ui_sell_norm[_norm_key(k)] = v
-                        nm_prev = (v.get('item') or '')
-                        if nm_prev:
-                            prev_ui_sell_norm[_norm_key(nm_prev)] = v
-                except Exception:
-                    prev_ui_sell_norm = {}
         if (
             wtype == 'buy_overview'
             and ui_buy
             and (self._baseline_initialized or prev_ui_buy)
         ):
-            existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates}
+            existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates if t.get('item_name')}
+            existing_norm = {_norm_key(t.get('item_name')) for t in tx_candidates if t.get('item_name')}
             for item_lc, metrics in ui_buy.items():
-                if item_lc in existing_items:
+                if item_lc in existing_items or _norm_key(metrics.get('item') or item_lc) in existing_norm:
                     continue
                 orders_completed = metrics.get('ordersCompleted') or 0
                 collect_amount = metrics.get('remainingPrice') or 0
                 if orders_completed <= 0 or collect_amount <= 0:
                     continue
                 prev_metrics = prev_ui_buy.get(item_lc) if prev_ui_buy else None
+                if not prev_metrics and prev_ui_buy:
+                    prev_metrics = prev_ui_buy.get(_norm_key(metrics.get('item') or item_lc))
                 prev_completed = prev_metrics.get('ordersCompleted') if prev_metrics else 0
                 prev_collect = prev_metrics.get('remainingPrice') if prev_metrics else 0
                 delta_qty = orders_completed - (prev_completed or 0)
                 delta_price = collect_amount - (prev_collect or 0)
                 if delta_qty <= 0 or delta_price <= 0:
+                    continue
+                if any(r.get('type') in ('transaction', 'purchased', 'placed', 'withdrew') and _norm_key((r.get('item') or '').lower()) == _norm_key(metrics.get('item') or item_lc) for r in tx_candidates for _ in [0]):
                     continue
                 if delta_qty < MIN_ITEM_QUANTITY or delta_qty > MAX_ITEM_QUANTITY:
                     continue
@@ -2345,7 +2508,7 @@ class MarketTracker:
                 # CRITICAL FIX: Validate inferred price against market data
                 # This prevents using stale UI metrics that produce wrong prices
                 try:
-                    plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price)
+                    plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price, tx_side='buy')
                     if not plausibility.get('plausible', True):
                         reason = plausibility.get('reason', 'unknown')
                         expected_min = plausibility.get('expected_min')
@@ -2611,29 +2774,11 @@ class MarketTracker:
             # If normalized text doesn't match, try pattern-based matching in baseline
             if not already_seen_in_prev and self.last_overview_text:
                 try:
-                    # Build a regex pattern to find this transaction in baseline
-                    # Pattern: "Transaction of {item}...x{qty}...{price_approx}"
-                    # PERFORMANCE: Use precompiled patterns for common operations
-                    item_escaped = re.escape(tx['item_name'] or '')
-                    item_pattern = _WHITESPACE_PATTERN.sub(r'\s+', item_escaped)
-                    qty_pattern = _COMMA_PATTERN.sub(',?', str(tx['quantity'] or ''))
-                    
-                    # Price pattern: allow commas, spaces, OCR errors (O for 0, etc)
-                    price_str = str(int(tx['price'] or 0))
-                    # Build flexible price pattern (allow first/last 3 digits to match)
-                    if len(price_str) > 6:
-                        price_prefix = price_str[:3]
-                        price_suffix = price_str[-3:]
-                        price_pattern = f"{price_prefix}[\\s,\\.\\dOolI]{{0,20}}{price_suffix}"
-                    else:
-                        price_pattern = _COMMA_PATTERN.sub(',?', price_str)
-                    
-                    pattern_str = _TRANSACTION_BASE_PATTERN.format(
-                        item=item_pattern,
-                        qty=qty_pattern,
-                        price=price_pattern
+                    pattern = self._compile_transaction_pattern(
+                        tx['item_name'],
+                        tx['quantity'],
+                        tx['price'],
                     )
-                    pattern = re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
                     if pattern.search(self.last_overview_text):
                         already_seen_in_prev = True
                         if self.debug:

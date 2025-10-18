@@ -1,10 +1,18 @@
-import os
 import sys
+from pathlib import Path
 
-# Ensure repository root is importable when running via pytest or directly
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
 
 from parsing import split_text_into_log_entries
 
@@ -39,11 +47,9 @@ _EXPECTED_SNIPPETS = [
 def test_collect_ui_blocks_not_saved():
     entries = split_text_into_log_entries(_SAMPLE_TEXT)
 
-    # Ensure UI-only blocks were excluded
     ui_entries = [snippet for _, _, snippet in entries if "Collect" in snippet]
     assert not ui_entries, "UI Collect blocks should be filtered out"
 
-    # Validate timestamps and snippets
     ts_values = [ts for _, ts, _ in entries]
     assert ts_values == _EXPECTED_TS
 

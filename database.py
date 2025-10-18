@@ -317,13 +317,13 @@ def transaction_exists_any_side(item_name: str, quantity: int, price: int, times
         return False
 
 
-def transaction_exists_by_values_near_time(item_name: str, quantity: int, price: int, timestamp, tolerance_minutes: int = 2) -> bool:
+def transaction_exists_by_values_near_time(item_name: str, quantity: int, price: int, timestamp, tolerance_minutes: int = 2, ignore_quantity: bool = False) -> bool:
     """Check whether a transaction exists with same item/qty/price within a time tolerance.
-    
-    CRITICAL: Used to prevent duplicates when OCR gives wrong timestamp.
     
     Args:
         tolerance_minutes: Time window in minutes to check for duplicates (default 2 minutes)
+        ignore_quantity: When True, match only on item + price within the tolerance window. Useful for
+            UI-inferred entries where quantity may fluctuate slightly but the price indicates duplication.
     
     Example:
         - Transaction exists at 22:26 with Magical Shard 200x @ 546M
@@ -346,17 +346,30 @@ def transaction_exists_by_values_near_time(item_name: str, quantity: int, price:
         end_time = timestamp + timedelta(minutes=tolerance_minutes)
         
         c = get_cursor()
-        c.execute(
-            """
-            SELECT timestamp FROM transactions
-            WHERE item_name = ? AND quantity = ? AND price = ?
-              AND timestamp BETWEEN ? AND ?
-            LIMIT 1
-            """,
-            (item_name, int(quantity), int(price), 
-             start_time.strftime("%Y-%m-%d %H:%M:%S"), 
-             end_time.strftime("%Y-%m-%d %H:%M:%S"))
-        )
+        if ignore_quantity:
+            c.execute(
+                """
+                SELECT timestamp FROM transactions
+                WHERE item_name = ? AND price = ?
+                  AND timestamp BETWEEN ? AND ?
+                LIMIT 1
+                """,
+                (item_name, int(price),
+                 start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                 end_time.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+        else:
+            c.execute(
+                """
+                SELECT timestamp FROM transactions
+                WHERE item_name = ? AND quantity = ? AND price = ?
+                  AND timestamp BETWEEN ? AND ?
+                LIMIT 1
+                """,
+                (item_name, int(quantity), int(price), 
+                 start_time.strftime("%Y-%m-%d %H:%M:%S"), 
+                 end_time.strftime("%Y-%m-%d %H:%M:%S"))
+            )
         return c.fetchone() is not None
     except Exception:
         return False
