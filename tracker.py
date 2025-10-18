@@ -57,6 +57,7 @@ from parsing import (
     extract_details_from_entry,
     parse_timestamp_text
 )
+from bdo_api_client import get_item_price_range_by_name
 
 # -----------------------
 # Performance: Precompiled Regex Patterns
