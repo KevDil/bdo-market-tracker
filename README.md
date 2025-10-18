@@ -1,188 +1,107 @@
 # BDO Market Tracker
 
-**Version:** 0.2.4  
-**Status:** ✅ BETA - Kernfunktionalität stabil (automatisierte Kern-Regressionen)  
-**Test Coverage:** 5 automatisierte Unit-Tests + kuratierte manuelle Replays
+Ein OCR-basierter Marktplatz-Tracker für Black Desert Online. Das Projekt nimmt Screenshots des Marktfensters, führt Game-UI-optimierte Vorverarbeitung und OCR (EasyOCR / optional PaddleOCR / Tesseract) aus, parsed erkannte Log-Zeilen, wendet Heuristiken und Fuzzy-Korrekturen an und persistiert gefundene Transaktionen in einer lokalen SQLite-Datenbank.
 
-OCR-basierter Market-Tracker für Black Desert Online mit automatischer Transaktionserkennung, Live-API-Integration, GPU-Acceleration und persistenter Baseline.
+Dieses Repository enthält eine einfache Tkinter-GUI (`gui.py`) zur Live-Überwachung, Export-Funktionen (CSV/JSON) sowie mehrere Hilfs- und Diagnoseskripte unter `scripts/`.
 
-## 🚀 Quick Start
+## Kurzüberblick (auf Deutsch)
 
-1. **Installation:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+- Primäre Programmsprache: Python 3.10–3.13
+- Haupt-Einstiegspunkt (GUI): `python gui.py`
+- Datenbank: `bdo_tracker.db` (SQLite, liegt im Repo für Entwicklung)
+- Primäre OCR-Engine: EasyOCR (default). Tesseract als Fallback. PaddleOCR optional (nicht standardmäßig aktiviert wegen Latenz).
 
-2. **Starten:**
-   ```bash
-   python gui.py
-   ```
+## Features
 
-3. **Erste Schritte:**
-   - Öffne das Central Market im Spiel
-   - Klicke "Single Scan" für einen Test
-   - Aktiviere "Auto Track" für kontinuierliches Tracking
-   - Nutze Filter/Export für Analyse
+- Live-Detection von Markt-Transaktionen (buy/sell)
+- Multi-Engine OCR-Strategie mit Game-UI-spezifischer Vorverarbeitung
+- Persistente Baseline und Deduplication-Logik, um doppelte Ereignisse zu vermeiden
+- Config/Region-Kalibrierung, Auto-Track-Modus, Einzel-Scan
+- Export als CSV / JSON aus der GUI
+- Debug-artefakte: `debug_orig.png`, `debug_proc.png` und `ocr_log.txt`
 
-## 📁 Projektstruktur
+## Voraussetzungen
 
-```
-market_tracker/
-├── 📄 Core Files (Hauptlogik)
-│   ├── gui.py                 # Tkinter GUI
-│   ├── tracker.py             # MarketTracker (Window-Detection, Gruppierung, Cases)
-│   ├── parsing.py             # OCR-Parsing (Timestamp, Events, Items)
-│   ├── database.py            # SQLite DB-Layer (thread-safe)
-│   ├── utils.py               # OCR & Helpers (Preprocessing, Fuzzy-Matching)
-│   └── config.py              # Konfiguration (Regions, Parameter)
-│
-├── 📊 Data & Config
-│   ├── config/
-│   │   ├── item_names.csv         # Item-Whitelist (für Fuzzy-Korrektur)
-│   │   └── item_categories.csv    # Buy/Sell-Kategorien (Historical Detection)
-│   ├── bdo_tracker.db             # SQLite Datenbank
-│   └── backups/                   # Automatische DB-Backups
-│
-├── 🧪 Tests (Validierung)
-│   ├── tests/
-│   │   ├── unit/                                  # Automatisierte Regression (reine Python-Tests)
-│   │   └── manual/                                # Manuelle Replays (OCR/DB/GUI erforderlich)
-│   ├── scripts/run_all_tests.py                   # Aggregierter Runner (führt tests/unit aus)
-│   ├── scripts/archive/                           # Historische Test-Skripte (Legacy)
-│   └── scripts/utils/                             # Utility-Scripts
-│       ├── calibrate_region.py                    # Region-Kalibrierung
-│       ├── compare_ocr.py                         # OCR-Methoden-Vergleich
-│       ├── dedupe_db.py                           # DB-Deduplizierung
-│       └── reset_db.py                            # DB-Reset
-│
-├── 📖 Documentation
-│   ├── instructions.md                            # HAUPTDOKUMENTATION
-│   ├── docs/
-│   │   ├── OCR_V2_README.md                       # OCR V2 Details
-│   │   ├── PERFORMANCE_ANALYSIS_2025-10-12.md     # Performance-Analyse
-│   │   └── archive/                               # Alte Dokumentation
-│   │
-│   └── dev-screenshots/                           # Referenz-Screenshots
-│       ├── listings_and_preorders/
-│       └── windows/
-│
-└── 🐛 Debug (Laufzeit-Artefakte)
-    ├── debug/                     # Debug-Screenshots & Logs
-    ├── debug_orig.png             # Aktueller Original-Screenshot
-    ├── debug_proc.png             # Aktueller Preprocessed-Screenshot
-    └── ocr_log.txt                # Aktuelles OCR-Log
+- Windows 10+ (getestet)
+- Python 3.10 bis 3.13
+- Empfohlene Python-Pakete (siehe `requirements.txt`): EasyOCR, pytesseract, opencv-python, numpy, Pillow, mss, pandas, matplotlib, rapidfuzz, requests
+- Optional: Tesseract-OCR (System-Installer), CUDA + cuDNN für GPU-Beschleunigung (nur wenn `USE_GPU` gesetzt)
+
+Installation (empfohlen in einem virtuellen Environment):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-## ✨ Features
+Hinweis: Tesseract muss gesondert installiert werden, wenn Sie die Tesseract-Fallback-Engine nutzen wollen. EasyOCR lädt Modelle beim ersten Start automatisch herunter.
 
-### Core Funktionalität
-- ✅ **Live Market API:** BDO World Market API für dynamische Preis-Validierung (Min/Max ±10%)
-- ✅ **OCR V2:** Sanftes Preprocessing (CLAHE, Sharpen), EasyOCR+Tesseract Hybrid, GPU-Support
-- ✅ **4 Window Types:** sell_overview, buy_overview, sell_item, buy_item (auto-detection)
-- ✅ **6 Transaction Cases:** collect, relist_full, relist_partial (buy & sell)
-- ✅ **Persistent Baseline:** tracker_state DB → überlebt App-Restart, Delta-Detection
+## Schnelle Anleitung
 
-### Intelligente Verarbeitung
-- ✅ **Anchor-Priorität:** transaction > purchased > placed > listed
-- ✅ **Smart Parsing:** Leerzeichen-tolerant, OCR-Fehler-Korrektur (O→0, I→1), Fuzzy-Matching
-- ✅ **Strict Validation:** market.json Whitelist (4874 Items), Quantity Bounds [1, 5000]
-- ✅ **Historical Detection:** Item-Kategorien für Buy/Sell ohne Kontext
+1. Spiel starten und das Marktfenster öffnen (Buy- oder Sell-Übersicht).
+2. `python gui.py` starten.
+3. Region anpassen (Standardregion ist im `config.py` voreingestellt). Alternativ im GUI auf "Auswahl" klicken und zwei Punkte im Bildschirm markieren.
+4. "Einmal scannen" zum Testen oder "Auto-Tracking starten" aktivieren.
 
-### Performance & UX
-- ✅ **Screenshot-Hash-Cache:** 50-80% Reduktion bei statischen Screens
-- ✅ **GPU-Acceleration:** RTX 4070 SUPER @ 2GB = 0 Ruckler, 20% schneller (~99 scans/min)
-- ✅ **Memory-Optimiert:** Stabile 80MB, deque(maxlen=1000), Log-Rotation @ 10MB
-- ✅ **GUI:** Live-Window-Status, Health-Indikator (🟢🟡🔴), Filter, Export (CSV/JSON), Plot
-- ✅ **Fast Stop:** Interruptible Sleep <200ms Reaktionszeit
+## Wichtige Dateien & Ordner
 
-## 🧪 Testing
+- `gui.py` — Tkinter GUI und Export-Funktionen
+- `tracker.py` — Kern-Logik: Capture, OCR-Integration, Parsing, Heuristiken, Persistenz
+- `parsing.py` — Muster/Parser für die Spiel-Logs
+- `database.py` — SQLite-Wrapper und Hilfsfunktionen
+- `market_json_manager.py` — Item-Korrektur (RapidFuzz + lokale Cache)
+- `bdo_api_client.py` — Live-Preis-Checks (optional)
+- `config.py` — zentrale Konfigurationswerte & persistent settings helpers
+- `scripts/` — Hilfs- und Test-Skripte (z. B. `scripts/utils/reset_db.py`)
 
-```bash
-# Automatisierte Unit-Tests
+## Tests
+
+Automatisierte Unit-Tests befinden sich in `tests/unit/`. Es gibt auch manuelle Replays unter `tests/manual/`.
+
+Kurzer Testlauf:
+
+```powershell
 python scripts/run_all_tests.py
+```
 
-# Einzelne Unit-Tests
-python tests/unit/test_collect_anchor.py
+Für gezielte Tests (Beispiele):
+
+```powershell
 python tests/unit/test_parsing_crystal.py
-python tests/unit/test_powder_of_darkness.py
-python tests/unit/test_price_plausibility.py
-
-# Manuelle Replays (schwere Abhängigkeiten)
-python tests/manual/test_window_detection.py
-python tests/manual/test_item_validation.py
-python tests/manual/test_integration.py
+python tests/unit/test_collect_anchor.py
 ```
 
-## 🔧 Utility Scripts
+## Packaging
 
-```bash
-# DB-Deduplizierung
-python scripts/utils/dedupe_db.py
+Es gibt pyinstaller-Spezifikationen unter `pyinstaller/` und ein Powershell-Packaging-Skript `PackagingScript.ps1`. Use the specs `pyinstaller/market_tracker_cpu.spec` or `market_tracker_cuda.spec` depending on whether you package for GPU-support.
 
-# DB-Reset
-python scripts/utils/reset_db.py
+Wichtige Hinweise beim Packaging:
 
-# OCR-Methoden vergleichen
-python scripts/utils/compare_ocr.py
+- Wenn GPU-Unterstützung aktiviert wird, stellen Sie sicher, dass Zielsystem CUDA/Driver-kompatibel ist.
+- Prüfen Sie `config.TESS_PATH` falls Tesseract verwendet wird.
+- Behalten Sie `bdo_tracker.db` und `config/` Dateien im Paket oder dokumentieren Sie, wie sie initialisiert werden.
 
-# Region kalibrieren
-python scripts/utils/calibrate_region.py
-```
+## Debugging
 
-## 📊 Performance
+- OCR-Probleme: `ocr_log.txt` prüfen, `debug_orig.png` vs. `debug_proc.png` vergleichen. Verwenden Sie `scripts/utils/compare_ocr.py`.
+- Parsing-Probleme: Unit-Tests in `tests/unit/` ausführen. Aktivieren Sie `Debug-Modus` in der GUI.
+- DB-Probleme: `inspect_db.py` oder `check_db.py` laufen lassen. `scripts/utils/reset_db.py` setzt Entwicklungs-DB zurück.
 
-- **Poll-Interval:** 0.5s (erfasst >95% der Transaktionen)
-- **Stop-Response:** <200ms (Interruptible Sleep)
-- **Memory-Usage:** Stabil (deque mit maxlen=1000)
-- **DB-Queries:** 30-40% schneller (4 Indizes)
-- **Item-Korrektur:** 50-70% schneller (LRU-Cache)
+## Betrieb & Design-Invarianten (Kurzform)
 
-Siehe `docs/PERFORMANCE_ANALYSIS_2025-10-12.md` für Details.
+- Fokus-Guard: Nur scannen, wenn das Spiel-Fenster aktiv ist (konfiguriert in `config.py`).
+- ROI: Standard-Region wird auf Top ~75% des Marktfensters getrimmt; Anpassungen nur über `scripts/utils/calibrate_region.py`.
+- OCR-Cache: Screenshot-MD5-Caching aktiv (siehe `utils.py`) — nicht deaktivieren.
+- Item-Whitelist & Korrektur: Items laufen durch `market_json_manager.correct_item_name` (RapidFuzz-Schwelle konfigurierbar).
+- Quantity-Bounds: 1..5000 (Filter für UI-Rauschen).
 
-## ⚠️ Wichtige Hinweise
+## Weiteres / Contributors
 
-- **NUR** `instructions.md` ist gültig (alle älteren Versionen obsolet)
-- Transaktionslog nur in **sell_overview** und **buy_overview** auswerten
-- Es ist **IMMER** nur EIN Tab sichtbar (Buy ODER Sell)
-- **Strikte Item-Whitelist:** Nur Items aus `config/item_names.csv`
-- **Quantity-Bounds:** MIN=1, MAX=5000 (typische BDO Stack-Größen)
-- Bei Problemen: `debug_proc.png`, `debug_orig.png`, `ocr_log.txt` analysieren
+Siehe `AGENTS.md` für die internen Richtlinien, Architektur-Notes und die Betriebsanleitung. Änderungen an Kernparametern (ROI, Polling, Cache-Policy) müssen mit reproduzierbaren Metriken dokumentiert werden (siehe `docs/`).
 
-## 🐛 Debugging
-
-1. **OCR-Probleme:**
-   - Prüfe `ocr_log.txt` (letzte 100 Zeilen)
-   - Vergleiche `debug_orig.png` vs `debug_proc.png`
-   - Teste mit `scripts/utils/compare_ocr.py`
-
-2. **Parsing-Probleme:**
-   - Aktiviere Debug-Toggle in GUI
-   - Prüfe `ocr_log.txt` auf Parsing-Fehler
-   - Teste mit `python tests/unit/test_parsing_crystal.py`
-
-3. **Window-Detection:**
-   - Prüfe `ocr_log.txt` für "Window changed"
-   - Teste mit `python tests/manual/test_window_detection.py`
-   - Nutze `scripts/utils/calibrate_region.py`
-
-## 📝 Dokumentation
-
-- **Hauptdokumentation:** `instructions.md` (vollständige Spec)
-- **OCR Details:** `docs/OCR_V2_README.md`
-- **Performance:** `docs/PERFORMANCE_ANALYSIS_2025-10-12.md`
-
-## 🔮 Roadmap
-
-- [ ] Parsing-Heuristiken vereinfachen (nach OCR V2 Validierung)
-- [ ] Performance Phase 2 (Screenshot-Hash-Caching, GPU-Acceleration)
-- [ ] GUI Improvements (Timeline-Panel, OCR-Toggle)
-- [ ] Formale State-Machine für Fenster-Übergänge
-- [ ] ML-basierter Confidence-Score für Buy/Sell-Entscheidung
-
-## 📜 Lizenz
-
-Für persönlichen Gebrauch.
+Wenn Sie etwas anpassen, führen Sie die vorhandenen Unit-Tests aus und fügen Sie weitere Tests hinzu, wenn sich das Verhalten ändert.
 
 ---
 
-**Version:** 0.2.3 | **Last Updated:** 2025-10-12 | **Status:** 🔧 In Entwicklung
+Version: aktualisiert am 2025-10-18
