@@ -120,7 +120,7 @@ def get_item_id_by_name(item_name: str, fuzzy: bool = True, min_score: int = 86)
 def get_item_name_by_id(item_id: str) -> Optional[str]:
     """
     Get item name by item ID.
-    
+
     Args:
         item_id: BDO item ID (as string)
         
@@ -131,8 +131,69 @@ def get_item_name_by_id(item_id: str) -> Optional[str]:
     
     if _item_id_to_name is None:
         return None
-    
+
     return _item_id_to_name.get(str(item_id))
+
+
+def get_base_price_from_cache(item_name: str, min_score: int = 86) -> Optional[int]:
+    """
+    Resolve an item's base price using the local market.json cache.
+
+    Args:
+        item_name: Item name to search for
+        min_score: Minimum fuzzy-match score when resolving the name
+
+    Returns:
+        Base price (pre-tax) if found, else None.
+    """
+    if not item_name:
+        return None
+
+    items = load_market_json()
+    if not items:
+        return None
+
+    candidates: list[str] = []
+    name_lower = item_name.lower()
+    if _item_name_to_id and name_lower in _item_name_to_id:
+        candidates.append(_item_name_to_id[name_lower])
+
+    if not candidates:
+        resolved_id = get_item_id_by_name(item_name, fuzzy=True, min_score=min_score)
+        if resolved_id:
+            candidates.append(resolved_id)
+
+    if not candidates:
+        corrected_name, is_valid = correct_item_name(item_name, min_score=min_score)
+        if corrected_name:
+            corrected_lower = corrected_name.lower()
+            if _item_name_to_id and corrected_lower in _item_name_to_id:
+                candidates.append(_item_name_to_id[corrected_lower])
+        if not is_valid and _item_name_to_id and name_lower in _item_name_to_id:
+            candidates.append(_item_name_to_id[name_lower])
+
+    for candidate_id in candidates:
+        data = items.get(str(candidate_id))
+        if not data:
+            continue
+        sub_items = data.get('sub_items') or []
+        fallback_price = None
+        for sub in sub_items:
+            try:
+                price = int(sub.get('price') or 0)
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            sub_key = sub.get('sub_key')
+            if sub_key == 0 or sub_key == '0':
+                return price
+            if fallback_price is None or price < fallback_price:
+                fallback_price = price
+        if fallback_price is not None:
+            return fallback_price
+
+    return None
 
 
 def correct_item_name(raw_name: str, min_score: int = 86) -> Tuple[str, bool]:

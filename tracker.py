@@ -38,6 +38,7 @@ from utils import (
     check_price_plausibility,
     correct_item_name,
     is_bdo_window_in_foreground,
+    MARKET_SELL_NET_FACTOR,
 )
 from database import (
     get_cursor,
@@ -58,6 +59,7 @@ from parsing import (
     parse_timestamp_text
 )
 from bdo_api_client import get_item_price_range_by_name
+from market_json_manager import get_base_price_from_cache
 
 # -----------------------
 # Performance: Precompiled Regex Patterns
@@ -66,6 +68,15 @@ from bdo_api_client import get_item_price_range_by_name
 _WHITESPACE_PATTERN = re.compile(r'\s+')
 _COMMA_PATTERN = re.compile(r',')
 _TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{price}"
+_SILVER_WORD_PATTERN = r"s\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]"
+_PRICE_HINT_PATTERN = re.compile(
+    rf"(?:worth|for)\s+([0-9OolI\|,\.\s]{{3,}})\s+{_SILVER_WORD_PATTERN}",
+    re.IGNORECASE,
+)
+_GENERIC_SILVER_PATTERN = re.compile(
+    rf"([0-9OolI\|,\.\s]{{3,}})\s+{_SILVER_WORD_PATTERN}",
+    re.IGNORECASE,
+)
 _HISTORICAL_VALUE_DUP_TOLERANCE_SECONDS = 90  # 1,5 Minuten Puffer für Scroll-Duplikate
 
 # -----------------------
@@ -323,14 +334,28 @@ class MarketTracker:
             if not candidate:
                 continue
             try:
-                data = get_item_price_range_by_name(candidate, use_cache=True)
+                offline_price = get_base_price_from_cache(candidate, min_score=80)
             except Exception as exc:
+                offline_price = None
                 if self.debug:
-                    log_debug(f"[PRICE] Base price lookup failed for '{candidate}': {exc}")
-                continue
-            if data and data.get('base_price'):
-                base_price = int(data['base_price'])
+                    log_debug(f"[PRICE] Local base price lookup failed for '{candidate}': {exc}")
+            if offline_price:
+                base_price = int(offline_price)
                 break
+
+        if base_price is None:
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                try:
+                    data = get_item_price_range_by_name(candidate, use_cache=True)
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[PRICE] Base price lookup failed for '{candidate}': {exc}")
+                    continue
+                if data and data.get('base_price'):
+                    base_price = int(data['base_price'])
+                    break
 
         # cache result (including None to avoid repeated lookups)
         self._base_price_cache[key] = base_price or 0
@@ -376,6 +401,126 @@ class MarketTracker:
                 return expected_total
             return expected_total
         return None
+
+    def _extract_price_hint(self, entry: dict | None) -> tuple[int | None, str | None]:
+        if not entry:
+            return (None, None)
+        raw = entry.get('raw') if isinstance(entry, dict) else None
+        if not raw:
+            return (None, None)
+        hint_match = _PRICE_HINT_PATTERN.search(raw)
+        generic_match = None
+        if not hint_match:
+            generic_match = _GENERIC_SILVER_PATTERN.search(raw)
+        match_obj = hint_match or generic_match
+        if not match_obj:
+            return (None, None)
+        raw_value = match_obj.group(1)
+        value = normalize_numeric_str(raw_value)
+        if value is None or value <= 0:
+            return (None, None)
+        digit_count = sum(1 for ch in raw_value if ch.isdigit() or ch in 'OolI')
+        if digit_count <= 0:
+            digits = str(value)
+        else:
+            digits = f"{value:0{digit_count}d}"
+        return (value, digits)
+
+    def _merge_hint_with_expected(self, expected_total: int | None, hint_digits: str | None) -> int | None:
+        if not expected_total or not hint_digits:
+            return expected_total
+        digits_clean = re.sub(r'\D', '', hint_digits)
+        if not digits_clean:
+            return expected_total
+        expected_str = str(int(expected_total))
+        if len(digits_clean) >= len(expected_str):
+            return int(digits_clean)
+        prefix = expected_str[:-len(digits_clean)]
+        if not prefix:
+            return int(digits_clean)
+        return int(prefix + digits_clean)
+
+    def _recover_sell_price(self, item_name: str, quantity: int, price: int | None, entry: dict | None) -> int | None:
+        if not item_name or not quantity or quantity <= 0:
+            return price
+
+        base_price = self._get_base_price(item_name)
+        hint_value, hint_digits = self._extract_price_hint(entry)
+        hint_suffix = re.sub(r'\D', '', hint_digits or '') if hint_digits else ''
+
+        expected_total = None
+        if base_price and base_price > 0:
+            expected_total = int(round(base_price * quantity * MARKET_SELL_NET_FACTOR))
+
+        suspicious = price is None or price <= 0
+        if not suspicious and expected_total:
+            try:
+                if price < expected_total * 0.6:
+                    suspicious = True
+            except Exception:
+                pass
+
+        if not suspicious:
+            return price
+
+        candidate_values: list[int] = []
+        if expected_total:
+            if hint_digits:
+                merged = self._merge_hint_with_expected(expected_total, hint_digits)
+                if merged:
+                    candidate_values.append(int(merged))
+            candidate_values.append(int(expected_total))
+
+        if hint_value and hint_value > 0:
+            candidate_values.append(int(hint_value))
+
+        if price and price > 0:
+            candidate_values.append(int(price))
+
+        seen_candidates = set()
+        ordered_candidates: list[int] = []
+        for cand in candidate_values:
+            if cand is None or cand <= 0:
+                continue
+            if cand not in seen_candidates:
+                seen_candidates.add(cand)
+                ordered_candidates.append(int(cand))
+
+        def _candidate_valid(val: int) -> bool:
+            if val is None or val <= 0 or not quantity or quantity <= 0:
+                return False
+            if hint_suffix:
+                if not str(int(val)).endswith(hint_suffix):
+                    return False
+            if base_price and base_price > 0:
+                try:
+                    unit_pre_tax = val / (quantity * MARKET_SELL_NET_FACTOR)
+                except ZeroDivisionError:
+                    return False
+                if unit_pre_tax <= 0:
+                    return False
+                diff_ratio = abs(unit_pre_tax - base_price) / float(base_price)
+                if diff_ratio > 0.15:
+                    return False
+            return True
+
+        for cand in ordered_candidates:
+            if _candidate_valid(cand):
+                if self.debug:
+                    log_debug(f"[SELL-RECOVER] Reconstructed price for '{item_name}' qty={quantity}: {cand:,} (base={base_price}, hint={hint_value})")
+                return cand
+
+        if expected_total and _candidate_valid(expected_total):
+            if self.debug:
+                log_debug(f"[SELL-RECOVER] Fallback to expected net price for '{item_name}': {expected_total:,}")
+            return expected_total
+
+        if hint_value and hint_value > 0 and (not hint_suffix or str(int(hint_value)).endswith(hint_suffix)):
+            if self.debug:
+                log_debug(f"[SELL-RECOVER] Using raw hint price for '{item_name}': {hint_value:,}")
+            return int(hint_value)
+
+        return price
 
     def _infer_quantity_from_price(self, item_name: str, observed_total: int | None) -> int | None:
         if not item_name or not observed_total or observed_total <= 0:
@@ -478,13 +623,14 @@ class MarketTracker:
         try:
             # PERFORMANCE: Use precompiled whitespace pattern
             s = _WHITESPACE_PATTERN.sub(' ', full_text)
+            s = s.replace('：', ':').replace('．', '.').replace('／', '/')
             # CRITICAL FIX: Two-pass approach to capture full item names
             # Pass 1: Find all "Orders ... Orders Completed ... Collect ... Re-list" blocks
             # Pass 2: Extract item name by looking backwards from "Orders" keyword
             
             # Find all metric blocks first
             metric_pattern = re.compile(
-                r"Orders\s*:?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*:?\s*([0-9,\.]+)[\s\S]{0,160}?Coll\w*\s*([0-9,\.]+)\s+[Rr]e-?list",
+                r"Orders\s*[:;]?\s*([0-9,\.]+)\s*(?:/)?\s*Orders\s*Completed\s*[:;]?\s*([0-9,\.]+)([\s\S]{0,200}?Collect[\s\S]{0,120}?Re-?list)",
                 re.IGNORECASE,
             )
             
@@ -492,7 +638,26 @@ class MarketTracker:
                 # Extract metrics
                 orders = normalize_numeric_str(m.group(1)) or 0
                 oc = normalize_numeric_str(m.group(2)) or 0
-                rem = normalize_numeric_str(m.group(3)) or 0
+                tail_segment = m.group(3) or ''
+                rem = 0
+                if tail_segment:
+                    try:
+                        collect_part = tail_segment.lower().split('collect', 1)[-1]
+                    except Exception:
+                        collect_part = tail_segment
+                    number_matches = re.findall(r'([0-9,\.]+)', collect_part)
+                    last_large = None
+                    for num_txt in number_matches:
+                        val = normalize_numeric_str(num_txt)
+                        if val is None or val <= 0:
+                            continue
+                        if val >= 1000:
+                            last_large = val
+                    if last_large is not None:
+                        rem = last_large
+                    elif number_matches:
+                        fallback_val = normalize_numeric_str(number_matches[-1])
+                        rem = fallback_val or 0
                 
                 if orders <= 0 or oc <= 0 or rem <= 0:
                     continue
@@ -500,34 +665,19 @@ class MarketTracker:
                 # Now look backwards from the start of "Orders" to find the item name
                 # Take up to 100 chars before "Orders" and extract the last valid item name
                 before_orders = s[max(0, m.start()-100):m.start()]
-                
-                # Extract item name: last sequence of letters/spaces/apostrophes before "Orders"
-                # Stop at known delimiters like "Re-list", "Collect", numbers-only sequences, "VT"
-                name_match = re.search(
-                    r"(?:^|Re-?list|Collect|VT|\d{3,})\s*([A-Za-z][A-Za-z' \[\]\(\)\-]{2,})\s*$",
-                    before_orders,
-                    re.IGNORECASE
-                )
-                
-                if not name_match:
-                    # Fallback: take everything that looks like text before "Orders"
-                    name_match = re.search(r"([A-Za-z][A-Za-z' \[\]\(\)\-]{2,})\s*$", before_orders)
-                
-                if name_match:
-                    name = name_match.group(1).strip()
-                    # Clean up trailing noise
-                    name = re.sub(r'\s*[:\d]+$', '', name).strip()
-                    # Remove common OCR artifacts at the end
-                    name = re.sub(r'\s+(Re-?list|Collect|Cancel|VT)$', '', name, flags=re.IGNORECASE).strip()
-                    
-                    if len(name) >= 3:  # Valid item name
-                        it_lc = name.lower()
-                        metrics[it_lc] = {
-                            'item': name,
-                            'orders': orders,
-                            'ordersCompleted': oc,
-                            'remainingPrice': rem,
-                        }
+                segments = [seg.strip() for seg in re.split(r'\d[\d\s,\.]*', before_orders) if seg.strip()]
+                name = segments[-1] if segments else before_orders.strip()
+                if name:
+                    name = re.sub(r'\b(?:Orders|Order|Completed|Collect|Re-?list|VT|Balance)\b', '', name, flags=re.IGNORECASE).strip()
+                    name = re.sub(r'[:;/]+$', '', name).strip()
+                if name and len(name) >= 3 and any(ch.isalpha() for ch in name):
+                    it_lc = name.lower()
+                    metrics[it_lc] = {
+                        'item': name,
+                        'orders': orders,
+                        'ordersCompleted': oc,
+                        'remainingPrice': rem,
+                    }
         except Exception:
             pass
         return metrics
@@ -1513,12 +1663,16 @@ class MarketTracker:
                     continue
                 if not isinstance(other.get('timestamp'), datetime.datetime):
                     continue
-                    
+
+                other_ts = other.get('timestamp')
                 # Skip if other is a 'purchased' - those are always standalone
                 if other['type'] == 'purchased':
                     continue
-                    
-                dt = abs((other['timestamp'] - ts).total_seconds())
+
+                dt = abs((other_ts - ts).total_seconds())
+                same_ts = isinstance(other_ts, datetime.datetime) and other_ts == ts
+                if first_snapshot_mode and not same_ts:
+                    continue
                 # Use wider window for withdrew, normal for others
                 if other['type'] == 'withdrew' and dt <= max_dt_withdrew:
                     cluster.append(other)
@@ -1899,6 +2053,11 @@ class MarketTracker:
             # final transaction type strictly from side; do not override with presence of listed/placed
             final_type = side
             ui_backfill_needed = False
+            ent_type = ent.get('type')
+            if final_type == 'buy' and ent_type == 'placed':
+                if self.debug:
+                    log_debug(f"skip placed-only entry for item='{ent.get('item')}'")
+                continue
 
             # On buy overview, avoid saving sell-side entries unless there is a strong sell cluster OR item is known to be sell-side
             # Allow sell saves if:
@@ -2332,6 +2491,16 @@ class MarketTracker:
                         price = pur_rel2.get('price')
                     elif tx_rel2 is not None:
                         price = tx_rel2.get('price')
+            if final_type == 'sell' and quantity:
+                entry_for_hint = transaction_entry if transaction_entry is not None else ent
+                recovered_price = self._recover_sell_price(ent.get('item'), quantity, price, entry_for_hint)
+                if recovered_price is not None and recovered_price > 0 and recovered_price != price:
+                    price = recovered_price
+                    if isinstance(entry_for_hint, dict):
+                        entry_for_hint['price'] = recovered_price
+                    if transaction_entry and isinstance(transaction_entry, dict):
+                        transaction_entry['price'] = recovered_price
+                    ent['price'] = recovered_price
             # Price correction using per-unit inference from related entries
             # Apply ONLY to buys to avoid mutating sell prices already parsed from 'worth ... Silver'.
             if final_type == 'buy':
@@ -2527,7 +2696,7 @@ class MarketTracker:
             created_clusters.add(cluster_key)
             tx_candidates.append(tx)
 
-            if final_type == 'sell' and len(transaction_entries_sorted) > 1:
+            if final_type in ('sell', 'buy') and len(transaction_entries_sorted) > 1:
                 for extra_entry in transaction_entries_sorted[1:]:
                     extra_qty = extra_entry.get('qty')
                     extra_price = extra_entry.get('price')
@@ -2535,14 +2704,15 @@ class MarketTracker:
                         continue
                     extra_quantity = extra_qty or quantity
                     extra_price_value = extra_price or price
-                    if extra_quantity < MIN_ITEM_QUANTITY or extra_quantity > MAX_ITEM_QUANTITY:
+                    if extra_quantity is None or extra_quantity < MIN_ITEM_QUANTITY or extra_quantity > MAX_ITEM_QUANTITY:
                         continue
                     if extra_price_value is None or extra_price_value <= 0:
                         continue
                     extra_slot = extra_entry.get('_occurrence_slot', 0) if transaction_entries_sorted else 0
+                    extra_timestamp = extra_entry.get('timestamp') if isinstance(extra_entry.get('timestamp'), datetime.datetime) else ent['timestamp']
                     extra_cluster_key = (
                         item_name.lower(),
-                        ts_key,
+                        int(extra_timestamp.timestamp()) if isinstance(extra_timestamp, datetime.datetime) else ts_key,
                         int(extra_quantity or 0),
                         int(extra_price_value or 0),
                         final_type,
@@ -2555,7 +2725,7 @@ class MarketTracker:
                         'item_name': item_name,
                         'quantity': extra_quantity,
                         'price': extra_price_value,
-                        'timestamp': ent['timestamp'],
+                        'timestamp': extra_timestamp,
                         'transaction_type': final_type,
                         'case': f"{final_type}_{case}",
                         'raw_related': related,
@@ -2573,6 +2743,7 @@ class MarketTracker:
         ):
             existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates if t.get('item_name')}
             existing_norm = {_norm_key(t.get('item_name')) for t in tx_candidates if t.get('item_name')}
+            scan_ts = datetime.datetime.now()
             for item_lc, metrics in ui_buy.items():
                 if item_lc in existing_items or _norm_key(metrics.get('item') or item_lc) in existing_norm:
                     continue
@@ -2598,6 +2769,27 @@ class MarketTracker:
                     continue
                 raw_name = metrics.get('item') or item_lc
                 corrected_name = correct_item_name(raw_name) or raw_name
+
+                # Guard: ensure a recent placed entry exists to avoid using stale UI deltas
+                latest_placed_ts = None
+                norm_metric_item = _norm_key(metrics.get('item') or item_lc)
+                for entry in structured:
+                    if entry.get('type') != 'placed':
+                        continue
+                    if _norm_key(entry.get('item') or '') != norm_metric_item:
+                        continue
+                    ts_entry = entry.get('timestamp')
+                    if isinstance(ts_entry, datetime.datetime):
+                        if latest_placed_ts is None or ts_entry > latest_placed_ts:
+                            latest_placed_ts = ts_entry
+                if latest_placed_ts:
+                    try:
+                        if (scan_ts - latest_placed_ts).total_seconds() > 120:
+                            if self.debug:
+                                log_debug(f"[UI-INFER] Skip '{corrected_name}' - latest placed timestamp {latest_placed_ts} older than 120s")
+                            continue
+                    except Exception:
+                        pass
                 
                 # CRITICAL FIX: Validate inferred price against market data
                 # This prevents using stale UI metrics that produce wrong prices
@@ -2624,7 +2816,7 @@ class MarketTracker:
                 # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
                 # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
                 # UI-inferred means we're detecting a NEW collect/buy that just happened NOW
-                ts_for_ui = datetime.datetime.now()
+                ts_for_ui = scan_ts
                 synthetic_tx = {
                     'item_name': corrected_name,
                     'quantity': delta_qty,
@@ -2733,10 +2925,15 @@ class MarketTracker:
                     if r.get('type') in ('purchased', 'transaction') and r.get('item'):
                         anchor_items_from_scan.add((r['item'] or '').lower())
             if anchor_items_from_scan:
-                # Adjust timestamps of candidates for those items
+                # Adjust timestamps only when the original timestamp is recent (within FRESH_TX_WINDOW)
                 for t in tx_candidates:
                     if (t['item_name'] or '').lower() in anchor_items_from_scan and isinstance(t['timestamp'], datetime.datetime) and latest_ts and t['timestamp'] < latest_ts:
-                        t['timestamp'] = latest_ts
+                        try:
+                            delta_seconds = (latest_ts - t['timestamp']).total_seconds()
+                        except Exception:
+                            delta_seconds = None
+                        if delta_seconds is not None and 0 < delta_seconds <= FRESH_TX_WINDOW:
+                            t['timestamp'] = latest_ts
                 # Filter out candidates not in the anchor set to avoid unrelated relist-only saves
                 before = len(tx_candidates)
                 tx_candidates = [t for t in tx_candidates if (t['item_name'] or '').lower() in anchor_items_from_scan]

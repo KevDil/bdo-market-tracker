@@ -4,6 +4,10 @@
 # Assumes prerequisites are met: Visual C++ Build Tools installed, Python 3.10-3.13 on PATH, and pip install -r requirements.txt succeeds in clean venv.
 # This version creates a temporary build venv for spec generation and installs pyinstaller in each build venv.
 
+param (
+    [switch]$OnlyCPU
+)
+
 # Create pyinstaller directory if it doesn't exist
 New-Item -ItemType Directory -Force -Path pyinstaller
 
@@ -21,11 +25,13 @@ pyi-makespec gui.py --onefile --noconsole --name MarketTracker
 # Move to pyinstaller/
 Move-Item -Path MarketTracker.spec -Destination pyinstaller/market_tracker_cpu.spec -Force
 
-# Generate spec for CUDA build (--onedir)
-pyi-makespec gui.py --onedir --noconsole --name MarketTrackerCUDA
+if (-not $OnlyCPU) {
+    # Generate spec for CUDA build (--onedir)
+    pyi-makespec gui.py --onedir --noconsole --name MarketTrackerCUDA
 
-# Move to pyinstaller/
-Move-Item -Path MarketTrackerCUDA.spec -Destination pyinstaller/market_tracker_cuda.spec -Force
+    # Move to pyinstaller/
+    Move-Item -Path MarketTrackerCUDA.spec -Destination pyinstaller/market_tracker_cuda.spec -Force
+}
 
 # Deactivate build venv
 deactivate
@@ -40,12 +46,16 @@ function Edit-SpecDatas {
     $content = $content -replace 'datas=\[\],', "datas=[('../config/market.json', 'config'), ('../config/item_categories.csv', 'config'), ('../config/icon.ico', 'config')],"
     $content = $content -replace "\['gui.py'\]", "['../gui.py']"
 
-	Set-Content $specPath $content
+    Set-Content $specPath $content
 }
 
-# Edit both specs
+# Edit CPU spec
 Edit-SpecDatas -specPath "pyinstaller/market_tracker_cpu.spec" -mode "cpu"
-Edit-SpecDatas -specPath "pyinstaller/market_tracker_cuda.spec" -mode "cuda"
+
+if (-not $OnlyCPU) {
+    # Edit CUDA spec
+    Edit-SpecDatas -specPath "pyinstaller/market_tracker_cuda.spec" -mode "cuda"
+}
 
 # Build CPU-only executable
 # Create and activate venv
@@ -68,52 +78,60 @@ Move-Item -Path dist/MarketTracker.exe -Destination dist/MarketTrackerCPU/ -Forc
 # Deactivate venv
 deactivate
 
-# Build CUDA-enabled executable
-# Create and activate venv
-python -m venv .venv-cuda
-. .\.venv-cuda\Scripts\Activate.ps1
+if (-not $OnlyCPU) {
+    # Build CUDA-enabled executable
+    # Create and activate venv
+    python -m venv .venv-cuda
+    . .\.venv-cuda\Scripts\Activate.ps1
 
-# Install dependencies
-python -m pip install --upgrade --quiet pip wheel setuptools
-pip install --quiet -r requirements.txt
-pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
-pip install --quiet pyinstaller
+    # Install dependencies
+    python -m pip install --upgrade --quiet pip wheel setuptools
+    pip install --quiet -r requirements.txt
+    pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu129
+    pip install --quiet pyinstaller
 
-# Verify CUDA availability
-python -c "import torch; assert torch.cuda.is_available()"
-if ($LASTEXITCODE -eq 0) {
-    Write-Output "CUDA verification passed."
-} else {
-    Write-Error "CUDA verification failed. Ensure NVIDIA drivers and CUDA toolkit are installed correctly. Aborting CUDA build."
+    # Verify CUDA availability
+    python -c "import torch; assert torch.cuda.is_available()"
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "CUDA verification passed."
+    } else {
+        Write-Error "CUDA verification failed. Ensure NVIDIA drivers and CUDA toolkit are installed correctly. Aborting CUDA build."
+        deactivate
+        exit 1  # Abort script
+    }
+
+    # Build with PyInstaller
+    pyinstaller pyinstaller/market_tracker_cuda.spec --log-level WARN
+
+    # Deactivate venv
     deactivate
-    exit 1  # Abort script
 }
-
-# Build with PyInstaller
-pyinstaller pyinstaller/market_tracker_cuda.spec --log-level WARN
-
-# Deactivate venv
-deactivate
 
 # Post-build checks (automatic parts)
 # Run --help for both if they exist
 if (Test-Path .\dist\MarketTrackerCPU\MarketTracker.exe) {
     Write-Output "Running --help for CPU build..."
-    .\dist\MarketTracker\MarketTracker.exe --help
+    .\dist\MarketTrackerCPU\MarketTracker.exe --help
 } else {
     Write-Warning "CPU executable not found; build may have failed."
 }
 
-if (Test-Path .\dist\MarketTrackerCUDA\MarketTrackerCUDA.exe) {
+if (-not $OnlyCPU -and (Test-Path .\dist\MarketTrackerCUDA\MarketTrackerCUDA.exe)) {
     Write-Output "Running --help for CUDA build..."
     .\dist\MarketTrackerCUDA\MarketTrackerCUDA.exe --help
 } else {
-    Write-Warning "CUDA executable not found; build may have failed."
+    if (-not $OnlyCPU) {
+        Write-Warning "CUDA executable not found; build may have failed."
+    }
 }
 
 # Record versions for reproducibility
-# Using the CUDA venv for example, but could be either
-. .\.venv-cuda\Scripts\Activate.ps1
+# Use the CPU venv if OnlyCPU is set, otherwise use CUDA venv
+if ($OnlyCPU) {
+    . .\.venv-cpu\Scripts\Activate.ps1
+} else {
+    . .\.venv-cuda\Scripts\Activate.ps1
+}
 $pyinstallerVersion = pyinstaller --version
 $torchVersion = pip show torch | Select-String -Pattern "Version:"
 deactivate
@@ -132,8 +150,12 @@ Write-Output "Windows build: $windowsBuild"
 # Instructions for manual parts
 Write-Output "Automation complete. For smoke-testing:"
 Write-Output "- Run the CPU executable on a clean machine: .\dist\MarketTrackerCPU\MarketTracker.exe"
-Write-Output "- Run the CUDA executable: .\dist\MarketTrackerCUDA\MarketTrackerCUDA.exe"
+if (-not $OnlyCPU) {
+    Write-Output "- Run the CUDA executable: .\dist\MarketTrackerCUDA\MarketTrackerCUDA.exe"
+}
 Write-Output "- Confirm debug/ artefacts, bdo_tracker.db creation, and config loading."
 Write-Output "- Perform full GUI sessions and check OCR logs manually."
 Write-Output "- Ship the entire dist/MarketTrackerCPU/ directory for CPU."
-Write-Output "- Ship the entire dist/MarketTrackerCUDA/ directory for CUDA."
+if (-not $OnlyCPU) {
+    Write-Output "- Ship the entire dist/MarketTrackerCUDA/ directory for CUDA."
+}
