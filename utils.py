@@ -53,6 +53,24 @@ CACHE_TTL = 5.0  # Sekunden - Cache-Einträge sind 5s gültig (was 2.0s)
 MAX_CACHE_SIZE = 20  # Maximal 20 verschiedene Screenshots im Cache (was 10)
 # Expected improvement: Cache hit rate from ~50% to >70%
 
+_OCR_TOKEN_TRANSLATION = str.maketrans({
+    '0': 'o',
+    '1': 'l',
+    '2': 'z',
+    '3': 'e',
+    '4': 'a',
+    '5': 's',
+    '6': 'g',
+    '7': 't',
+    '8': 'b',
+    '9': 'g',
+    'i': 'l',
+    '|': 'l',
+    '!': 'l',
+    '$': 's',
+    '@': 'a'
+})
+
 def log_text(text):
     """Logging mit automatischer Rotation bei 10MB Limit (Performance: verhindert unbegrenztes Wachstum)"""
     try:
@@ -926,14 +944,57 @@ def detect_window_type(ocr_text: str) -> str:
     # normalisiere Whitespace, damit "sales\ncompleted" erkannt wird
     s_norm = re.sub(r"\s+", " ", s)
 
+    def _normalize_token_text_local(text: str) -> str:
+        if not text:
+            return ""
+        normalized = text.lower().translate(_OCR_TOKEN_TRANSLATION)
+        normalized = re.sub(r'[^a-z0-9\s]', ' ', normalized)
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        return normalized
+
+    s_token_norm = _normalize_token_text_local(s_norm)
+
+    sell_tokens = ["sell", "set price", "register quantity", "total price"]
+    buy_tokens = ["purchase", "desired price", "desired amount", "total cost"]
+    sell_tokens_norm = [_normalize_token_text_local(tok) for tok in sell_tokens]
+    buy_tokens_norm = [_normalize_token_text_local(tok) for tok in buy_tokens]
+
+    def _count_matches(token_norms: list[str]) -> int:
+        return sum(1 for tok in token_norms if tok and tok in s_token_norm)
+
+    if sell_tokens_norm and sell_tokens_norm[0] in s_token_norm:
+        if _count_matches(sell_tokens_norm) >= 3:
+            return "sell_item"
+
+    if buy_tokens_norm and buy_tokens_norm[0] in s_token_norm:
+        if _count_matches(buy_tokens_norm) >= 3:
+            return "buy_item"
+
     def has_all(substrings):
         return all(sub.lower() in s_norm for sub in substrings)
 
-    # Detail-Fenster zuerst prüfen (strengere Regel: beide Keywords nötig)
+    # Detail-Fenster zuerst prüfen (Legacy-Heuristik für vollständige OCR)
     if has_all(["set price", "register quantity"]):
         return "sell_item"
     if has_all(["desired price", "desired amount"]):
         return "buy_item"
+
+    sells_detail_tokens = [
+        ("set price", "total price"),
+        ("set price", "base price"),
+        ("set price", "min"),
+        ("set price", "max"),
+    ]
+    buys_detail_tokens = [
+        ("desired price", "total price"),
+        ("desired price", "desired amount"),
+    ]
+    for token_pair in sells_detail_tokens:
+        if all(tok in s_norm for tok in token_pair):
+            return "sell_item"
+    for token_pair in buys_detail_tokens:
+        if all(tok in s_norm for tok in token_pair):
+            return "buy_item"
 
     # Overview-Fenster (fuzzy Completed-Erkennung)
     # comp(?:l|1|i)et(?:e|ed|ion)s? → completed/complete/completion

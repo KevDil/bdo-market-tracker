@@ -2621,6 +2621,21 @@ class MarketTracker:
                 except Exception:
                     pass
             if quantity is None:
+                strong_anchor_present = any(
+                    r.get('type') in ('listed', 'withdrew', 'purchased') and r.get('qty')
+                    for r in related
+                )
+                ui_anchor_present = False
+                if final_type == 'sell' and ui_sell:
+                    metrics = ui_sell.get((item_name or '').lower())
+                    ui_anchor_present = bool(metrics and metrics.get('salesCompleted'))
+                elif final_type == 'buy' and ui_buy:
+                    metrics = ui_buy.get((item_name or '').lower())
+                    ui_anchor_present = bool(metrics and metrics.get('ordersCompleted'))
+                if not (strong_anchor_present or ui_anchor_present or transaction_entry):
+                    if self.debug:
+                        log_debug(f"drop candidate: missing quantity anchors for item='{item_name}' (final_type={final_type})")
+                    continue
                 quantity = 1
             
             # CRITICAL: Verwerfe Transaktionen ohne gültigen Preis
