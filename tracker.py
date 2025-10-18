@@ -377,6 +377,58 @@ class MarketTracker:
             return expected_total
         return None
 
+    def _infer_quantity_from_price(self, item_name: str, observed_total: int | None) -> int | None:
+        if not item_name or not observed_total or observed_total <= 0:
+            return None
+
+        try:
+            base_price = self._get_base_price(item_name)
+        except Exception:
+            base_price = None
+        if not base_price or base_price <= 0:
+            return None
+
+        approx = observed_total / base_price
+        candidates = []
+        primary = int(round(approx)) if approx > 0 else 0
+        for q in (primary, math.floor(approx), math.ceil(approx)):
+            if q not in candidates:
+                candidates.append(q)
+        # also try neighbours to compensate rounding
+        if primary > 0:
+            for delta in (-1, 1):
+                cand = primary + delta
+                if cand > 0 and cand not in candidates:
+                    candidates.append(cand)
+
+        valid_candidates = []
+        for qty in candidates:
+            if qty <= 0 or qty > MAX_ITEM_QUANTITY:
+                continue
+            unit_price = observed_total / qty
+            try:
+                if self._is_unit_price_plausible(item_name, unit_price):
+                    valid_candidates.append((qty, unit_price))
+                    continue
+            except Exception:
+                pass
+            # fallback: accept if total roughly matches base price within tolerance
+            tolerance = 0.2
+            lower = base_price * (1 - tolerance) * qty
+            upper = base_price * (1 + tolerance) * qty
+            if lower <= observed_total <= upper:
+                valid_candidates.append((qty, unit_price))
+
+        if not valid_candidates:
+            return None
+
+        # Prefer candidate closest to approx quantity
+        valid_candidates.sort(key=lambda item: abs(item[0] - approx))
+        chosen_qty = int(valid_candidates[0][0])
+        if chosen_qty <= 0 or chosen_qty > MAX_ITEM_QUANTITY:
+            return None
+        return chosen_qty
+
     def _compile_transaction_pattern(self, item_name, quantity, price):
         parts = []
         if item_name:
@@ -1151,6 +1203,12 @@ class MarketTracker:
                     itlc = (s.get('item') or '').lower()
                     if itlc in anchor_items and isinstance(s.get('timestamp'), datetime.datetime):
                         if s['timestamp'] < overall_max_ts:
+                            try:
+                                delta_seconds = abs((overall_max_ts - s['timestamp']).total_seconds())
+                            except Exception:
+                                delta_seconds = None
+                            if delta_seconds is not None and delta_seconds > 120:
+                                continue
                             if self.debug:
                                 old_ts = s['timestamp'].strftime('%H:%M:%S')
                                 new_ts = overall_max_ts.strftime('%H:%M:%S')
@@ -1524,7 +1582,13 @@ class MarketTracker:
                             ts_score = -abs((overall_max_ts - ts_entry).total_seconds())
                     except Exception:
                         ts_score = 0
-                    return (has_price, has_qty, ts_score, entry.get('qty') or 0, entry.get('price') or 0)
+                    return (
+                        has_price,
+                        ts_score,
+                        has_qty,
+                        entry.get('qty') or 0,
+                        entry.get('price') or 0,
+                    )
 
                 transaction_entries_sorted = sorted(
                     transaction_entries,
@@ -1820,7 +1884,17 @@ class MarketTracker:
                 if (not has_bought_same or (ent.get('qty') is None)) and has_placed_same and not has_withdrew_same:
                     placed_entry = next((r for r in related if r['type'] == 'placed' and same_item(r) and r.get('qty')), None)
                     if placed_entry and (ent.get('qty') is None or ent.get('qty') <= 0):
-                        ent['qty'] = placed_entry['qty']
+                        allow_from_placed = True
+                        ts_ent = ent.get('timestamp')
+                        ts_placed = placed_entry.get('timestamp')
+                        try:
+                            if isinstance(ts_ent, datetime.datetime) and isinstance(ts_placed, datetime.datetime):
+                                if abs((ts_ent - ts_placed).total_seconds()) > 120:
+                                    allow_from_placed = False
+                        except Exception:
+                            pass
+                        if allow_from_placed:
+                            ent['qty'] = placed_entry['qty']
 
             # final transaction type strictly from side; do not override with presence of listed/placed
             final_type = side
@@ -1944,6 +2018,12 @@ class MarketTracker:
                         quantity = ent['qty']
                     if ent.get('price') and (price is None or price <= 0):
                         price = ent['price']
+
+                if (quantity is None or quantity <= 0) and price and price > 0:
+                    inferred_qty = self._infer_quantity_from_price(item_name, int(price))
+                    if inferred_qty:
+                        quantity = inferred_qty
+                        ent['_qty_inferred_from_price'] = True
                 # If on buy_overview and this is a buy, check if we have buy anchors
                 # Note: This check should only apply to BUY transactions, not SELL transactions on buy_overview!
                 if wtype == 'buy_overview' and final_type == 'buy':
