@@ -348,7 +348,7 @@ class MarketTracker:
             return None
 
         observed_unit = observed_total / quantity
-        tolerance = 0.10
+        tolerance = 0.15
         lower = base_price * (1 - tolerance)
         upper = base_price * (1 + tolerance)
         if observed_unit >= lower:

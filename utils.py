@@ -793,7 +793,7 @@ def check_price_plausibility(
     unit_price = total_price / quantity
     result['unit_price'] = unit_price
 
-    tolerance = 0.10
+    tolerance = 0.15
     min_unit_price = base_price * (1 - tolerance)
     max_unit_price = base_price * (1 + tolerance)
 

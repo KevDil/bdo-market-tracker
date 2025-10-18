@@ -855,14 +855,15 @@ def extract_details_from_entry(ts_text, entry_text):
                 # Mark as invalid price to trigger UI fallback in tracker.py
                 price = None
 
-    # timestamp: from ts_text if given, else try to find within entry_text
+    # timestamp: prefer the timestamp supplied by split_text_into_log_entries (ts_text),
+    # fall back to a timestamp found inside the entry snippet only if needed.
     ts = None
-    # Prefer a timestamp found inside this entry snippet if available (more precise per-row attribution)
-    m_ts_local = re.search(r'(20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2})', entry_text)
-    if m_ts_local:
-        ts = parse_timestamp_text(m_ts_local.group(1))
-    if not ts and ts_text:
+    if ts_text:
         ts = parse_timestamp_text(ts_text)
+    if ts is None:
+        local_matches = list(re.finditer(r'(20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2})', entry_text))
+        if local_matches:
+            ts = parse_timestamp_text(local_matches[-1].group(1))
     # kein Fallback auf Systemzeit; ohne gültigen Spiel-Zeitstempel wird der Eintrag verworfen
 
     return {

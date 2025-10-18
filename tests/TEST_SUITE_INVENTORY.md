@@ -17,6 +17,7 @@
 | `tests/unit/test_parsing_crystal.py` | Parsing: Crystal of Void Destruction extraction | ensures transaction detection |
 | `tests/unit/test_ocr_robustness.py` | Parsing normalization (Silver keyword, transaction priority) | covers common OCR noise |
 | `tests/unit/test_price_plausibility.py` | Price plausibility (net vs gross totals) | stubs heavy deps for deterministic behaviour |
+| `tests/unit/test_timestamp_priority.py` | Timestamp disambiguation (ts_text vs inline) | prevents duplicate saves from mixed timestamps |
 
 All unit tests follow simple `assert` semantics and can be executed with `python tests/unit/<file>.py` or via the aggregated runner.
 
