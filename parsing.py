@@ -233,6 +233,7 @@ def split_text_into_log_entries(text):
         return []
 
     entries = []
+    ts_positions_all = list(ts_positions)
     # Finde alle Event-Anker im gesamten Text mit Positionen (nutzt pre-compiled pattern)
     lowered_text = text.lower()
     all_anchors = []
@@ -286,9 +287,19 @@ def split_text_into_log_entries(text):
                 next_anchor_start = next_a_start
                 break
 
+        # Default snippet end: a bit after the anchor to capture trailing price info
         event_end = anchor_end + 300
         if next_anchor_start and next_anchor_start < event_end:
             event_end = next_anchor_start
+        else:
+            # Also stop before the next global timestamp to avoid dragging historical lines into the same snippet
+            next_ts_pos = None
+            for pos, _ in ts_positions_all:
+                if pos > anchor_start:
+                    next_ts_pos = pos
+                    break
+            if next_ts_pos is not None and next_ts_pos < event_end:
+                event_end = next_ts_pos
 
         entry_start = anchor_start
         if best_ts_pos is not None:
@@ -308,7 +319,15 @@ def split_text_into_log_entries(text):
                 except Exception:
                     internal_ts = []
                 if internal_ts:
-                    best_ts_text = internal_ts[-1][1]
+                    anchor_rel_start = max(0, anchor_start - entry_start)
+                    # pick timestamp closest to the anchor (prefer one located before the anchor)
+                    def _ts_key(item):
+                        pos, _ = item
+                        distance = pos - anchor_rel_start
+                        return (abs(distance), distance > 0)
+
+                    nearest_ts = min(internal_ts, key=_ts_key)
+                    best_ts_text = nearest_ts[1]
                 entries.append((entry_start, best_ts_text, cleaned))
 
     # Filter out UI-only collect/re-list snippets that slipped through without anchors

@@ -1513,9 +1513,22 @@ class MarketTracker:
             related = cluster_entries  # ALL entries in the cluster
             transaction_entries = [r for r in related if r['type'] == 'transaction']
             if transaction_entries:
+                def _tx_sort_key(entry):
+                    has_price = 1 if (entry.get('price') or 0) > 0 else 0
+                    has_qty = 1 if (entry.get('qty') or 0) > 0 else 0
+                    ts_score = 0
+                    ts_entry = entry.get('timestamp')
+                    try:
+                        if isinstance(ts_entry, datetime.datetime) and 'overall_max_ts' in locals() and isinstance(overall_max_ts, datetime.datetime):
+                            # prefer timestamps closest to the newest timestamp seen in this snapshot
+                            ts_score = -abs((overall_max_ts - ts_entry).total_seconds())
+                    except Exception:
+                        ts_score = 0
+                    return (has_price, has_qty, ts_score, entry.get('qty') or 0, entry.get('price') or 0)
+
                 transaction_entries_sorted = sorted(
                     transaction_entries,
-                    key=lambda r: ((r.get('qty') or 0), (r.get('price') or 0)),
+                    key=_tx_sort_key,
                     reverse=True
                 )
                 for pos, entry in enumerate(transaction_entries_sorted):
