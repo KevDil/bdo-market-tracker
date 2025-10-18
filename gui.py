@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import datetime
 from utils import log_debug 
+import torch
 
 from tracker import MarketTracker
 from config import (
@@ -26,10 +27,15 @@ from database import conn, get_connection
 def start_gui():
     tracker = MarketTracker(debug=get_debug_mode(True))
 
+    mode = "GPU" if torch.cuda.is_available() else "CPU"
     root = tk.Tk()
     root.title("BDO Market Tracker")
-    root.geometry("640x740")
+    root.geometry("640x760")
     root.minsize(560, 680)
+    try:
+        root.iconbitmap('config/icon.ico')
+    except tk.TclError:
+        pass  # Icon not found, continue without it
 
     style = ttk.Style()
     try:
@@ -47,6 +53,7 @@ def start_gui():
     status_var = tk.StringVar(value="Status: Idle")
     health_status_var = tk.StringVar(value="🟢 Healthy")
     window_status_var = tk.StringVar(value="Fenster: -")
+    mode_var = tk.StringVar(value=f"Modus: {mode}")
 
     def _parse_region(value: str) -> tuple[int, int, int, int] | None:
         try:
@@ -182,17 +189,19 @@ def start_gui():
     settings_frame = ttk.LabelFrame(main_container, text="Einstellungen", style="Section.TLabelframe")
     settings_frame.pack(fill="x", pady=(0, 12))
 
-    tk.Checkbutton(settings_frame, text="GPU-Modus verwenden", variable=use_gpu_var).pack(anchor="w")
+    if mode == "GPU":
+        tk.Checkbutton(settings_frame, text="GPU-Modus verwenden", variable=use_gpu_var).pack(anchor="w")
     tk.Checkbutton(settings_frame, text="Debug-Modus", variable=debug_var).pack(anchor="w", pady=(2, 0))
     ttk.Button(settings_frame, text="Speichern", style="Accent.TButton", command=_apply_settings).pack(anchor="e", pady=(8, 0))
 
-    note = tk.Label(
-        settings_frame,
-        text="Hinweis: GPU-Änderungen werden nach einem Neustart aktiv.",
-        foreground="#666",
-        font=("Segoe UI", 9, "italic"),
-    )
-    note.pack(anchor="w", pady=(4, 0))
+    if mode == "GPU":
+        note = tk.Label(
+            settings_frame,
+            text="Hinweis: GPU-Änderungen werden nach einem Neustart aktiv.",
+            foreground="#666",
+            font=("Segoe UI", 9, "italic"),
+        )
+        note.pack(anchor="w", pady=(4, 0))
 
     # Status Section
     status_frame = ttk.LabelFrame(main_container, text="Status", style="Section.TLabelframe")
@@ -201,6 +210,7 @@ def start_gui():
     health_label = tk.Label(status_frame, textvariable=health_status_var, font=("Segoe UI", 11, "bold"))
     health_label.pack(anchor="w")
     tk.Label(status_frame, textvariable=window_status_var, fg="#1a4d8f").pack(anchor="w", pady=(2, 0))
+    tk.Label(status_frame, textvariable=mode_var, fg="#666" if mode == "CPU" else "#00aaff").pack(anchor="w", pady=(2, 0))
     
     def update_health_status():
         """Update health status display every 500ms"""
@@ -528,6 +538,10 @@ def start_gui():
         result_window = tk.Toplevel(root)
         result_window.title("Datenübersicht")
         result_window.geometry("820x600")
+        try:
+            result_window.iconbitmap('config/icon.ico')
+        except tk.TclError:
+            pass  # Icon not found, continue without it
 
         summary_frame = tk.Frame(result_window)
         summary_frame.pack(fill="x", padx=12, pady=(12, 8))
