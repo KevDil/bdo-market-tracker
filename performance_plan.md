@@ -18,6 +18,10 @@
    - Stelle sicher, dass `log_text`/`log_debug` deaktivierbar sind (ENV-Flag) und nicht automatisch mitmessen.
 3. **ROI-Visualisierung & Snapshot-Archiv**  
    - Lege reproduzierbare Test-Frames unter `dev-screenshots/` ab und dokumentiere ROI-Overlays, um Flächenreduktionen später beurteilen zu können.
+4. **Messresultate festhalten (Januar 2025, GPU-Benchmark)**  
+   - Capture ≈ 12 ms, Preprocess ≈ 1,6 ms, Postprocess ≈ 0 ms (Dry-Run).  
+   - OCR dominiert mit ≈ 1 200 ms (p95 ≈ 1 223 ms), Cache-Hit-Rate 0 %.  
+   - CUDA-Allokation ~200 MB, daher liegt das Optimierungspotenzial klar im OCR-Pfad.
 
 ## Phase 1 – Quick Wins (1–2 Tage, hohes Nutzen/Risiko-Verhältnis)
 1. **Debug-IO standardmäßig abschalten**  
@@ -30,10 +34,10 @@
    - Passe `detect_log_roi` so an, dass nur noch das rote Transaktionsfeld aus `dev-screenshots/regions.png` erfasst wird (oberes Log, keine Itemliste). Ergänze zwei neue Helper: `detect_metrics_roi` für das grüne Delta-Feld (Orders/Collect/Re-list) sowie `detect_window_label_roi` für die gelben Fenster-Titel.  
    - Lasse das Log-ROI bei jedem Poll verarbeiten, trigger die Metrik-/Label-ROIs nur bei Bedarf (z. B. wenn `detect_window_type` unsicher ist oder wenn neue Log-Einträge auftauchen).  
    - Dokumentiere die neue ROI-Aufteilung (75 % Trim laut Guidelines, zusätzliche Sub-ROIs) und stelle Konfiguration/Testbarkeit sicher.
-4. **EasyOCR-Parameter unterscheiden nach CPU/GPU**  
-   - Reduziere `canvas_size` für GPU auf ~1600 und deaktivere `paragraph=True`, um Parallelisierung zu steigern (`utils.py:348-371`).  
-   - Für CPU-Läufe kann `contrast_ths` weiter erhöht und `batch_size` >1 gesetzt werden, wenn genügend RAM vorhanden ist.  
-   - Dokumentiere die neuen Parameter im Guidelines-Dokument.
+4. **EasyOCR-/GPU-Pipeline härten**  
+   - Verifiziere, dass EasyOCR tatsächlich auf der GPU läuft (Logging von `torch.cuda.get_device_name()`, `torch.cuda.is_available()` vor jedem Scan, optional Halbpräzision aktivieren).  
+   - Reduziere `canvas_size` für GPU auf ~1600, deaktiviere `paragraph=True` und teste `detail=0`/`batch_size>1`, um die Erkennungszeit unter das beobachtete 1,2 s-Level zu drücken (`utils.py:348-371`).  
+   - Für CPU-Läufe darf `contrast_ths` leicht erhöht werden; dokumentiere alle Parameteränderungen in den Repository-Guidelines.
 5. **Cache-Hotpath entlasten**  
    - Ersetze das MD5-basiierte Hashing durch `np.ndarray.tobytes()` mit `blake2s` oder ein Rolling-Hash über downsampled Frames (`utils.py:490-533`).  
    - Cache auch das vorverarbeitete Graustufenbild, damit OCR-Hits ohne erneute CLAHE-Berechnung auskommen.

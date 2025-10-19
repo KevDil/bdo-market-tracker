@@ -223,7 +223,7 @@ class MarketTracker:
             time.sleep(0.05)
             return None
 
-    def _process_image(self, img, context='sync', allow_debug=True):
+    def _process_image(self, img, context='sync', allow_debug=True, metrics=None):
         """Run preprocessing, OCR, and downstream processing for a captured image."""
         if img is None:
             return None
@@ -236,9 +236,12 @@ class MarketTracker:
             # BALANCED PREPROCESSING: Use adaptive CLAHE but skip denoise
             # Fast mode was too aggressive and hurt OCR quality
             proc = preprocess(img, adaptive=True, denoise=False, fast_mode=False)
-            preprocess_time = (time.perf_counter() - preprocess_start) * 1000
+            preprocess_elapsed = time.perf_counter() - preprocess_start
+            preprocess_time = preprocess_elapsed * 1000
             if self.debug:
                 log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
+            if metrics is not None:
+                metrics["preprocess_ms"] = preprocess_time
 
             if allow_debug and self.debug:
                 self._write_debug_images(img, proc, context)
@@ -253,13 +256,19 @@ class MarketTracker:
                 preprocessed=proc,
                 fast_mode=True,  # Still use fast mode for speed
             )
-            ocr_time = (time.perf_counter() - ocr_start) * 1000
+            ocr_elapsed = time.perf_counter() - ocr_start
+            ocr_time = ocr_elapsed * 1000
             if self.debug:
                 cache_indicator = " [CACHED]" if was_cached else ""
                 log_debug(
                     f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
                     f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
                 )
+            if metrics is not None:
+                metrics["ocr_ms"] = ocr_time
+                metrics["ocr_cache_hit"] = bool(was_cached)
+                metrics["ocr_cache_age_s"] = cache_stats.get('cache_age')
+                metrics["ocr_cache_size"] = cache_stats.get('cache_size')
 
             log_text(text)
             if self.debug and context != 'async':
@@ -267,11 +276,18 @@ class MarketTracker:
 
             process_start = time.perf_counter()
             self.process_ocr_text(text)
-            process_time = (time.perf_counter() - process_start) * 1000
-            total_time = (time.perf_counter() - total_start) * 1000
+            process_elapsed = time.perf_counter() - process_start
+            process_time = process_elapsed * 1000
+            total_elapsed = time.perf_counter() - total_start
+            total_time = total_elapsed * 1000
 
             if self.debug:
                 log_debug(f"{perf_prefix} Process: {process_time:.1f}ms, Total scan: {total_time:.1f}ms")
+
+            if metrics is not None:
+                metrics["postprocess_ms"] = process_time
+                metrics["total_ms"] = total_time
+                metrics["ocr_text_length"] = len(text) if text else 0
 
             if self.error_count > 0:
                 self.error_count = max(0, self.error_count - 1)
@@ -283,6 +299,8 @@ class MarketTracker:
             self.error_count += 1
             self.last_error_time = datetime.datetime.now()
             self.last_error_message = f"Processing error: {exc}"
+            if metrics is not None:
+                metrics.setdefault("error", str(exc))
             return None
 
     def _write_debug_images(self, original_bgr, processed_img, _context: str) -> None:
