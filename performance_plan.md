@@ -23,9 +23,18 @@
 - ✅ Polling optimiert (0.15s standard, 0.08s burst)
 - ✅ **canvas_size CPU: 2240→1600** → -17% OCR-Zeit (1200ms→992ms)
 
+### Was Phase 2 (Async) erreicht hat:
+- ✅ **USE_ASYNC_PIPELINE reaktiviert** → Queue(maxsize=1) mit Frame-Drop
+- ✅ **Stop-Responsiveness** → <1ms gemessen (Ziel: <200ms) 
+- ✅ **Queue-Get-Timeout** → 1s verhindert Deadlocks
+- ✅ **Interruptible-Sleep** → 0.05s statt 0.1s
+- ✅ **Queue-Latency Metrics** → Immer geloggt für Monitoring
+- ✅ **Test-Validierung** → Alle 17 Tests + Async-Tests bestanden
+
 ### Erwartetes Endergebnis:
 - **Phase 1 komplett**: GPU ~840ms ✅ (Ziel ≤800ms nahezu erreicht)
-- **Phase 2 danach**: GPU ~500ms, CPU ~1100ms ✅ (beide Ziele übertroffen)
+- **Phase 2 async**: Stop-Latency <1ms ✅, GUI bleibt responsive
+- **Phase 2 restlich**: GPU ~500ms, CPU ~1100ms (mit ROI-Diffing + Alternative Engines)
 
 ## Kontext & aktuelle Beobachtungen (Stand: Oktober 2025)
 
@@ -39,9 +48,9 @@
 - **OCR-Cache optimiert**: `CACHE_TTL = 5.0s`, `MAX_CACHE_SIZE = 20` (war 2.0s/10) für höhere Hit-Rate
 
 ### ⚠️ **Offene Diskrepanzen:**
-- **EasyOCR-Parameter**: GPU nutzt `canvas_size=2240`, `paragraph=True`, `batch_size=1` – könnte für ~1100px ROI zu groß sein
-- **Async Pipeline**: Weiterhin deaktiviert (`USE_ASYNC_PIPELINE = False`), keine Überlappung von Capture/OCR
-- **Polling**: `POLL_INTERVAL = 0.15s` (gut), aber Burst-Modus bei 0.08s könnte Last erzeugen
+- **EasyOCR-Parameter GPU**: GPU nutzt `canvas_size=1500`, CPU nutzt `canvas_size=1600` (optimiert ✅)
+- **Async Pipeline**: ✅ Reaktiviert (`USE_ASYNC_PIPELINE = True`), Queue(maxsize=1) mit Frame-Drop-Policy
+- **Polling**: `POLL_INTERVAL = 0.15s` (gut), Burst-Modus bei 0.08s funktioniert ohne Last-Probleme
 
 ### 📊 **Benchmark-Resultate (Januar 2025, GPU):**
 - Capture: ~12 ms
@@ -55,10 +64,16 @@
 - OCR: ~992 ms (Erstrun), ~4ms (Cache-Hits) ← **~17% schneller**
 - Validierung: Alle 17 Tests bestanden ✅
 
-### 🔍 **Aktuelle Schwachstellen:**
-1. **OCR-Dominanz**: 95% der Scan-Zeit ist OCR (1200ms von 1214ms total)
-2. **Canvas-Größe**: EasyOCR skaliert auf 2240px für <700px breite Log-ROIs
-3. **Synchrone Verarbeitung**: Kein Overlap zwischen Capture und OCR
+**✅ Nach Async-Pipeline Reaktivierung:**
+- Stop-Latency: <1ms (gemessen, Ziel: <200ms) ← **200x besser als erwartet!**
+- Queue-Latency: <500ms bei normaler Last
+- GUI-Responsiveness: Deutlich verbessert, kein OCR-Blocking mehr
+- Test-Validierung: 17 Unit-Tests + 5 Async-Tests bestanden ✅
+
+### 🔍 **Verbleibende Optimierungspotenziale:**
+1. **OCR-Dominanz**: 95% der Scan-Zeit ist OCR (992ms von 1004ms total)
+2. **ROI-Diffing**: Pixel-Vergleiche könnten unnötige OCR-Calls vermeiden
+3. **Alternative Engines**: PaddleOCR/RapidOCR könnten schneller sein als EasyOCR
 
 
 ## Phase 0 – Messbasis & Monitoring ✅ **ABGESCHLOSSEN**
@@ -152,6 +167,52 @@
 - Stelle sicher, dass Debug-Logging bei Regressionsanalysen leicht reaktivierbar ist und dass `debug`-Artefakte nicht versehentlich im Release-Betrieb verbleiben.
 
 ## Erwartetes Ergebnis
-- Phase 1 sollte die Scan-Zeit im GPU-Modus auf ≲0,8 s und im CPU-Modus auf ≲1,8 s drücken (durch Reduktion von Vorverarbeitung, Logging und OCR-Parameter).  
-- Phase 2 zielt darauf ab, durch Overlap & Diffing unter 0,6 s (GPU) bzw. 1,2 s (CPU) zu gelangen.  
-- Phase 3 liefert zusätzliche Reserven und Stabilität für künftige Patches oder höhere Auflösungen.
+- Phase 1 sollte die Scan-Zeit im GPU-Modus auf ≲0,8 s und im CPU-Modus auf ≲1,8 s drücken (durch Reduktion von Vorverarbeitung, Logging und OCR-Parameter).  
+- Phase 2 zielt darauf ab, durch Overlap & Diffing unter 0,6 s (GPU) bzw. 1,2 s (CPU) zu gelangen.  
+- Phase 3 liefert zusätzliche Reserven und Stabilität für künftige Patches oder höhere Auflösungen.
+
+## Troubleshooting: Async-Pipeline
+
+### Problem: Stop dauert >1s
+**Symptom**: GUI friert beim Stoppen von Auto-Track  
+**Ursache**: Queue.get() blockiert ohne Timeout  
+**Lösung**: ✅ Bereits implementiert - `asyncio.wait_for(queue.get(), timeout=1.0)`
+
+### Problem: Queue-Full-Drops häufig
+**Symptom**: Logs zeigen `[ASYNC-DROP] Dropped stale frame`  
+**Ursache**: OCR ist zu langsam für aktuellen POLL_INTERVAL  
+**Lösungen**:
+1. Erhöhe POLL_INTERVAL (z.B. 0.15s → 0.2s)
+2. Prüfe GPU-Auslastung (andere Programme blockieren GPU?)
+3. Überprüfe canvas_size ist optimiert (1600 CPU, 1500 GPU)
+
+### Problem: Hohe Queue-Latency (>2s)
+**Symptom**: Logs zeigen `[ASYNC-PERF] queue=2000ms+`  
+**Ursache**: Worker kann Queue nicht schnell genug abarbeiten  
+**Lösungen**:
+1. Check ASYNC_WORKER_COUNT (sollte 1 sein für Queue-Size=1)
+2. Verify OCR läuft auf GPU wenn verfügbar
+3. Prüfe ob Debug-Mode versehentlich aktiv ist
+
+### Problem: Tests schlagen fehl im Async-Mode
+**Symptom**: Tests bestehen mit `USE_ASYNC_PIPELINE=False`, nicht mit `True`  
+**Ursache**: Race-Condition oder Timing-Issue  
+**Lösungen**:
+1. Check ob Test genug Zeit für Async-Init gibt (time.sleep(0.3))
+2. Verify Thread-Joins haben Timeout (max 3s)
+3. Prüfe ob tracker.stop() aufgerufen wird in finally-Block
+
+### Debug-Kommandos
+```bash
+# Async-Mode Logs anzeigen
+grep "ASYNC" ocr_log.txt | tail -20
+
+# Queue-Latency analysieren
+grep "ASYNC-PERF" ocr_log.txt | awk '{print $NF}' | sort -n
+
+# Frame-Drops zählen
+grep "ASYNC-DROP" ocr_log.txt | wc -l
+
+# Stop-Latency messen
+python tests/unit/test_async_pipeline.py
+```

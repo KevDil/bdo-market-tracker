@@ -4361,8 +4361,7 @@ class AsyncPipelineController:
                             # Drop oldest frame (FIFO - get without blocking)
                             old_frame = self.queue.get_nowait()
                             self.queue.task_done()  # Mark old frame as done
-                            if self.tracker.debug:
-                                log_debug("[ASYNC] Dropped stale frame (queue full)")
+                            log_debug("[ASYNC-DROP] Dropped stale frame (queue full - OCR too slow)")
                         except asyncio.QueueEmpty:
                             pass  # Race condition - queue emptied between check and get
                     
@@ -4388,7 +4387,15 @@ class AsyncPipelineController:
             return
 
         while True:
-            item = await self.queue.get()
+            # CRITICAL FIX: Add timeout for responsive stop (max 1s wait)
+            try:
+                item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                # Check if stop was requested during wait
+                if self._stop_requested or not self.tracker.running:
+                    break
+                continue  # Retry queue.get()
+            
             if item is None:
                 self.queue.task_done()
                 break
@@ -4398,6 +4405,7 @@ class AsyncPipelineController:
                 continue
 
             try:
+                start_process = time.perf_counter()
                 await loop.run_in_executor(
                     self.executor,
                     self.tracker._process_image,
@@ -4405,13 +4413,15 @@ class AsyncPipelineController:
                     'async',
                     self.tracker.debug,
                 )
-                if self.tracker.debug:
-                    captured_at = item.get('captured_at')
-                    if captured_at is not None:
-                        latency_ms = (time.perf_counter() - captured_at) * 1000
-                        log_debug(f"[PERF-ASYNC] Queue latency: {latency_ms:.1f}ms")
+                # PERFORMANCE METRICS: Always log queue latency (even in non-debug mode)
+                captured_at = item.get('captured_at')
+                if captured_at is not None:
+                    queue_latency_ms = (start_process - captured_at) * 1000
+                    process_time_ms = (time.perf_counter() - start_process) * 1000
+                    total_latency_ms = (time.perf_counter() - captured_at) * 1000
+                    log_debug(f"[ASYNC-PERF] Worker {worker_id}: queue={queue_latency_ms:.1f}ms process={process_time_ms:.1f}ms total={total_latency_ms:.1f}ms")
             except Exception as exc:
-                log_debug(f"[ASYNC] Worker {worker_id} error: {exc}")
+                log_debug(f"[ASYNC-ERROR] Worker {worker_id}: {exc}")
             finally:
                 self.queue.task_done()
 
@@ -4421,7 +4431,8 @@ class AsyncPipelineController:
             return
 
         elapsed = 0.0
-        step = 0.1
+        # CRITICAL FIX: Faster granularity for <100ms stop response (was 0.1s, now 0.05s)
+        step = 0.05  # Check every 50ms instead of 100ms
         while elapsed < duration and not self._stop_requested and self.tracker.running:
             slice_len = min(step, duration - elapsed)
             await asyncio.sleep(slice_len)
