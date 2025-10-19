@@ -3,6 +3,7 @@ import json
 import sqlite3
 import pytesseract
 import easyocr
+import numpy as np
 
 # -----------------------
 # Konfiguration
@@ -356,6 +357,19 @@ if USE_EASYOCR:
             detector=True,
             recognizer=True
         )
+
+        # Warmup-Scan, damit EasyOCR Gewichte lädt und der erste Live-Scan nicht blockiert.
+        def _warmup_easyocr(reader_obj):
+            try:
+                dummy = np.zeros((48, 192, 3), dtype=np.uint8)
+                reader_obj.readtext(dummy, detail=0, paragraph=False, batch_size=1)
+            except Exception as warmup_err:
+                try:
+                    print(f"[WARNING] EasyOCR warmup skipped: {warmup_err}")
+                except UnicodeEncodeError:
+                    print("[WARNING] EasyOCR warmup skipped")
+
+        _warmup_easyocr(reader)
         
         mode = "GPU" if gpu_available else "CPU"
         try:

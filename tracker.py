@@ -365,7 +365,10 @@ class MarketTracker:
                 metrics["ocr_cache_age_s"] = cache_stats.get("cache_age")
                 metrics["ocr_cache_size"] = cache_stats.get("cache_size")
 
-            self._latest_log_text = text or ""
+            self._log_capture_failed = bool(need_log_ocr and not (text or "").strip())
+            if not need_log_ocr:
+                self._log_capture_failed = False
+            self._latest_log_text = text if need_log_ocr else ""
 
             current_device = get_easyocr_device_name()
             if current_device != self._easyocr_device:
@@ -1691,15 +1694,18 @@ class MarketTracker:
                 pass
         else:
             if ts_dt:
-                try:
-                    if transaction_exists_by_values_near_time(item, qty or 0, int(price), ts_dt, tolerance_minutes=5):
+                if last_processed and ts_dt > last_processed:
+                    pass
+                else:
+                    try:
+                        if transaction_exists_by_values_near_time(item, qty or 0, int(price), ts_dt, tolerance_minutes=5):
+                            if self.debug:
+                                log_debug(f"[CONTENT-HASH] Skip near-time duplicate: {item} {qty}x @ {price} around {ts_dt}")
+                            self.seen_tx_signatures.append(sig)
+                            return False
+                    except Exception as exc:
                         if self.debug:
-                            log_debug(f"[CONTENT-HASH] Skip near-time duplicate: {item} {qty}x @ {price} around {ts_dt}")
-                        self.seen_tx_signatures.append(sig)
-                        return False
-                except Exception as exc:
-                    if self.debug:
-                        log_debug(f"[CONTENT-HASH] Near-time duplicate check failed: {exc}")
+                            log_debug(f"[CONTENT-HASH] Near-time duplicate check failed: {exc}")
         with self.lock:
             try:
                 db_cur = get_cursor()
@@ -1793,9 +1799,34 @@ class MarketTracker:
             log_debug(msg)
 
         log_text_source = (getattr(self, '_latest_log_text', '') or '').strip()
-        if not log_text_source:
-            log_text_source = full_text
-        entries = split_text_into_log_entries(log_text_source)
+        entries = split_text_into_log_entries(log_text_source) if log_text_source else []
+
+        # Fallback: only attempt to parse the full snapshot when log ROI failed in an overview window.
+        fallback_used = False
+        if not entries and self._log_capture_failed and wtype in ("sell_overview", "buy_overview"):
+            def _sanitize_snapshot(text: str) -> str:
+                lines = []
+                for line in text.splitlines():
+                    low = line.lower()
+                    if re.search(r"20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2}", line):
+                        lines.append(line)
+                        continue
+                    if any(tok in low for tok in ("transaction", "placed order", "withdrew", "listed", "purchased")):
+                        lines.append(line)
+                        continue
+                return "\n".join(lines)
+
+            sanitized = _sanitize_snapshot(full_text)
+            if sanitized:
+                entries = split_text_into_log_entries(sanitized)
+                fallback_used = True
+
+        if not entries:
+            if self.debug and self._log_capture_failed and wtype in ("sell_overview", "buy_overview"):
+                log_debug("[LOG] skip scan: log ROI empty; no entries parsed")
+            return
+        elif fallback_used and self.debug:
+            log_debug("[LOG] fallback snapshot used for log parsing")
         if not entries:
             if self.debug:
                 msg = "no timestamp-entries found; skipping"
@@ -1824,6 +1855,8 @@ class MarketTracker:
             details = extract_details_from_entry(ts_text, snippet)
             # include original pos for fallback grouping
             if not details['timestamp']:
+                continue
+            if details['type'] not in {'transaction', 'placed', 'listed', 'withdrew', 'purchased'}:
                 # ohne gültigen Spiel-Zeitstempel nicht verarbeiten
                 continue
             structured.append({

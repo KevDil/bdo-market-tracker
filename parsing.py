@@ -349,6 +349,15 @@ def split_text_into_log_entries(text):
         )
         if looks_like_ui and not has_anchor:
             continue
+        ui_noise = (
+            "registration count" in low
+            or low.startswith("items listed")
+            or "vt" in low and "capacity" in low
+            or "cancel" in low and "re-list" in low
+            or ("sales completed" in low and not has_anchor)
+        )
+        if ui_noise and not has_anchor:
+            continue
         filtered.append((start, ts_text, snippet))
 
     return filtered
