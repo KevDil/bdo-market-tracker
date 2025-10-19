@@ -50,11 +50,33 @@ _screenshot_cache = {}  # {hash: (timestamp, ocr_result, cache_hits)}
 _cache_lock = threading.Lock()
 # Aggregate stats for hit rate tracking
 _cache_totals = {"requests": 0, "hits": 0}
+_preprocessed_cache: dict[str, tuple[float, np.ndarray]] = {}
 # Performance optimization: Increased cache parameters for better hit rate
 # Market window changes infrequently, so longer TTL is safe
 CACHE_TTL = 5.0  # Sekunden - Cache-Einträge sind 5s gültig (was 2.0s)
 MAX_CACHE_SIZE = 20  # Maximal 20 verschiedene Screenshots im Cache (was 10)
 # Expected improvement: Cache hit rate from ~50% to >70%
+
+
+def get_preprocessed_frame(frame_hash: str) -> np.ndarray | None:
+    now = time.time()
+    with _cache_lock:
+        entry = _preprocessed_cache.get(frame_hash)
+        if not entry:
+            return None
+        ts, img = entry
+        if now - ts < CACHE_TTL:
+            return img
+        del _preprocessed_cache[frame_hash]
+        return None
+
+
+def set_preprocessed_frame(frame_hash: str, image: np.ndarray) -> None:
+    with _cache_lock:
+        _preprocessed_cache[frame_hash] = (time.time(), image.copy())
+        if len(_preprocessed_cache) > MAX_CACHE_SIZE:
+            oldest_key = min(_preprocessed_cache.items(), key=lambda x: x[1][0])[0]
+            del _preprocessed_cache[oldest_key]
 
 _OCR_TOKEN_TRANSLATION = str.maketrans({
     '0': 'o',
@@ -234,10 +256,49 @@ def detect_metrics_roi(img):
 
 
 def easyocr_uses_gpu() -> bool:
-    try:
-        return USE_EASYOCR and reader is not None and bool(getattr(reader, "gpu", False))
-    except Exception:
+    if not USE_EASYOCR or reader is None:
         return False
+    try:
+        gpu_attr = getattr(reader, "gpu", None)
+        if isinstance(gpu_attr, bool):
+            if gpu_attr:
+                return True
+        elif isinstance(gpu_attr, (list, tuple)):
+            if any(str(x).lower().startswith("cuda") or str(x) == "1" for x in gpu_attr):
+                return True
+        elif isinstance(gpu_attr, str):
+            if "cuda" in gpu_attr.lower() or gpu_attr.strip() == "1":
+                return True
+    except Exception:
+        pass
+
+    # Fallback: check reader.device
+    try:
+        device_attr = getattr(reader, "device", None)
+        if isinstance(device_attr, str) and "cuda" in device_attr.lower():
+            return True
+    except Exception:
+        pass
+
+    # Check recognizer/detector modules
+    try:
+        recognizer = getattr(reader, "recognizer", None)
+        if recognizer is not None:
+            params = list(recognizer.parameters())
+            if params and params[0].device.type == "cuda":
+                return True
+    except Exception:
+        pass
+    try:
+        detector = getattr(reader, "detector", None)
+        if detector is not None:
+            params = list(detector.parameters())
+            if params and params[0].device.type == "cuda":
+                return True
+    except Exception:
+        pass
+
+    return False
 
 
 def get_easyocr_device_name() -> str:
@@ -426,20 +487,34 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                 #   - text_threshold: 0.7 → 0.72 (slightly higher, but not too strict)
                 #   - contrast_ths: 0.3 → 0.35 (balanced)
                 #   - paragraph: True (faster grouping)
-                use_gpu_reader = bool(getattr(reader, "gpu", False))
-                canvas_size = 1600 if use_gpu_reader else 2240
-                paragraph_mode = False if use_gpu_reader else True
-                batch_size = 2 if use_gpu_reader else 1
-                contrast_ths = 0.32 if use_gpu_reader else 0.35
+                use_gpu_reader = easyocr_uses_gpu()
+                if use_gpu_reader:
+                    canvas_size = 1500
+                    paragraph_mode = False
+                    batch_size = 3
+                    contrast_ths = 0.28
+                    adjust_contrast = 0.30
+                    text_threshold = 0.68
+                    low_text = 0.36
+                    link_threshold = 0.36
+                else:
+                    canvas_size = 2240
+                    paragraph_mode = True
+                    batch_size = 1
+                    contrast_ths = 0.35
+                    adjust_contrast = 0.50
+                    text_threshold = 0.72
+                    low_text = 0.42
+                    link_threshold = 0.42
                 res_with_conf = reader.readtext(
                     rgb,
                     detail=1,
                     paragraph=paragraph_mode,
                     contrast_ths=contrast_ths,
-                    adjust_contrast=0.5,     # Keep moderate contrast adjustment
-                    text_threshold=0.72,     # Balanced (was 0.75 - too strict)
-                    low_text=0.42,           # Balanced (was 0.45 - too high)
-                    link_threshold=0.42,     # Balanced (was 0.45 - too high)
+                    adjust_contrast=adjust_contrast,
+                    text_threshold=text_threshold,
+                    low_text=low_text,
+                    link_threshold=link_threshold,
                     canvas_size=canvas_size,
                     mag_ratio=1.0,           # No magnification (faster)
                     width_ths=0.7,           # Default (balanced)
@@ -449,9 +524,13 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                     batch_size=batch_size
                 )
                 if use_gpu_reader:
-                    log_debug("[EASYOCR] GPU path active (canvas=1600, batch=2, paragraph=False)")
+                    log_debug("[EASYOCR] GPU path active (canvas=1500, batch=3, paragraph=False)")
                 else:
-                    log_debug("[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True)")
+                    try:
+                        device_name = get_easyocr_device_name()
+                        log_debug(f"[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True) device={device_name} reader.gpu={getattr(reader, 'gpu', None)}")
+                    except Exception:
+                        log_debug("[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True)")
                 
                 # Extrahiere Text und berechne durchschnittliche Confidence
                 # ROBUST: EasyOCR gibt manchmal nur 2 Werte zurück statt 3

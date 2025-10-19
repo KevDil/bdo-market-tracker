@@ -45,6 +45,8 @@ from utils import (
     correct_item_name,
     is_bdo_window_in_foreground,
     MARKET_SELL_NET_FACTOR,
+    get_preprocessed_frame,
+    set_preprocessed_frame,
 )
 from database import (
     get_cursor,
@@ -117,9 +119,11 @@ class MarketTracker:
         self._fast_preprocess_cooldown = 0
         self._fast_preprocess_recovery = 0
         self._scan_counter = 0
-        self._metrics_refresh_interval = 3
+        self._metrics_refresh_seconds = 5.0
         self._last_metrics_text = ""
         self._last_label_text = ""
+        self._pending_metrics_refresh = True
+        self._last_metrics_refresh_ts: datetime.datetime | None = None
         self._easyocr_uses_gpu = easyocr_uses_gpu()
         self._easyocr_device = get_easyocr_device_name()
         self._burst_source = None
@@ -256,45 +260,109 @@ class MarketTracker:
                 # count down cooldown after each slow run
                 self._fast_preprocess_cooldown = max(0, self._fast_preprocess_cooldown - 1)
 
-            preprocess_start = time.perf_counter()
-            # BALANCED PREPROCESSING: Use adaptive CLAHE but skip denoise
-            # Fast mode was too aggressive and hurt OCR quality
-            proc = preprocess(img, adaptive=True, denoise=False, fast_mode=use_fast_preprocess)
-            preprocess_elapsed = time.perf_counter() - preprocess_start
-            preprocess_time = preprocess_elapsed * 1000
-            if self.debug:
-                log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
+            frame_hash = None
+            try:
+                frame_hash = hashlib.blake2s(img.tobytes(), digest_size=16).hexdigest()
+            except Exception:
+                frame_hash = None
+
+            preprocess_time = 0.0
+            preprocess_cache_hit = False
+            proc = None
+            if frame_hash:
+                cached_proc = get_preprocessed_frame(frame_hash)
+                if cached_proc is not None:
+                    proc = cached_proc
+                    preprocess_cache_hit = True
+                    if self.debug:
+                        log_debug(f"{perf_prefix} Preprocess cache hit (frame)")
+
+            if proc is None:
+                preprocess_start = time.perf_counter()
+                # BALANCED PREPROCESSING: Use adaptive CLAHE but skip denoise
+                # Fast mode was too aggressive and hurt OCR quality
+                proc = preprocess(img, adaptive=True, denoise=False, fast_mode=use_fast_preprocess)
+                preprocess_elapsed = time.perf_counter() - preprocess_start
+                preprocess_time = preprocess_elapsed * 1000
+                if frame_hash:
+                    set_preprocessed_frame(frame_hash, proc)
+                if self.debug:
+                    log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
             if metrics is not None:
                 metrics["preprocess_ms"] = preprocess_time
                 metrics["preprocess_fast_mode"] = use_fast_preprocess
+                metrics["preprocess_cache_hit"] = preprocess_cache_hit
 
             if allow_debug and self.debug:
                 self._write_debug_images(img, proc, context)
 
-            ocr_start = time.perf_counter()
-            # PHASE 2: Multi-Engine OCR with PaddleOCR (primary)
-            # PaddleOCR is faster and more accurate for game UIs
-            text, was_cached, cache_stats = ocr_image_cached(
-                img,
-                method='auto',  # Uses config.OCR_ENGINE (default: paddle)
-                use_roi=True,
-                preprocessed=proc,
-                fast_mode=True,  # Still use fast mode for speed
-            )
-            ocr_elapsed = time.perf_counter() - ocr_start
-            ocr_time = ocr_elapsed * 1000
-            if self.debug:
-                cache_indicator = " [CACHED]" if was_cached else ""
-                log_debug(
-                    f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
-                    f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
+            # First, OCR the label ROI to determine window context.
+            label_text = ""
+            label_roi = detect_window_label_roi(img)
+            label_ms = 0.0
+            if label_roi:
+                label_start = time.perf_counter()
+                label_text, label_cached, label_stats = ocr_image_cached(
+                    img,
+                    method='auto',
+                    use_roi=True,
+                    preprocessed=proc,
+                    fast_mode=use_fast_preprocess,
+                    roi=label_roi,
+                    roi_label="label",
+                    cache_tag="label",
                 )
+                label_ms = (time.perf_counter() - label_start) * 1000
+                if label_text:
+                    self._last_label_text = label_text
+                if metrics is not None:
+                    metrics["label_cache_hit"] = bool(label_cached)
+                    metrics["label_cache_age_s"] = label_stats.get("cache_age")
+                    metrics["label_ms"] = label_ms
+            cached_label = self._last_label_text if not label_text else label_text
+            label_lower = (cached_label or "").lower()
+
+            overview_anchor = bool(
+                re.search(
+                    r"(sales\s+completed|orders\s+completed|items\s+listed)",
+                    label_lower,
+                )
+            )
+            detail_hint = bool(re.search(r"(set\s*price|desired\s*price)", label_lower))
+            detail_window_detected = detail_hint and not overview_anchor
+
+            # Decide if we need the log OCR: only for overview windows or when label is missing.
+            need_log_ocr = not detail_window_detected or not cached_label
+            text = ""
+            ocr_time = 0.0
+            was_cached = False
+            cache_stats = {"hit_rate": 0.0, "cache_size": 0, "cache_age": None}
+            if need_log_ocr:
+                ocr_start = time.perf_counter()
+                text, was_cached, cache_stats = ocr_image_cached(
+                    img,
+                    method='auto',
+                    use_roi=True,
+                    preprocessed=proc,
+                    fast_mode=True,
+                )
+                ocr_elapsed = time.perf_counter() - ocr_start
+                ocr_time = ocr_elapsed * 1000
+                if self.debug:
+                    cache_indicator = " [CACHED]" if was_cached else ""
+                    log_debug(
+                        f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
+                        f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
+                    )
+            else:
+                if self.debug:
+                    log_debug(f"{perf_prefix} Skip log OCR (detail window detected via label)")
+
             if metrics is not None:
                 metrics["ocr_ms"] = ocr_time
                 metrics["ocr_cache_hit"] = bool(was_cached)
-                metrics["ocr_cache_age_s"] = cache_stats.get('cache_age')
-                metrics["ocr_cache_size"] = cache_stats.get('cache_size')
-                metrics["easyocr_device"] = self._easyocr_device
+                metrics["ocr_cache_age_s"] = cache_stats.get("cache_age")
+                metrics["ocr_cache_size"] = cache_stats.get("cache_size")
 
             current_device = get_easyocr_device_name()
             if current_device != self._easyocr_device:
@@ -309,35 +377,59 @@ class MarketTracker:
 
             text_lower = (text or "").lower()
 
-            label_text = ""
-            label_roi = detect_window_label_roi(img)
-            if label_roi:
-                label_text, _, _ = ocr_image_cached(
-                    img,
-                    method='auto',
-                    use_roi=True,
-                    preprocessed=proc,
-                    fast_mode=use_fast_preprocess,
-                    roi=label_roi,
-                    roi_label="label",
-                    cache_tag="label",
-                )
-                if label_text:
-                    self._last_label_text = label_text
-            cached_label = self._last_label_text if not label_text else label_text
-
             metrics_text = ""
-            refresh_metrics = (
-                self._scan_counter <= 1
-                or (self._scan_counter % self._metrics_refresh_interval == 0)
-                or self._request_immediate_rescan > 0
+            overview_anchor = bool(
+                re.search(
+                    r"(sales\s+completed|orders\s+completed|items\s+listed)",
+                    label_lower,
+                )
             )
-            if not re.search(r"(transaction\s+of|placed\s+order|withdrew\s+order|sales\s+completed|orders\s+completed)", text_lower):
+            if not overview_anchor:
+                overview_anchor = bool(
+                    re.search(
+                        r"(sales\s+completed|orders\s+completed)",
+                        text_lower,
+                    )
+                )
+            detail_hint = bool(re.search(r"(set\s*price|desired\s*price)", label_lower))
+            detail_window_detected = detail_hint and not overview_anchor
+            now_dt = datetime.datetime.now()
+            time_since_metrics = None
+            if self._last_metrics_refresh_ts:
+                try:
+                    time_since_metrics = (now_dt - self._last_metrics_refresh_ts).total_seconds()
+                except Exception:
+                    time_since_metrics = None
+            refresh_metrics = False
+            if self._pending_metrics_refresh:
                 refresh_metrics = True
+            elif self._scan_counter <= 1:
+                refresh_metrics = True
+            elif self._request_immediate_rescan > 0:
+                refresh_metrics = True
+            elif detail_hint:
+                refresh_metrics = True
+            elif not overview_anchor:
+                refresh_metrics = True
+            elif (
+                self._metrics_refresh_seconds is not None
+                and (
+                    self._last_metrics_refresh_ts is None
+                    or (
+                        time_since_metrics is not None
+                        and time_since_metrics >= self._metrics_refresh_seconds
+                    )
+                )
+            ):
+                    refresh_metrics = True
+            metrics_refresh_ran = False
+            if detail_window_detected:
+                refresh_metrics = False
+                self._pending_metrics_refresh = True
             if refresh_metrics:
                 metrics_roi = detect_metrics_roi(img)
                 if metrics_roi:
-                    metrics_text, _, _ = ocr_image_cached(
+                    metrics_text, metrics_cached, metrics_stats = ocr_image_cached(
                         img,
                         method='auto',
                         use_roi=True,
@@ -349,7 +441,21 @@ class MarketTracker:
                     )
                     if metrics_text:
                         self._last_metrics_text = metrics_text
+                    metrics_refresh_ran = True
+                    if metrics is not None:
+                        metrics["metrics_cache_hit"] = bool(metrics_cached)
+                        metrics["metrics_cache_size"] = metrics_stats.get("cache_size")
+                        metrics["metrics_cache_age_s"] = metrics_stats.get("cache_age")
+                    self._pending_metrics_refresh = False
+                    self._last_metrics_refresh_ts = now_dt
+                else:
+                    # Retry on next scan if ROI detection failed
+                    self._pending_metrics_refresh = True
+            if metrics is not None:
+                metrics["metrics_refresh"] = metrics_refresh_ran
             cached_metrics = self._last_metrics_text if not metrics_text else metrics_text
+            if detail_window_detected:
+                cached_metrics = ""
 
             combined_parts = []
             if cached_label:
@@ -1646,6 +1752,8 @@ class MarketTracker:
         # Log window transitions
         if self.debug and prev_window != wtype:
             log_debug(f"[WINDOW] Transition: {prev_window} → {wtype}")
+        if prev_window != wtype:
+            self._pending_metrics_refresh = True
         if wtype in ("sell_overview", "buy_overview"):
             self.last_overview = wtype
 

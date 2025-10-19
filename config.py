@@ -203,7 +203,7 @@ ASYNC_WORKER_COUNT = max(1, int(os.getenv('ASYNC_WORKER_COUNT', '1') or '1'))
 # Performance: GPU-Optimierung (Game-Friendly)
 # -----------------------
 # Aktuelle Config (RTX 4070 SUPER):
-#   - GPU_MEMORY_LIMIT = 2048 MB (2GB VRAM für OCR, 10GB für Spiel)
+#   - GPU_MEMORY_LIMIT = 1024 MB (2GB VRAM für OCR, 10GB für Spiel)
 #   - GPU_LOW_PRIORITY = True (Spiel-Rendering hat Vorrang)
 #   - Screenshot-Hash-Cache = 50% Hit-Rate → ~1000ms avg OCR
 #   - Throughput: ~99 scans/minute (GPU cached) vs ~60 scans/min (CPU)
@@ -263,14 +263,14 @@ MAX_ITEM_QUANTITY = 5000
 # Ursache: Spiel und OCR konkurrieren um GPU-Ressourcen
 # Lösungen:
 #   1. USE_GPU = False         → CPU-only (langsamer, aber keine Game-Ruckler)
-#   2. GPU_MEMORY_LIMIT = 2048 → Limitiert VRAM-Nutzung (MB)
+#   2. GPU_MEMORY_LIMIT = 1024 → Limitiert VRAM-Nutzung (MB)
 #   3. GPU_LOW_PRIORITY = True → OCR bekommt niedrige GPU-Priorität
 USE_GPU = get_use_gpu(True)  # ⚠️ Auf True setzen wenn GPU verfügbar 
 
 # GPU-Memory-Limit (MB) - Reduziert VRAM-Nutzung, verhindert Konkurrenz mit Spiel
-# Empfohlen: 2048-4096 MB (2-4 GB) für RTX 4070
+# Empfohlen: 1024-4096 MB (2-4 GB) für RTX 4070
 # None = kein Limit (nutzt soviel wie nötig)
-GPU_MEMORY_LIMIT = 2048  # MB VRAM für OCR
+GPU_MEMORY_LIMIT = 1024  # MB VRAM für OCR
 
 # GPU Low-Priority Mode - OCR bekommt niedrige GPU-Priorität
 # True = Spiel hat Vorrang, OCR läuft im Hintergrund
