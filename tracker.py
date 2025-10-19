@@ -124,6 +124,7 @@ class MarketTracker:
         self._last_label_text = ""
         self._pending_metrics_refresh = True
         self._last_metrics_refresh_ts: datetime.datetime | None = None
+        self._latest_log_text = ""
         self._easyocr_uses_gpu = easyocr_uses_gpu()
         self._easyocr_device = get_easyocr_device_name()
         self._burst_source = None
@@ -363,6 +364,8 @@ class MarketTracker:
                 metrics["ocr_cache_hit"] = bool(was_cached)
                 metrics["ocr_cache_age_s"] = cache_stats.get("cache_age")
                 metrics["ocr_cache_size"] = cache_stats.get("cache_size")
+
+            self._latest_log_text = text or ""
 
             current_device = get_easyocr_device_name()
             if current_device != self._easyocr_device:
@@ -1789,7 +1792,10 @@ class MarketTracker:
             print("DEBUG:", msg)
             log_debug(msg)
 
-        entries = split_text_into_log_entries(full_text)
+        log_text_source = (getattr(self, '_latest_log_text', '') or '').strip()
+        if not log_text_source:
+            log_text_source = full_text
+        entries = split_text_into_log_entries(log_text_source)
         if not entries:
             if self.debug:
                 msg = "no timestamp-entries found; skipping"
