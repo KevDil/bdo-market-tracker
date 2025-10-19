@@ -498,7 +498,7 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                     low_text = 0.36
                     link_threshold = 0.36
                 else:
-                    canvas_size = 2240
+                    canvas_size = 1600
                     paragraph_mode = True
                     batch_size = 1
                     contrast_ths = 0.35
@@ -528,9 +528,9 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                 else:
                     try:
                         device_name = get_easyocr_device_name()
-                        log_debug(f"[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True) device={device_name} reader.gpu={getattr(reader, 'gpu', None)}")
+                        log_debug(f"[EASYOCR] CPU path active (canvas=1600, batch=1, paragraph=True) device={device_name} reader.gpu={getattr(reader, 'gpu', None)}")
                     except Exception:
-                        log_debug("[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True)")
+                        log_debug("[EASYOCR] CPU path active (canvas=1600, batch=1, paragraph=True)")
                 
                 # Extrahiere Text und berechne durchschnittliche Confidence
                 # ROBUST: EasyOCR gibt manchmal nur 2 Werte zurück statt 3
