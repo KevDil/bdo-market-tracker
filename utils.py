@@ -32,6 +32,7 @@ from config import (
     FOCUS_WINDOW_TITLES,
     OCR_ENGINE,
     OCR_FALLBACK_ENABLED,
+    get_debug_mode,
 )
 
 from market_json_manager import (
@@ -47,6 +48,8 @@ from bdo_api_client import get_item_price_range
 # -----------------------
 _screenshot_cache = {}  # {hash: (timestamp, ocr_result, cache_hits)}
 _cache_lock = threading.Lock()
+# Aggregate stats for hit rate tracking
+_cache_totals = {"requests": 0, "hits": 0}
 # Performance optimization: Increased cache parameters for better hit rate
 # Market window changes infrequently, so longer TTL is safe
 CACHE_TTL = 5.0  # Sekunden - Cache-Einträge sind 5s gültig (was 2.0s)
@@ -73,6 +76,8 @@ _OCR_TOKEN_TRANSLATION = str.maketrans({
 
 def log_text(text):
     """Logging mit automatischer Rotation bei 10MB Limit (Performance: verhindert unbegrenztes Wachstum)"""
+    if not get_debug_mode(False):
+        return
     try:
         # Prüfe Dateigröße vor dem Schreiben
         if os.path.exists(LOG_PATH):
@@ -95,6 +100,8 @@ def log_text(text):
 
 def log_debug(message: str):
     """Append a debug line to ocr_log.txt with timestamp (for development diagnostics)."""
+    if not get_debug_mode(False):
+        return
     try:
         ts = datetime.datetime.now().isoformat()
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -167,42 +174,90 @@ def capture_region(region):
         img = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
     return img
 
+def _shape_hw(img) -> tuple[int, int]:
+    if img.ndim == 3:
+        return img.shape[0], img.shape[1]
+    return img.shape
+
+
 def detect_log_roi(img):
     """
-    CRITICAL PERFORMANCE FIX: Erkennt die Transaction-Log-Region (ROI) im Market-Window.
-    Gibt (x, y, w, h) zurück oder None bei Fehler.
-    Die Log-Region ist der untere 50% Bereich - nur dort sind Transaction-Zeilen.
-    
-    PERFORMANCE IMPACT: 50% kleiner → 60-70% schneller OCR (von 2.0s auf ~0.8s)
+    Eingrenzung auf das Benachrichtigungs-Log (roter Bereich in dev-screenshots/regions.png).
+
+    Enthält ausschließlich die Transaktionsmeldungen oberhalb der Tab-Leiste.
     """
     try:
-        if img.ndim == 3:
-            h, w, _ = img.shape
-        else:
-            h, w = img.shape
-        
-        # CRITICAL FIX V2.2: Transactions are in NOTIFICATION area at TOP, not bottom log!
-        # BDO Market Window Layout (CORRECTED):
-        #   Top 25%: TRANSACTION NOTIFICATIONS (timestamps like "2025.10.13 22:06 Transaction...")
-        #   Middle 50%: Item list, metrics (Orders, Collect, Re-list)
-        #   Bottom 25%: Inventory icons
-        # 
-        # MISTAKE in V2.0-V2.1: ROI at 40%-100% cut off transaction notifications!
-        # The notifications are at the TOP (0-25%), not the bottom!
-        # 
-        # NEW STRATEGY: Skip only the very bottom (inventory icons)
-        # Scan 0-65% (top 65%) to include:
-        #   - Transaction notifications (TOP - most important!)
-        #   - Item metrics (MIDDLE)
-        #   - Skip inventory icons (BOTTOM - not needed)
-        roi_y_start = 0  # Start from top (transactions are here!)
-        roi_y_end = int(h * 0.65)  # End at 65% (skip inventory icons)
-        roi_x_start = 0
-        roi_x_end = w
-        
-        return (roi_x_start, roi_y_start, roi_x_end - roi_x_start, roi_y_end - roi_y_start)
+        h, w = _shape_hw(img)
+        y_start = 0
+        y_end = int(h * 0.32)
+        y_end = max(y_start + 20, min(h, y_end))
+        x_start = int(w * 0.25)
+        x_end = w
+        width = x_end - x_start
+        return (x_start, y_start, width, y_end - y_start)
     except Exception:
         return None
+
+
+def detect_window_label_roi(img):
+    """
+    Kleiner Ausschnitt um die Fensterkennung (gelber Bereich: "Orders / Orders Completed" bzw. "Sales Completed").
+    """
+    try:
+        h, w = _shape_hw(img)
+        y_start = int(h * 0.33)
+        y_end = int(h * 0.65)
+        x_start = int(w * 0.28)
+        x_end = int(w * 0.66)
+        y_end = max(y_start + 40, min(h, y_end))
+        x_end = max(x_start + 60, min(w, x_end))
+        return (x_start, y_start, x_end - x_start, y_end - y_start)
+    except Exception:
+        return None
+
+
+def detect_metrics_roi(img):
+    """
+    ROI für die UI-Metriken (grüner Bereich: Item-Zeilen mit Orders/Re-list).
+    """
+    try:
+        h, w = _shape_hw(img)
+        y_start = int(h * 0.33)
+        y_end = int(h * 0.97)
+        x_start = int(w * 0.28)
+        x_end = int(w * 0.96)
+        y_end = max(y_start + 40, min(h, y_end))
+        x_end = max(x_start + 60, min(w, x_end))
+        return (x_start, y_start, x_end - x_start, y_end - y_start)
+    except Exception:
+        return None
+
+
+def easyocr_uses_gpu() -> bool:
+    try:
+        return USE_EASYOCR and reader is not None and bool(getattr(reader, "gpu", False))
+    except Exception:
+        return False
+
+
+def get_easyocr_device_name() -> str:
+    if not USE_EASYOCR or reader is None:
+        return "disabled"
+    try:
+        device_attr = getattr(reader, "device", None)
+        if device_attr:
+            return str(device_attr)
+    except Exception:
+        pass
+    try:
+        if easyocr_uses_gpu():
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.get_device_name(0)
+            return "cuda"
+    except Exception:
+        return "cuda"
+    return "cpu"
 
 def preprocess(img, adaptive=True, denoise=False, fast_mode=False):
     """
@@ -262,7 +317,7 @@ def preprocess(img, adaptive=True, denoise=False, fast_mode=False):
     
     return enhanced
 
-def extract_text(img, use_roi=True, method='auto', fast_mode=True):
+def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi_label=None):
     """
     CRITICAL PERFORMANCE FIX: OCR mit aggressiver ROI und Speed-Optimierung.
     Phase 2: Multi-Engine-Support (PaddleOCR, EasyOCR, Tesseract)
@@ -285,13 +340,18 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True):
     # This is the SINGLE BIGGEST performance improvement
     target_img = img
     roi_applied = False
+    roi_to_use = roi
     if use_roi and img.ndim >= 2:
-        roi = detect_log_roi(img)
-        if roi:
-            x, y, w, h = roi
+        if roi_to_use is None:
+            roi_to_use = detect_log_roi(img)
+        if roi_to_use:
+            x, y, w, h = roi_to_use
             target_img = img[y:y+h, x:x+w]
             roi_applied = True
-            log_debug(f"[ROI] Applied: region=({x},{y},{w},{h}) - scanning only transaction log area")
+            if roi_label:
+                log_debug(f"[ROI-{roi_label}] Applied: region=({x},{y},{w},{h})")
+            else:
+                log_debug(f"[ROI] Applied: region=({x},{y},{w},{h}) - scanning only transaction log area")
     
     result_paddle = ""
     result_easy = ""
@@ -366,23 +426,32 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True):
                 #   - text_threshold: 0.7 → 0.72 (slightly higher, but not too strict)
                 #   - contrast_ths: 0.3 → 0.35 (balanced)
                 #   - paragraph: True (faster grouping)
+                use_gpu_reader = bool(getattr(reader, "gpu", False))
+                canvas_size = 1600 if use_gpu_reader else 2240
+                paragraph_mode = False if use_gpu_reader else True
+                batch_size = 2 if use_gpu_reader else 1
+                contrast_ths = 0.32 if use_gpu_reader else 0.35
                 res_with_conf = reader.readtext(
                     rgb,
                     detail=1,
-                    paragraph=True,          # Faster text grouping
-                    contrast_ths=0.35,       # Balanced (was 0.4 - too high)
+                    paragraph=paragraph_mode,
+                    contrast_ths=contrast_ths,
                     adjust_contrast=0.5,     # Keep moderate contrast adjustment
                     text_threshold=0.72,     # Balanced (was 0.75 - too strict)
                     low_text=0.42,           # Balanced (was 0.45 - too high)
                     link_threshold=0.42,     # Balanced (was 0.45 - too high)
-                    canvas_size=2240,        # Reduced from 2560, increased from 1920 (balanced)
+                    canvas_size=canvas_size,
                     mag_ratio=1.0,           # No magnification (faster)
                     width_ths=0.7,           # Default (balanced)
                     ycenter_ths=0.5,         # Default (balanced)
                     height_ths=0.5,          # Default (balanced)
                     add_margin=0.1,          # Slightly more margin than before (was 0.05)
-                    batch_size=1             # No batching (lower latency)
+                    batch_size=batch_size
                 )
+                if use_gpu_reader:
+                    log_debug("[EASYOCR] GPU path active (canvas=1600, batch=2, paragraph=False)")
+                else:
+                    log_debug("[EASYOCR] CPU path active (canvas=2240, batch=1, paragraph=True)")
                 
                 # Extrahiere Text und berechne durchschnittliche Confidence
                 # ROBUST: EasyOCR gibt manchmal nur 2 Werte zurück statt 3
@@ -487,7 +556,16 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True):
     
     return final_result
 
-def ocr_image_cached(img, method='auto', use_roi=True, preprocessed=None, fast_mode=True):
+def ocr_image_cached(
+    img,
+    method='auto',
+    use_roi=True,
+    preprocessed=None,
+    fast_mode=True,
+    roi=None,
+    roi_label=None,
+    cache_tag=None,
+):
     """
     CRITICAL PERFORMANCE FIX: Run OCR with cache support and fast mode.
     Phase 2: Supports PaddleOCR (default), EasyOCR, and Tesseract.
@@ -496,39 +574,48 @@ def ocr_image_cached(img, method='auto', use_roi=True, preprocessed=None, fast_m
         method: 'auto' (uses config.OCR_ENGINE), 'paddle', 'easyocr', 'tesseract', or 'both'
         fast_mode: Use fast preprocessing and OCR (default True for <1s response)
     """
-    global _screenshot_cache
+    global _screenshot_cache, _cache_totals
 
     # Determine hash for cache lookup (ROI-based when available)
+    roi_to_use = None
     hash_img = img
     if use_roi:
-        roi = detect_log_roi(img)
-        if roi:
-            x, y, w, h = roi
+        roi_to_use = roi if roi is not None else detect_log_roi(img)
+        if roi_to_use:
+            x, y, w, h = roi_to_use
             hash_img = img[y:y+h, x:x+w]
 
     now = time.time()
     try:
-        img_hash = hashlib.md5(hash_img.tobytes()).hexdigest()
+        img_hash = hashlib.blake2s(hash_img.tobytes(), digest_size=16).hexdigest()
     except Exception:
         img_hash = str(now)
+    cache_key = img_hash if not cache_tag else f"{cache_tag}:{img_hash}"
 
     with _cache_lock:
-        entry = _screenshot_cache.get(img_hash)
+        _cache_totals["requests"] += 1
+        entry = _screenshot_cache.get(cache_key)
         if entry:
             cached_time, cached_result, cache_hits = entry
             if now - cached_time < CACHE_TTL:
-                _screenshot_cache[img_hash] = (cached_time, cached_result, cache_hits + 1)
+                _screenshot_cache[cache_key] = (cached_time, cached_result, cache_hits + 1)
+                _cache_totals["hits"] += 1
+                hit_rate = (
+                    (_cache_totals["hits"] / _cache_totals["requests"]) * 100
+                    if _cache_totals["requests"]
+                    else 0.0
+                )
                 cache_stats = {
                     'cache_hit': True,
                     'cache_age': now - cached_time,
                     'cache_hits': cache_hits + 1,
                     'cache_size': len(_screenshot_cache),
-                    'hit_rate': 0.0,
+                    'hit_rate': hit_rate,
                 }
-                log_debug(f"[CACHE HIT] Hash={img_hash[:8]}... age={cache_stats['cache_age']:.2f}s hits={cache_stats['cache_hits']}")
+                log_debug(f"[CACHE HIT] Key={cache_key[:8]}... age={cache_stats['cache_age']:.2f}s hits={cache_stats['cache_hits']}")
                 return cached_result, True, cache_stats
             # Expired entry → remove to allow refresh
-            del _screenshot_cache[img_hash]
+            del _screenshot_cache[cache_key]
 
     # Cache miss: perform preprocessing/OCR outside of cache lock
     if preprocessed is None:
@@ -537,23 +624,35 @@ def ocr_image_cached(img, method='auto', use_roi=True, preprocessed=None, fast_m
         preprocessed = preprocess(img, adaptive=True, denoise=False, fast_mode=False)
 
     # BALANCED: Use balanced OCR parameters (updated in extract_text)
-    result = extract_text(preprocessed, use_roi=use_roi, method=method, fast_mode=fast_mode)
+    result = extract_text(
+        preprocessed,
+        use_roi=use_roi,
+        method=method,
+        fast_mode=fast_mode,
+        roi=roi_to_use,
+        roi_label=roi_label,
+    )
 
     with _cache_lock:
-        _screenshot_cache[img_hash] = (now, result, 0)
+        _screenshot_cache[cache_key] = (now, result, 0)
         if len(_screenshot_cache) > MAX_CACHE_SIZE:
             oldest_hash = min(_screenshot_cache.items(), key=lambda x: x[1][0])[0]
             del _screenshot_cache[oldest_hash]
             log_debug(f"[CACHE] Evicted oldest entry (cache size: {len(_screenshot_cache)})")
+        hit_rate = (
+            (_cache_totals["hits"] / _cache_totals["requests"]) * 100
+            if _cache_totals["requests"]
+            else 0.0
+        )
         cache_stats = {
             'cache_hit': False,
             'cache_age': 0,
             'cache_hits': 0,
             'cache_size': len(_screenshot_cache),
-            'hit_rate': 0.0,
+            'hit_rate': hit_rate,
         }
 
-    log_debug(f"[CACHE MISS] Hash={img_hash[:8]}... cached new result (size={len(result)} chars)")
+    log_debug(f"[CACHE MISS] Key={cache_key[:8]}... cached new result (size={len(result)} chars)")
     return result, False, cache_stats
 
 
@@ -930,18 +1029,11 @@ def detect_tab_from_text(text):
     return "sell" if last_sell > last_buy else "buy"
 
 def detect_window_type(ocr_text: str) -> str:
-    """Erkennt eines der 4 Marktfenster anhand von OCR-Keywords (tolerant gegenüber Newlines/OCR-Fehlern).
-    Rückgabe: 'sell_overview' | 'buy_overview' | 'sell_item' | 'buy_item' | 'unknown'
-    Regeln:
-    - sell_overview: 'Sales Completed' (Whitespace/Zeilenumbrüche tolerant, Completed/Complete/Completion akzeptiert)
-    - buy_overview: 'Orders Completed' (dito)
-    - sell_item: BEIDE 'Set Price' UND 'Register Quantity' (Whitespace tolerant)
-    - buy_item: BEIDE 'Desired Price' UND 'Desired Amount' (Whitespace tolerant)
-    """
+    """Erkennt eines der 4 Marktfenster anhand der aktuell relevanten Schlüsselwörter."""
     if not ocr_text:
         return "unknown"
-    s = ocr_text.lower()
-    # normalisiere Whitespace, damit "sales\ncompleted" erkannt wird
+
+    s = ocr_text.lower().replace("：", ":")
     s_norm = re.sub(r"\s+", " ", s)
 
     def _normalize_token_text_local(text: str) -> str:
@@ -952,78 +1044,41 @@ def detect_window_type(ocr_text: str) -> str:
         normalized = re.sub(r'\s+', ' ', normalized).strip()
         return normalized
 
-    s_token_norm = _normalize_token_text_local(s_norm)
+    normalized_text = _normalize_token_text_local(s_norm)
+    normalized_tokens = set(tok for tok in normalized_text.split() if tok)
+    condensed_text = normalized_text.replace(" ", "")
 
-    sell_tokens = ["sell", "set price", "register quantity", "total price"]
-    buy_tokens = ["purchase", "desired price", "desired amount", "total cost"]
-    sell_tokens_norm = [_normalize_token_text_local(tok) for tok in sell_tokens]
-    buy_tokens_norm = [_normalize_token_text_local(tok) for tok in buy_tokens]
+    def has_phrase(phrase: str) -> bool:
+        norm = _normalize_token_text_local(phrase)
+        if not norm:
+            return False
+        if " " in norm:
+            if norm in normalized_text:
+                return True
+            return norm.replace(" ", "") in condensed_text
+        return norm in normalized_tokens
 
-    def _count_matches(token_norms: list[str]) -> int:
-        return sum(1 for tok in token_norms if tok and tok in s_token_norm)
-
-    if sell_tokens_norm and sell_tokens_norm[0] in s_token_norm:
-        if _count_matches(sell_tokens_norm) >= 3:
-            return "sell_item"
-
-    if buy_tokens_norm and buy_tokens_norm[0] in s_token_norm:
-        if _count_matches(buy_tokens_norm) >= 3:
-            return "buy_item"
-
-    def has_all(substrings):
-        return all(sub.lower() in s_norm for sub in substrings)
-
-    # Detail-Fenster zuerst prüfen (Legacy-Heuristik für vollständige OCR)
-    if has_all(["set price", "register quantity"]):
+    # Detail-Fenster (Item-Dialoge)
+    if has_phrase("set price") and has_phrase("register quantity"):
         return "sell_item"
-    if has_all(["desired price", "desired amount"]):
+    if has_phrase("desired price") and has_phrase("desired amount"):
         return "buy_item"
 
-    sells_detail_tokens = [
-        ("set price", "total price"),
-        ("set price", "base price"),
-        ("set price", "min"),
-        ("set price", "max"),
-    ]
-    buys_detail_tokens = [
-        ("desired price", "total price"),
-        ("desired price", "desired amount"),
-    ]
-    for token_pair in sells_detail_tokens:
-        if all(tok in s_norm for tok in token_pair):
-            return "sell_item"
-    for token_pair in buys_detail_tokens:
-        if all(tok in s_norm for tok in token_pair):
-            return "buy_item"
-
-    # Overview-Fenster (fuzzy Completed-Erkennung)
-    # comp(?:l|1|i)et(?:e|ed|ion)s? → completed/complete/completion
-    # pl?et(?:e|ed|ion)s? → plet/pleted (OCR-Fehler wenn 'com' verschwindet)
-    sell_pat = re.compile(r"sa?les?\s+(?:comp(?:l|1|i)et(?:e|ed|ion)s?|pl?et(?:e|ed|ion)s?)", re.IGNORECASE)
-    buy_pat = re.compile(r"orders?\s+(?:comp(?:l|1|i)et(?:e|ed|ion)s?|pl?et(?:e|ed|ion)s?)", re.IGNORECASE)
-    
-    # WICHTIG: Die Screen-Region erfasst das KOMPLETTE Marktfenster!
-    # Es ist IMMER nur EIN Tab sichtbar (entweder Buy ODER Sell, nie beide gleichzeitig)
-    # "Sales Completed" sichtbar → 100% sell_overview (Sell-Tab ist aktiv)
-    # "Orders Completed" sichtbar → 100% buy_overview (Buy-Tab ist aktiv)
-    
-    # Straightforward detection: Nur ein Pattern kann matchen
-    if sell_pat.search(s_norm):
+    # Overview-Fenster
+    if has_phrase("items listed") and has_phrase("sales completed"):
         return "sell_overview"
-    if buy_pat.search(s_norm):
+    if has_phrase("orders completed") and (has_phrase("orders") or has_phrase("order")):
         return "buy_overview"
-    
-    # Fallback-Heuristik: Header fehlt (cropping), aber Log-Inhalt vorhanden
-    # Wenn es Timestamps gibt und typische Log-Keywords, werten wir als Overview
+
+    # Fallback-Heuristik: Timestamps + typische Anker im Log
     try:
         has_ts = bool(find_all_timestamps(ocr_text))
     except Exception:
         has_ts = False
     if has_ts:
-        # Buy-Anchor zuerst (purchased/bought/order placed)
         if re.search(r"\b(placed\s+order|purchased?|bought|withdrew\s+order)\b", s_norm, re.IGNORECASE):
             return "buy_overview"
-        # Sell-Anchor: listed/relisted
-        if re.search(r"\b(listed|relisted)\b", s_norm, re.IGNORECASE):
+        if re.search(r"\b(items?\s+listed|listed|relisted|sales?\s+completed)\b", s_norm, re.IGNORECASE):
             return "sell_overview"
+
     return "unknown"

@@ -151,7 +151,7 @@ def set_use_gpu(value: bool) -> None:
     _set_bool_setting("use_gpu", value)
 
 
-def get_debug_mode(default: bool = True) -> bool:
+def get_debug_mode(default: bool = False) -> bool:
     """Return the persisted debug flag."""
     return _get_bool_setting("debug_mode", default)
 

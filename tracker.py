@@ -7,6 +7,7 @@ import re
 import json
 import cv2
 import hashlib
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from functools import lru_cache
@@ -35,6 +36,11 @@ from utils import (
     log_debug,
     normalize_numeric_str,
     ocr_image_cached,
+    detect_log_roi,
+    detect_window_label_roi,
+    detect_metrics_roi,
+    easyocr_uses_gpu,
+    get_easyocr_device_name,
     check_price_plausibility,
     correct_item_name,
     is_bdo_window_in_foreground,
@@ -85,7 +91,7 @@ _HISTORICAL_VALUE_DUP_TOLERANCE_SECONDS = 90  # 1,5 Minuten Puffer für Scroll-D
 class MarketTracker:
     def __init__(self, region=DEFAULT_REGION, poll_interval=POLL_INTERVAL, debug=None):
         if debug is None:
-            debug = get_debug_mode(True)
+            debug = get_debug_mode(False)
         self.debug = bool(debug)
         self.region = region
         # Game-Friendly Mode: Längeres Poll-Interval bei GPU-Modus reduziert Ruckler
@@ -106,6 +112,19 @@ class MarketTracker:
         self.running = False
         self.lock = threading.Lock()
         self._debug_image_lock = threading.Lock()
+        self._use_fast_preprocess = USE_GPU
+        self._fast_preprocess_failures = 0
+        self._fast_preprocess_cooldown = 0
+        self._fast_preprocess_recovery = 0
+        self._scan_counter = 0
+        self._metrics_refresh_interval = 3
+        self._last_metrics_text = ""
+        self._last_label_text = ""
+        self._easyocr_uses_gpu = easyocr_uses_gpu()
+        self._easyocr_device = get_easyocr_device_name()
+        self._burst_source = None
+        if self.debug:
+            log_debug(f"[INIT] EasyOCR device: {self._easyocr_device}")
         # bereits gesehene transaction-signaturen (session), um doppelte Verarbeitung zu verhindern
         # Performance-Optimierung: Deque statt Set verhindert unbegrenztes Wachstum
         from collections import deque
@@ -232,16 +251,22 @@ class MarketTracker:
         total_start = time.perf_counter()
 
         try:
+            use_fast_preprocess = self._use_fast_preprocess and self._fast_preprocess_cooldown <= 0
+            if not use_fast_preprocess and self._fast_preprocess_cooldown > 0:
+                # count down cooldown after each slow run
+                self._fast_preprocess_cooldown = max(0, self._fast_preprocess_cooldown - 1)
+
             preprocess_start = time.perf_counter()
             # BALANCED PREPROCESSING: Use adaptive CLAHE but skip denoise
             # Fast mode was too aggressive and hurt OCR quality
-            proc = preprocess(img, adaptive=True, denoise=False, fast_mode=False)
+            proc = preprocess(img, adaptive=True, denoise=False, fast_mode=use_fast_preprocess)
             preprocess_elapsed = time.perf_counter() - preprocess_start
             preprocess_time = preprocess_elapsed * 1000
             if self.debug:
                 log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
             if metrics is not None:
                 metrics["preprocess_ms"] = preprocess_time
+                metrics["preprocess_fast_mode"] = use_fast_preprocess
 
             if allow_debug and self.debug:
                 self._write_debug_images(img, proc, context)
@@ -269,13 +294,75 @@ class MarketTracker:
                 metrics["ocr_cache_hit"] = bool(was_cached)
                 metrics["ocr_cache_age_s"] = cache_stats.get('cache_age')
                 metrics["ocr_cache_size"] = cache_stats.get('cache_size')
+                metrics["easyocr_device"] = self._easyocr_device
 
-            log_text(text)
+            current_device = get_easyocr_device_name()
+            if current_device != self._easyocr_device:
+                self._easyocr_device = current_device
+                self._easyocr_uses_gpu = easyocr_uses_gpu()
+                if metrics is not None:
+                    metrics["easyocr_device"] = self._easyocr_device
+                if self.debug:
+                    log_debug(f"[EASYOCR] Device updated -> {self._easyocr_device}")
+
+            self._scan_counter += 1
+
+            label_text = ""
+            label_roi = detect_window_label_roi(img)
+            if label_roi:
+                label_text, _, _ = ocr_image_cached(
+                    img,
+                    method='auto',
+                    use_roi=True,
+                    preprocessed=proc,
+                    fast_mode=use_fast_preprocess,
+                    roi=label_roi,
+                    roi_label="label",
+                    cache_tag="label",
+                )
+                if label_text:
+                    self._last_label_text = label_text
+            cached_label = self._last_label_text if not label_text else label_text
+
+            metrics_text = ""
+            refresh_metrics = (
+                self._scan_counter <= 1
+                or (self._scan_counter % self._metrics_refresh_interval == 0)
+                or self._request_immediate_rescan > 0
+            )
+            if refresh_metrics:
+                metrics_roi = detect_metrics_roi(img)
+                if metrics_roi:
+                    metrics_text, _, _ = ocr_image_cached(
+                        img,
+                        method='auto',
+                        use_roi=True,
+                        preprocessed=proc,
+                        fast_mode=use_fast_preprocess,
+                        roi=metrics_roi,
+                        roi_label="metrics",
+                        cache_tag="metrics",
+                    )
+                    if metrics_text:
+                        self._last_metrics_text = metrics_text
+            cached_metrics = self._last_metrics_text if not metrics_text else metrics_text
+
+            combined_parts = []
+            if cached_label:
+                combined_parts.append(cached_label)
+            if text:
+                combined_parts.append(text)
+            if cached_metrics:
+                combined_parts.append(cached_metrics)
+            full_text = "\n".join(part for part in combined_parts if part)
+
+            log_text(full_text)
             if self.debug and context != 'async':
-                print(f"OCR ({context}):", text[:700].replace("\n", " "))
+                preview = full_text[:700].replace("\n", " ") if full_text else ""
+                print(f"OCR ({context}):", preview)
 
             process_start = time.perf_counter()
-            self.process_ocr_text(text)
+            self.process_ocr_text(full_text)
             process_elapsed = time.perf_counter() - process_start
             process_time = process_elapsed * 1000
             total_elapsed = time.perf_counter() - total_start
@@ -288,6 +375,32 @@ class MarketTracker:
                 metrics["postprocess_ms"] = process_time
                 metrics["total_ms"] = total_time
                 metrics["ocr_text_length"] = len(text) if text else 0
+                metrics["label_text_length"] = len(cached_label) if cached_label else 0
+                metrics["metrics_text_length"] = len(cached_metrics) if cached_metrics else 0
+
+            text_length = len(text) if text else 0
+            if use_fast_preprocess:
+                if not was_cached and text_length < 20:
+                    self._fast_preprocess_failures += 1
+                    if self._fast_preprocess_failures >= 2:
+                        self._use_fast_preprocess = False
+                        self._fast_preprocess_cooldown = 5
+                        self._fast_preprocess_recovery = 0
+                        if self.debug:
+                            log_debug("[PERF] Fast preprocess disabled due to short OCR result")
+                else:
+                    self._fast_preprocess_failures = 0
+                    self._fast_preprocess_recovery = 0
+            else:
+                if text_length > 40:
+                    self._fast_preprocess_recovery += 1
+                else:
+                    self._fast_preprocess_recovery = 0
+                if self._fast_preprocess_cooldown == 0 and self._fast_preprocess_recovery >= 3:
+                    self._use_fast_preprocess = True
+                    self._fast_preprocess_failures = 0
+                    if self.debug:
+                        log_debug("[PERF] Fast preprocess re-enabled after stable scans")
 
             if self.error_count > 0:
                 self.error_count = max(0, self.error_count - 1)
@@ -301,28 +414,76 @@ class MarketTracker:
             self.last_error_message = f"Processing error: {exc}"
             if metrics is not None:
                 metrics.setdefault("error", str(exc))
+            # fallback to balanced preprocessing after errors
+            self._use_fast_preprocess = False
+            self._fast_preprocess_cooldown = max(self._fast_preprocess_cooldown, 5)
+            self._fast_preprocess_recovery = 0
             return None
 
     def _write_debug_images(self, original_bgr, processed_img, _context: str) -> None:
         """Persist the latest debug screenshots so investigation always has fresh material."""
-        latest_orig = "debug_orig.png"
-        latest_proc = "debug_proc.png"
+        debug_dir = Path("debug")
+        try:
+            debug_dir.mkdir(exist_ok=True)
+        except Exception:
+            pass
+
+        latest_orig = debug_dir / "debug_orig.png"
+        latest_proc = debug_dir / "debug_proc.png"
+
+        def _save_image(arr, path, color=True):
+            if arr is None or arr.size == 0:
+                return
+            img = arr
+            if color and arr.ndim == 3:
+                img = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+            try:
+                Image.fromarray(img).save(path)
+            except Exception:
+                pass
+
+        def _save_roi_images(tag: str, detector):
+            try:
+                roi = detector(original_bgr)
+            except Exception:
+                roi = None
+            if not roi:
+                return
+            x, y, w, h = roi
+            if w <= 0 or h <= 0:
+                return
+            roi_bgr = original_bgr[y:y+h, x:x+w]
+            roi_proc = None
+            try:
+                roi_proc = processed_img[y:y+h, x:x+w]
+            except Exception:
+                roi_proc = None
+            _save_image(roi_bgr, debug_dir / f"debug_{tag}_orig.png", color=True)
+            if roi_proc is not None and roi_proc.size > 0:
+                _save_image(roi_proc, debug_dir / f"debug_{tag}_proc.png", color=False)
 
         with self._debug_image_lock:
             try:
-                Image.fromarray(cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)).save(latest_orig)
-                Image.fromarray(processed_img).save(latest_proc)
+                _save_image(original_bgr, latest_orig, color=True)
+                _save_image(processed_img, latest_proc, color=False)
+                _save_roi_images("log", detect_log_roi)
+                _save_roi_images("label", detect_window_label_roi)
+                _save_roi_images("metrics", detect_metrics_roi)
             except Exception as save_err:
                 log_debug(f"[DEBUG] Failed to write debug images: {save_err}")
 
     def _get_next_sleep_interval(self):
         now = datetime.datetime.now()
         if self._burst_until and now < self._burst_until:
-            sleep_iv = 0.08 if self._burst_fast_scans > 0 else self.poll_interval_burst
+            if self._burst_source == 'item_window':
+                sleep_iv = 0.08 if self._burst_fast_scans > 0 else self.poll_interval_burst
+            else:
+                sleep_iv = self.poll_interval
         else:
             sleep_iv = self.poll_interval
             if self._burst_until and now >= self._burst_until:
                 self._burst_until = None
+                self._burst_source = None
                 if self.debug:
                     log_debug("burst scan window expired")
         if sleep_iv <= 0.08 and self._burst_fast_scans > 0:
@@ -1498,6 +1659,7 @@ class MarketTracker:
             # ins Overview-Fenster mit hoher Wahrscheinlichkeit zu erwischen.
             if wtype in ("buy_item", "sell_item"):
                 self._burst_until = now + datetime.timedelta(seconds=4.0)
+                self._burst_source = 'item_window'
                 # schedule multiple immediate fast scans
                 self._burst_fast_scans = max(self._burst_fast_scans, 5)
                 # also request immediate re-scans from single_scan (no wait)
@@ -1531,6 +1693,7 @@ class MarketTracker:
             # AGGRESSIVE: More scans, longer burst window
             self._burst_fast_scans = max(self._burst_fast_scans, 15)  # Was 8, now 15 (1.2s of fast scans)
             self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=3.0))  # Was 4.5s, now 3s
+            self._burst_source = 'item_window'
             # Immediate re-scans (no sleep between scans)
             self._request_immediate_rescan = max(self._request_immediate_rescan, 5)  # Was 3, now 5
             if self.debug:
@@ -3376,6 +3539,7 @@ class MarketTracker:
                         # only (re)schedule if not already within an active burst window
                         if not self._burst_until or now2 >= self._burst_until:
                             self._burst_until = now2 + datetime.timedelta(seconds=3.5)
+                            self._burst_source = 'overview_followup'
                             self._burst_fast_scans = max(self._burst_fast_scans, 6)
                             self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                             if self.debug:
@@ -3395,6 +3559,7 @@ class MarketTracker:
                         now2 = datetime.datetime.now()
                         if not self._burst_until or now2 >= self._burst_until:
                             self._burst_until = now2 + datetime.timedelta(seconds=3.5)
+                            self._burst_source = 'overview_followup'
                             self._burst_fast_scans = max(self._burst_fast_scans, 6)
                             self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                             if self.debug:
@@ -3806,6 +3971,7 @@ class MarketTracker:
                         if not self._burst_until or now2 >= self._burst_until:
                             burst_seconds = 3.0 if wtype == 'buy_overview' else 2.5
                             self._burst_until = now2 + datetime.timedelta(seconds=burst_seconds)
+                            self._burst_source = 'overview_followup'
                         self._burst_fast_scans = max(self._burst_fast_scans, 6 if wtype == 'buy_overview' else 4)
                         self._request_immediate_rescan = max(self._request_immediate_rescan, 3 if wtype == 'buy_overview' else 2)
                         if self.debug:
@@ -3828,6 +3994,7 @@ class MarketTracker:
                         now2 = datetime.datetime.now()
                         if not self._burst_until or now2 >= self._burst_until:
                             self._burst_until = now2 + datetime.timedelta(seconds=3.5)
+                            self._burst_source = 'overview_followup'
                             self._burst_fast_scans = max(self._burst_fast_scans, 6)
                             self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                             if self.debug:
@@ -3845,6 +4012,7 @@ class MarketTracker:
                         now2 = datetime.datetime.now()
                         if not self._burst_until or now2 >= self._burst_until:
                             self._burst_until = now2 + datetime.timedelta(seconds=3.5)
+                            self._burst_source = 'overview_followup'
                             self._burst_fast_scans = max(self._burst_fast_scans, 6)
                             self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                             if self.debug:
