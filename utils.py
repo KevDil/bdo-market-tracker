@@ -191,12 +191,12 @@ def detect_log_roi(img):
         # The notifications are at the TOP (0-25%), not the bottom!
         # 
         # NEW STRATEGY: Skip only the very bottom (inventory icons)
-        # Scan 0-75% (top 75%) to include:
+        # Scan 0-65% (top 65%) to include:
         #   - Transaction notifications (TOP - most important!)
         #   - Item metrics (MIDDLE)
         #   - Skip inventory icons (BOTTOM - not needed)
         roi_y_start = 0  # Start from top (transactions are here!)
-        roi_y_end = int(h * 0.75)  # End at 75% (skip inventory icons)
+        roi_y_end = int(h * 0.65)  # End at 65% (skip inventory icons)
         roi_x_start = 0
         roi_x_end = w
         

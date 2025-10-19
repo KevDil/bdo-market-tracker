@@ -4,6 +4,8 @@ import time
 from tkinter import messagebox, ttk
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import datetime
 from utils import log_debug 
 import torch
@@ -429,16 +431,73 @@ def start_gui():
         button_frame.pack(fill="x", padx=12, pady=(0, 12))
 
         def show_price_plot():
-            plt.figure(figsize=(10, 5))
-            for t in df['transaction_type'].dropna().unique():
-                sub = df[df['transaction_type'] == t]
-                plt.plot(sub['timestamp'], sub['unit_price'], marker='o', label=t.upper())
-            plt.title("Stückpreisverlauf")
-            plt.xlabel("Zeit")
-            plt.ylabel("Preis pro Einheit (Silver)")
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
+            # Replaced original large standalone matplotlib plot with a compact
+            # inline summary window (min/max/avg/median, sparkline, recent values)
+            # — it's more useful for quick inspection and non-blocking in the GUI.
+            # Compact price summary + sparkline embedded in a Toplevel window
+            unit_series = df['unit_price'].dropna()
+            if unit_series.empty:
+                messagebox.showinfo("Preisverlauf", "Keine gültigen Stückpreise zum Anzeigen.")
+                return
+
+            min_v = unit_series.min()
+            max_v = unit_series.max()
+            mean_v = unit_series.mean()
+            median_v = unit_series.median()
+            last_vals = (
+                df[['timestamp', 'unit_price']]
+                .dropna()
+                .sort_values('timestamp')
+                .tail(10)
+            )
+
+            win = tk.Toplevel(root)
+            win.title("Preisübersicht")
+            win.geometry("720x360")
+            try:
+                win.iconbitmap('config/icon.ico')
+            except tk.TclError:
+                pass
+
+            summary_frame = tk.Frame(win)
+            summary_frame.pack(fill="x", padx=12, pady=8)
+            tk.Label(summary_frame, text=f"Anzahl Werte: {len(unit_series)}").grid(row=0, column=0, sticky="w")
+            tk.Label(summary_frame, text=f"Min: {int(round(min_v)):,} Silver").grid(row=0, column=1, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Max: {int(round(max_v)):,} Silver").grid(row=0, column=2, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Ø: {int(round(mean_v)):,} Silver").grid(row=0, column=3, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Median: {int(round(median_v)):,} Silver").grid(row=0, column=4, sticky="w", padx=12)
+
+            plot_frame = tk.Frame(win)
+            plot_frame.pack(fill="x", padx=12)
+            fig = Figure(figsize=(6, 2), dpi=100)
+            ax = fig.add_subplot(111)
+            timestamps = pd.to_datetime(df['timestamp'])
+            ax.plot(timestamps, df['unit_price'], marker='o', linewidth=1)
+            ax.set_title("Stückpreis (Sparkline)")
+            ax.set_ylabel("Silver")
+            ax.get_xaxis().set_visible(False)
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+
+            recent_frame = tk.Frame(win)
+            recent_frame.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+            cols = ("time", "price")
+            tree = ttk.Treeview(recent_frame, columns=cols, show="headings", height=6)
+            tree.heading("time", text="Zeit")
+            tree.heading("price", text="Preis/Einheit")
+            tree.column("time", width=180)
+            tree.column("price", width=120, anchor="e")
+            tree.pack(side="left", fill="both", expand=True)
+            vsb = ttk.Scrollbar(recent_frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=vsb.set)
+            vsb.pack(side="right", fill="y")
+
+            for _, r in last_vals.iterrows():
+                t = pd.to_datetime(r['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+                p = int(round(r['unit_price']))
+                tree.insert("", "end", values=(t, f"{p:,}"))
 
         ttk.Button(button_frame, text="Preisverlauf anzeigen", command=show_price_plot).pack(side="left")
         ttk.Button(button_frame, text="Fenster schließen", command=result_window.destroy).pack(side="right")
@@ -608,19 +667,73 @@ def start_gui():
         button_frame.pack(fill="x", padx=12, pady=(0, 12))
 
         def show_price_plot():
-            plt.figure(figsize=(10, 5))
-            for t in df['transaction_type'].dropna().unique():
-                sub = df[df['transaction_type'] == t]
-                plt.plot(sub['timestamp'], sub['unit_price'], marker='o', label=t.upper())
-            plt.title("Stückpreisverlauf")
-            plt.xlabel("Zeit")
-            plt.ylabel("Preis pro Einheit (Silver)")
-            plt.legend()
-            plt.tight_layout()
-            plt.show()
+            # Compact price summary + sparkline embedded in a Toplevel window
+            unit_series = df['unit_price'].dropna()
+            if unit_series.empty:
+                messagebox.showinfo("Preisverlauf", "Keine gültigen Stückpreise zum Anzeigen.")
+                return
 
-        tk.Button(button_frame, text="Preisverlauf anzeigen", command=show_price_plot).pack(side="left")
-        tk.Button(button_frame, text="Fenster schließen", command=result_window.destroy).pack(side="right")
+            min_v = unit_series.min()
+            max_v = unit_series.max()
+            mean_v = unit_series.mean()
+            median_v = unit_series.median()
+            last_vals = (
+                df[['timestamp', 'unit_price']]
+                .dropna()
+                .sort_values('timestamp')
+                .tail(10)
+            )
+
+            win = tk.Toplevel(root)
+            win.title("Preisübersicht")
+            win.geometry("720x360")
+            try:
+                win.iconbitmap('config/icon.ico')
+            except tk.TclError:
+                pass
+
+            summary_frame = tk.Frame(win)
+            summary_frame.pack(fill="x", padx=12, pady=8)
+            tk.Label(summary_frame, text=f"Anzahl Werte: {len(unit_series)}").grid(row=0, column=0, sticky="w")
+            tk.Label(summary_frame, text=f"Min: {int(round(min_v)):,} Silver").grid(row=0, column=1, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Max: {int(round(max_v)):,} Silver").grid(row=0, column=2, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Ø: {int(round(mean_v)):,} Silver").grid(row=0, column=3, sticky="w", padx=12)
+            tk.Label(summary_frame, text=f"Median: {int(round(median_v)):,} Silver").grid(row=0, column=4, sticky="w", padx=12)
+
+            plot_frame = tk.Frame(win)
+            plot_frame.pack(fill="x", padx=12)
+            fig = Figure(figsize=(6, 2), dpi=100)
+            ax = fig.add_subplot(111)
+            timestamps = pd.to_datetime(df['timestamp'])
+            ax.plot(timestamps, df['unit_price'], marker='o', linewidth=1)
+            ax.set_title("Stückpreis (Sparkline)")
+            ax.set_ylabel("Silver")
+            ax.get_xaxis().set_visible(False)
+            fig.tight_layout()
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill="both", expand=True)
+
+            recent_frame = tk.Frame(win)
+            recent_frame.pack(fill="both", expand=True, padx=12, pady=(8, 12))
+            cols = ("time", "price")
+            tree = ttk.Treeview(recent_frame, columns=cols, show="headings", height=6)
+            tree.heading("time", text="Zeit")
+            tree.heading("price", text="Preis/Einheit")
+            tree.column("time", width=180)
+            tree.column("price", width=120, anchor="e")
+            tree.pack(side="left", fill="both", expand=True)
+            vsb = ttk.Scrollbar(recent_frame, orient="vertical", command=tree.yview)
+            tree.configure(yscrollcommand=vsb.set)
+            vsb.pack(side="right", fill="y")
+
+            for _, r in last_vals.iterrows():
+                t = pd.to_datetime(r['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
+                p = int(round(r['unit_price']))
+                tree.insert("", "end", values=(t, f"{p:,}"))
+
+        ttk.Button(button_frame, text="Preisverlauf anzeigen", command=show_price_plot).pack(side="left")
+        ttk.Button(button_frame, text="Fenster schließen", command=result_window.destroy).pack(side="right")
 
     def on_close():
         try:

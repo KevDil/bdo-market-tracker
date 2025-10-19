@@ -17,7 +17,7 @@ pytesseract.pytesseract.tesseract_cmd = TESS_PATH
 # PaddleOCR: Zu langsam (5-6s pro Scan) -> Queue Latency Probleme
 # EasyOCR: Schneller (~400-700ms) und stabiler für BDO
 # Tesseract: Final fallback (system-level)
-OCR_ENGINE = 'easyocr'  # Beste Performance für BDO (PaddleOCR zu langsam)
+OCR_ENGINE = 'paddleocr'  # Beste Performance für BDO (PaddleOCR zu langsam)
 OCR_FALLBACK_ENABLED = False  # Fallback bei Bedarf
 
 # Legacy compatibility

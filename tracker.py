@@ -70,11 +70,11 @@ _COMMA_PATTERN = re.compile(r',')
 _TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{price}"
 _SILVER_WORD_PATTERN = r"s\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]"
 _PRICE_HINT_PATTERN = re.compile(
-    rf"(?:worth|for)\s+([0-9OolI\|,\.\s]{{3,}})\s+{_SILVER_WORD_PATTERN}",
+    rf"(?:worth|for)\s+([0-9OolI\|,\.\s_]{{3,}})\s+{_SILVER_WORD_PATTERN}",
     re.IGNORECASE,
 )
 _GENERIC_SILVER_PATTERN = re.compile(
-    rf"([0-9OolI\|,\.\s]{{3,}})\s+{_SILVER_WORD_PATTERN}",
+    rf"([0-9OolI\|,\.\s_]{{3,}})\s+{_SILVER_WORD_PATTERN}",
     re.IGNORECASE,
 )
 _HISTORICAL_VALUE_DUP_TOLERANCE_SECONDS = 90  # 1,5 Minuten Puffer für Scroll-Duplikate
@@ -416,6 +416,19 @@ class MarketTracker:
         if not match_obj:
             return (None, None)
         raw_value = match_obj.group(1)
+        raw_compact = raw_value.replace(' ', '')
+        has_placeholder = '_' in raw_compact
+        trimmed = raw_value.strip()
+        ends_with_digit = bool(trimmed) and trimmed[-1] in "0123456789OolI|"
+        hint_mode = 'suffix'
+        if has_placeholder or not ends_with_digit:
+            hint_mode = 'prefix'
+        placeholder_count = raw_value.count('_')
+        if isinstance(entry, dict):
+            entry['_price_hint_mode'] = hint_mode
+            entry['_price_hint_placeholders'] = placeholder_count
+            entry['_price_hint_raw'] = raw_value
+
         value = normalize_numeric_str(raw_value)
         if value is None or value <= 0:
             return (None, None)
@@ -447,16 +460,37 @@ class MarketTracker:
         base_price = self._get_base_price(item_name)
         hint_value, hint_digits = self._extract_price_hint(entry)
         hint_suffix = re.sub(r'\D', '', hint_digits or '') if hint_digits else ''
+        hint_mode = 'suffix'
+        placeholder_count = 0
+        ui_unit_price = None
+        if isinstance(entry, dict):
+            hint_mode = entry.get('_price_hint_mode') or 'suffix'
+            placeholder_count = int(entry.get('_price_hint_placeholders') or 0)
+            ui_unit_price = entry.get('_ui_unit_price') or entry.get('_ui_price')
 
-        expected_total = None
+        reference_totals: list[int] = []
+        expected_total_base: int | None = None
+        expected_total_ui: int | None = None
+        if ui_unit_price and ui_unit_price > 0:
+            try:
+                expected_total_ui = int(round(float(ui_unit_price) * quantity * MARKET_SELL_NET_FACTOR))
+            except Exception:
+                expected_total_ui = None
+            if expected_total_ui and expected_total_ui > 0:
+                reference_totals.append(expected_total_ui)
         if base_price and base_price > 0:
-            expected_total = int(round(base_price * quantity * MARKET_SELL_NET_FACTOR))
+            expected_total_base = int(round(base_price * quantity * MARKET_SELL_NET_FACTOR))
+            reference_totals.append(expected_total_base)
+
+        primary_expected = reference_totals[0] if reference_totals else None
 
         suspicious = price is None or price <= 0
-        if not suspicious and expected_total:
+        if not suspicious and reference_totals:
             try:
-                if price < expected_total * 0.6:
-                    suspicious = True
+                for ref in reference_totals:
+                    if ref and ref > 0 and price < ref * 0.6:
+                        suspicious = True
+                        break
             except Exception:
                 pass
 
@@ -464,12 +498,14 @@ class MarketTracker:
             return price
 
         candidate_values: list[int] = []
-        if expected_total:
-            if hint_digits:
-                merged = self._merge_hint_with_expected(expected_total, hint_digits)
-                if merged:
-                    candidate_values.append(int(merged))
-            candidate_values.append(int(expected_total))
+        if hint_digits and hint_mode != 'prefix':
+            for ref in reference_totals:
+                if ref:
+                    merged = self._merge_hint_with_expected(ref, hint_digits)
+                    if merged:
+                        candidate_values.append(int(merged))
+
+        candidate_values.extend(ref for ref in reference_totals if ref)
 
         if hint_value and hint_value > 0:
             candidate_values.append(int(hint_value))
@@ -490,7 +526,20 @@ class MarketTracker:
             if val is None or val <= 0 or not quantity or quantity <= 0:
                 return False
             if hint_suffix:
-                if not str(int(val)).endswith(hint_suffix):
+                val_str = str(int(val))
+                if hint_mode == 'prefix':
+                    if not val_str.startswith(hint_suffix):
+                        return False
+                else:
+                    if not val_str.endswith(hint_suffix):
+                        return False
+            if ui_unit_price and ui_unit_price > 0:
+                try:
+                    unit_pre_tax_ui = val / (quantity * MARKET_SELL_NET_FACTOR)
+                except ZeroDivisionError:
+                    return False
+                diff_ratio_ui = abs(unit_pre_tax_ui - ui_unit_price) / float(ui_unit_price)
+                if diff_ratio_ui > 0.15:
                     return False
             if base_price and base_price > 0:
                 try:
@@ -507,20 +556,171 @@ class MarketTracker:
         for cand in ordered_candidates:
             if _candidate_valid(cand):
                 if self.debug:
-                    log_debug(f"[SELL-RECOVER] Reconstructed price for '{item_name}' qty={quantity}: {cand:,} (base={base_price}, hint={hint_value})")
+                    log_debug(
+                        f"[SELL-RECOVER] Reconstructed price for '{item_name}' qty={quantity}: {cand:,} "
+                        f"(base={base_price}, ui={ui_unit_price}, hint={hint_value}, mode={hint_mode}, placeholders={placeholder_count})"
+                    )
                 return cand
 
-        if expected_total and _candidate_valid(expected_total):
+        if primary_expected and _candidate_valid(primary_expected):
             if self.debug:
-                log_debug(f"[SELL-RECOVER] Fallback to expected net price for '{item_name}': {expected_total:,}")
-            return expected_total
+                log_debug(f"[SELL-RECOVER] Fallback to expected net price for '{item_name}': {primary_expected:,}")
+            return primary_expected
 
-        if hint_value and hint_value > 0 and (not hint_suffix or str(int(hint_value)).endswith(hint_suffix)):
+        if hint_value and hint_value > 0:
+            valid_hint = False
+            hint_str = str(int(hint_value))
+            if not hint_suffix:
+                valid_hint = True
+            elif hint_mode == 'prefix':
+                valid_hint = hint_str.startswith(hint_suffix)
+            else:
+                valid_hint = hint_str.endswith(hint_suffix)
+            if valid_hint and _candidate_valid(int(hint_value)):
+                if self.debug:
+                    log_debug(f"[SELL-RECOVER] Using raw hint price for '{item_name}': {hint_value:,}")
+                return int(hint_value)
+
+        if price and price > 0 and _candidate_valid(price):
             if self.debug:
-                log_debug(f"[SELL-RECOVER] Using raw hint price for '{item_name}': {hint_value:,}")
-            return int(hint_value)
+                log_debug(f"[SELL-RECOVER] Keeping original parsed price for '{item_name}': {price:,}")
+            return price
 
         return price
+
+    def _recover_buy_price(
+        self,
+        item_name: str,
+        quantity: int,
+        price: int | None,
+        entry: dict | None,
+        raw_related: list[dict],
+    ) -> int | None:
+        if not item_name or not quantity or quantity <= 0:
+            return price
+
+        hint_values: list[int] = []
+        hint_suffixes: list[str] = []
+
+        def _collect_hint(source: dict | None):
+            if not source:
+                return
+            source_type = source.get('type') if isinstance(source, dict) else None
+            if source_type and source_type not in ('transaction', 'purchased'):
+                return
+            raw_hint = source.get('raw_price_hint')
+            if raw_hint:
+                try:
+                    hint_int = int(raw_hint)
+                except Exception:
+                    hint_int = None
+                if hint_int and hint_int > 0:
+                    hint_values.append(hint_int)
+                    hint_suffixes.append(str(hint_int))
+            val, digits = self._extract_price_hint(source)
+            if val and val > 0:
+                hint_values.append(int(val))
+            if digits:
+                suffix = re.sub(r'\D', '', digits)
+                if suffix:
+                    hint_suffixes.append(suffix)
+
+        _collect_hint(entry if isinstance(entry, dict) else None)
+        for rel in raw_related or []:
+            _collect_hint(rel if isinstance(rel, dict) else None)
+
+        if not hint_values and price:
+            return price
+
+        try:
+            base_price = self._get_base_price(item_name)
+        except Exception:
+            base_price = None
+        tolerance = 0.18
+        lower = base_price * (1 - tolerance) if base_price else None
+        upper = base_price * (1 + tolerance) if base_price else None
+
+        candidates: list[int] = []
+        anchor_totals: list[int] = []
+        if price and price > 0:
+            anchor_totals.append(int(price))
+            candidates.append(int(price))
+        if base_price and base_price > 0:
+            base_total = int(round(base_price * quantity))
+            anchor_totals.append(base_total)
+            candidates.append(base_total)
+        if price and price > 0 and hint_suffixes:
+            price_str = str(int(price))
+            for suffix in hint_suffixes:
+                digits = re.sub(r'\D', '', suffix)
+                if not digits:
+                    continue
+                if len(digits) >= len(price_str):
+                    candidates.append(int(digits))
+                else:
+                    merged = int(price_str[:-len(digits)] + digits)
+                    candidates.append(merged)
+        candidates.extend(int(v) for v in hint_values if v and v > 0)
+
+        for suffix in hint_suffixes:
+            if not suffix:
+                continue
+            for anchor in anchor_totals:
+                merged = self._merge_hint_with_expected(anchor, suffix)
+                if merged:
+                    candidates.append(int(merged))
+
+        unique_candidates: list[int] = []
+        seen = set()
+        for cand in candidates:
+            if cand and cand not in seen:
+                seen.add(cand)
+                unique_candidates.append(int(cand))
+
+        def _suffix_match(val: int) -> bool:
+            if not hint_suffixes:
+                return True
+            val_str = str(int(val))
+            return any(val_str.endswith(sfx) for sfx in hint_suffixes if sfx)
+
+        valid_candidates: list[int] = []
+        for cand in unique_candidates:
+            unit = cand / quantity
+            plausible = True
+            if base_price and upper:
+                try:
+                    if unit > upper:
+                        plausible = False
+                except Exception:
+                    pass
+            if not plausible:
+                continue
+            if not self._is_unit_price_plausible(item_name, int(round(unit))):
+                continue
+            if not _suffix_match(cand):
+                continue
+            valid_candidates.append(cand)
+
+        if self.debug:
+            log_debug(f"[BUY-RECOVER] hints={hint_suffixes} candidates={valid_candidates} raw={hint_values}")
+        if valid_candidates:
+            reference = None
+            if price and price > 0:
+                reference = int(price)
+            elif hint_values:
+                reference = max(hint_values)
+            elif base_price and base_price > 0:
+                reference = int(round(base_price * quantity))
+            else:
+                reference = valid_candidates[0]
+            chosen = min(valid_candidates, key=lambda val: abs(val - reference))
+            if self.debug:
+                log_debug(f"[BUY-RECOVER] Reconstructed price for '{item_name}' qty={quantity}: {chosen:,} hints={hint_values}")
+            return chosen
+
+        if price and price > 0:
+            return int(price)
+        return None
 
     def _infer_quantity_from_price(self, item_name: str, observed_total: int | None) -> int | None:
         if not item_name or not observed_total or observed_total <= 0:
@@ -1197,6 +1397,17 @@ class MarketTracker:
             except Exception:
                 # proceed to insert path as fallback if helper failed
                 pass
+        else:
+            if ts_dt:
+                try:
+                    if transaction_exists_by_values_near_time(item, qty or 0, int(price), ts_dt, tolerance_minutes=5):
+                        if self.debug:
+                            log_debug(f"[CONTENT-HASH] Skip near-time duplicate: {item} {qty}x @ {price} around {ts_dt}")
+                        self.seen_tx_signatures.append(sig)
+                        return False
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[CONTENT-HASH] Near-time duplicate check failed: {exc}")
         with self.lock:
             try:
                 db_cur = get_cursor()
@@ -1324,7 +1535,8 @@ class MarketTracker:
                 'qty': details['qty'],
                 'price': details['price'],
                 'timestamp': details['timestamp'],
-                'raw': details['raw']
+                'raw': details['raw'],
+                'raw_price_hint': details.get('raw_price_hint')
             })
 
         # sort by timestamp then pos
@@ -1916,6 +2128,61 @@ class MarketTracker:
                     side = likely_type
                     if self.debug:
                         log_debug(f"[HISTORICAL] Determined side={side} for '{ent['item']}' via item category")
+
+            if side is None:
+                qty_hint = ent.get('qty')
+                if not qty_hint and transaction_entry and transaction_entry.get('qty'):
+                    qty_hint = transaction_entry.get('qty')
+                price_hint_total = ent.get('price')
+                if price_hint_total is None and transaction_entry:
+                    price_hint_total = transaction_entry.get('price')
+                if qty_hint and qty_hint > 0 and price_hint_total and price_hint_total > 0:
+                    reference_units: list[float] = []
+                    try:
+                        base_price_local = self._get_base_price(ent.get('item'))
+                    except Exception:
+                        base_price_local = None
+                    if base_price_local:
+                        reference_units.append(float(base_price_local))
+                    ui_price_try = None
+                    try:
+                        key_lookup = (ent.get('item') or '').lower()
+                        ui_metric = ui_sell.get(key_lookup) if 'ui_sell' in locals() else None
+                        if (not ui_metric) and 'ui_sell_norm' in locals():
+                            ui_metric = ui_sell_norm.get(_norm_key(ent.get('item') or ''))
+                        if ui_metric:
+                            ui_price_try = ui_metric.get('price')
+                    except Exception:
+                        ui_price_try = None
+                    if ui_price_try:
+                        try:
+                            reference_units.append(float(ui_price_try))
+                        except Exception:
+                            pass
+                    if reference_units:
+                        buy_unit = float(price_hint_total) / float(qty_hint)
+                        try:
+                            sell_unit = float(price_hint_total) / (float(qty_hint) * MARKET_SELL_NET_FACTOR)
+                        except ZeroDivisionError:
+                            sell_unit = None
+                        if sell_unit is not None and sell_unit > 0:
+                            try:
+                                diff_buy = min(abs(buy_unit - ref) for ref in reference_units if ref)
+                            except ValueError:
+                                diff_buy = None
+                            try:
+                                diff_sell = min(abs(sell_unit - ref) for ref in reference_units if ref)
+                            except ValueError:
+                                diff_sell = None
+                            if diff_buy is not None and diff_sell is not None:
+                                if diff_buy <= diff_sell * 0.8:
+                                    side = 'buy'
+                                    if self.debug:
+                                        log_debug(f"[PRICE-HINT] Side bias→buy for '{ent['item']}' (diff_buy={diff_buy:.2f}, diff_sell={diff_sell:.2f})")
+                                elif diff_sell <= diff_buy * 0.8:
+                                    side = 'sell'
+                                    if self.debug:
+                                        log_debug(f"[PRICE-HINT] Side bias→sell for '{ent['item']}' (diff_sell={diff_sell:.2f}, diff_buy={diff_buy:.2f})")
             
             # Final fallback: use window type
             if side is None:
@@ -2165,6 +2432,26 @@ class MarketTracker:
             price = ent['price'] or None
             item_name = ent.get('item') or ""
             if final_type == 'sell':
+                m_ui = None
+                item_name_raw = item_name
+                try:
+                    item_lc2 = item_name_raw.lower()
+                except Exception:
+                    item_lc2 = item_name_raw or ""
+                if 'ui_sell' in locals():
+                    m_ui = ui_sell.get(item_lc2)
+                if (not m_ui) and 'ui_sell_norm' in locals():
+                    m_ui = ui_sell_norm.get(_norm_key(item_name_raw))
+                if m_ui and isinstance(m_ui, dict):
+                    ui_price_hint = m_ui.get('price')
+                    try:
+                        ui_price_hint = int(ui_price_hint) if ui_price_hint is not None else None
+                    except Exception:
+                        ui_price_hint = None
+                    if ui_price_hint and ui_price_hint > 0:
+                        if transaction_entry and isinstance(transaction_entry, dict):
+                            transaction_entry['_ui_unit_price'] = ui_price_hint
+                        ent['_ui_unit_price'] = ui_price_hint
                 # Try to override with a related transaction's values
                 # CRITICAL: Prioritize transaction price even if qty is None (price is more reliable in merged OCR text)
                 tx_rel = transaction_entry if transaction_entry else None
@@ -2181,12 +2468,6 @@ class MarketTracker:
                 # This handles fast collect scenarios where transaction line scrolled off before OCR scan
                 if (quantity is None or price is None or price <= 0 or first_snapshot_mode):
                     try:
-                        item_name_raw = item_name
-                        item_lc2 = item_name_raw.lower()
-                        m_ui = ui_sell.get(item_lc2) if 'ui_sell' in locals() else None
-                        if (not m_ui) and 'ui_sell_norm' in locals():
-                            m_ui = ui_sell_norm.get(_norm_key(item_name_raw))
-                        
                         if m_ui:
                             sc = m_ui.get('salesCompleted') or 0
                             unit_price = m_ui.get('price') or 0
@@ -2365,11 +2646,17 @@ class MarketTracker:
                                     chosen = newp
                                     break
                     if chosen is not None:
+                        entry_for_recovery = transaction_entry if transaction_entry is not None else ent
                         price = chosen
 
-                    corrected_buy = self._restore_total_with_base_price(item_name, quantity, price)
-                    if corrected_buy is not None:
-                        price = corrected_buy
+                entry_for_recovery = transaction_entry if transaction_entry is not None else ent
+                price = self._recover_buy_price(
+                    item_name,
+                    quantity,
+                    price,
+                    entry_for_recovery,
+                    related,
+                )
 
             # Apply fallback price reconstruction using UI metrics when allowed and necessary
             try:

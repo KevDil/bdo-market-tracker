@@ -832,6 +832,7 @@ def extract_details_from_entry(ts_text, entry_text):
     
     # Advanced plausibility check using market data (min/max unit prices)
     # Checks if the total price is plausible for the item based on known market ranges
+    raw_price_hint = None
     if typ in ('transaction', 'purchased') and price is not None and qty is not None and item:
         from utils import check_price_plausibility
         try:
@@ -850,17 +851,20 @@ def extract_details_from_entry(ts_text, entry_text):
                     if reason == 'too_low' and expected_min and price < expected_min * 0.1:
                         # Price is less than 10% of expected minimum → definitely OCR error
                         # Common pattern: lost leading digit(s) e.g., "265M" instead of "1265M"
+                        raw_price_hint = price
                         price = None
                     elif reason == 'too_high' and expected_max and price > expected_max * 10:
                         # Price is more than 10x expected maximum → definitely OCR error
+                        raw_price_hint = price
                         price = None
                     # Moderate threshold: if price is still far below the allowed minimum (e.g. missing leading digit)
                     # mark it invalid so tracker.py can reconstruct it via UI metrics instead of persisting garbage.
                     elif reason == 'too_low' and expected_min and price < expected_min * 0.3:
+                        raw_price_hint = price
                         price = None
         except Exception:
             pass  # If plausibility check fails, keep original price
-    
+
     # Fallback: Simple heuristic for very low prices with high quantities
     # (For items not in market_data.csv or if check failed)
     if typ in ('transaction', 'purchased') and price is not None and qty is not None:
@@ -872,6 +876,7 @@ def extract_details_from_entry(ts_text, entry_text):
                 # Price too low for high quantity - likely OCR error with missing leading digits
                 # Common pattern: lost 4-6 leading digits from a price like "585,585,000"
                 # Mark as invalid price to trigger UI fallback in tracker.py
+                raw_price_hint = price
                 price = None
 
     # timestamp: prefer the timestamp supplied by split_text_into_log_entries (ts_text),
@@ -892,5 +897,6 @@ def extract_details_from_entry(ts_text, entry_text):
         'price': int(price) if price else None,
         'timestamp': ts,
         'raw': entry_text,
+        'raw_price_hint': raw_price_hint,
         'ts_text': ts_text
     }
