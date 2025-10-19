@@ -11,7 +11,7 @@ import time
 import threading
 from functools import lru_cache
 import os
-from typing import Dict, Iterator, Optional, Sequence
+from typing import Any, Dict, Iterator, Optional, Sequence
 
 # Performance: Import Windows-specific modules at top level (not inside function)
 try:
@@ -50,7 +50,7 @@ _screenshot_cache = {}  # {hash: (timestamp, ocr_result, cache_hits)}
 _cache_lock = threading.Lock()
 # Aggregate stats for hit rate tracking
 _cache_totals = {"requests": 0, "hits": 0}
-_preprocessed_cache: dict[str, tuple[float, np.ndarray]] = {}
+_preprocessed_cache: dict[str, tuple[float, Any]] = {}
 # Performance optimization: Increased cache parameters for better hit rate
 # Market window changes infrequently, so longer TTL is safe
 CACHE_TTL = 5.0  # Sekunden - Cache-Einträge sind 5s gültig (was 2.0s)
@@ -58,7 +58,7 @@ MAX_CACHE_SIZE = 20  # Maximal 20 verschiedene Screenshots im Cache (was 10)
 # Expected improvement: Cache hit rate from ~50% to >70%
 
 
-def get_preprocessed_frame(frame_hash: str) -> np.ndarray | None:
+def get_preprocessed_frame(frame_hash: str) -> Any | None:
     now = time.time()
     with _cache_lock:
         entry = _preprocessed_cache.get(frame_hash)
@@ -71,7 +71,7 @@ def get_preprocessed_frame(frame_hash: str) -> np.ndarray | None:
         return None
 
 
-def set_preprocessed_frame(frame_hash: str, image: np.ndarray) -> None:
+def set_preprocessed_frame(frame_hash: str, image: Any) -> None:
     with _cache_lock:
         _preprocessed_cache[frame_hash] = (time.time(), image.copy())
         if len(_preprocessed_cache) > MAX_CACHE_SIZE:
