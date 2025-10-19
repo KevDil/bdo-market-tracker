@@ -1811,7 +1811,7 @@ class MarketTracker:
                     if re.search(r"20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2}", line):
                         lines.append(line)
                         continue
-                    if any(tok in low for tok in ("transaction", "placed order", "withdrew", "listed", "purchased")):
+                    if any(tok in low for tok in ("transaction", "placed order", "withdrew", "listed", "purchased", "sold ", "sold")):
                         lines.append(line)
                         continue
                 return "\n".join(lines)
