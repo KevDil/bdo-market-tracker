@@ -1,0 +1,4 @@
+﻿Reproducibility info:
+PyInstaller version: 6.16.0
+Torch info: Version: 2.8.0+cu129
+Windows build: Microsoft Windows NT 10.0.19045.0

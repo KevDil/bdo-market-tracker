@@ -76,7 +76,7 @@ from market_json_manager import get_base_price_from_cache
 _WHITESPACE_PATTERN = re.compile(r'\s+')
 _COMMA_PATTERN = re.compile(r',')
 _TRANSACTION_BASE_PATTERN = r"Transaction\s+of\s+{item}\s*.*?x?\s*{qty}\s*.*?{price}"
-_SILVER_WORD_PATTERN = r"s\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]"
+_SILVER_WORD_PATTERN = r"s\s*[iIl1](?:\s*[lIl1_])*(?:\s*[vV])?(?:\s*[eE])?(?:\s*[rR_])*"
 _PRICE_HINT_PATTERN = re.compile(
     rf"(?:worth|for)\s+([0-9OolI\|,\.\s_]{{3,}})\s+{_SILVER_WORD_PATTERN}",
     re.IGNORECASE,
@@ -119,7 +119,7 @@ class MarketTracker:
         self._fast_preprocess_cooldown = 0
         self._fast_preprocess_recovery = 0
         self._scan_counter = 0
-        self._metrics_refresh_seconds = 5.0
+        # REMOVED: _metrics_refresh_seconds (5-Sekunden-Timer) - Metrics nur bei Transaktionen gebraucht!
         self._last_metrics_text = ""
         self._last_label_text = ""
         self._pending_metrics_refresh = True
@@ -400,34 +400,30 @@ class MarketTracker:
             detail_hint = bool(re.search(r"(set\s*price|desired\s*price)", label_lower))
             detail_window_detected = detail_hint and not overview_anchor
             now_dt = datetime.datetime.now()
-            time_since_metrics = None
-            if self._last_metrics_refresh_ts:
-                try:
-                    time_since_metrics = (now_dt - self._last_metrics_refresh_ts).total_seconds()
-                except Exception:
-                    time_since_metrics = None
+            
+            # CRITICAL FIX: Metrics-ROI wird NUR bei echten Transaktionen gebraucht!
+            # Laut AGENTS.md: "Detail-/Metrics-ROI wird nach Fensterwechseln, Burst-Rescans, 
+            # Detail-Hinweisen oder wenn im Fenster-Label keine Overview-Anker erkannt werden sofort neu ausgelesen"
+            # 
+            # ALTE LOGIK (FALSCH): 5-Sekunden-Timer + "not overview_anchor" -> ständiges Auslesen
+            # NEUE LOGIK: Nur bei Fensterwechsel, Burst oder Detail-Hinweisen
             refresh_metrics = False
             if self._pending_metrics_refresh:
+                # Nach Fensterwechsel einmalig aktualisieren
                 refresh_metrics = True
             elif self._scan_counter <= 1:
+                # Erster Scan
                 refresh_metrics = True
             elif self._request_immediate_rescan > 0:
+                # Nach Burst-Rescan (Item-Fenster -> Overview)
                 refresh_metrics = True
             elif detail_hint:
+                # Detail-Fenster erkannt (Set Price / Desired Price)
                 refresh_metrics = True
-            elif not overview_anchor:
-                refresh_metrics = True
-            elif (
-                self._metrics_refresh_seconds is not None
-                and (
-                    self._last_metrics_refresh_ts is None
-                    or (
-                        time_since_metrics is not None
-                        and time_since_metrics >= self._metrics_refresh_seconds
-                    )
-                )
-            ):
-                    refresh_metrics = True
+            
+            # REMOVED: 5-Sekunden-Timer und "not overview_anchor" Bedingung
+            # Diese führten zu ständigem Auslesen auch ohne Transaktionen
+            
             metrics_refresh_ran = False
             if detail_window_detected:
                 refresh_metrics = False

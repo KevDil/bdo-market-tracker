@@ -30,12 +30,12 @@ _MULTIPLIER_WITH_QTY_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*([0-9OolI\|S
 _MULTIPLIER_PRESENCE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}\s*[0-9OolI\|SsZzBb,\.]+", re.IGNORECASE)
 _GLUED_MULTIPLIER_PATTERN = re.compile(r"([A-Za-z0-9'\-:\(\)]+)\s*[x×X]\s*([0-9OolI\|SsZzBb,\.]+)", re.IGNORECASE)
 
-_SILVER_PATTERN_RAW = r"s\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]"
+_SILVER_PATTERN_RAW = r"s\s*[iIl1](?:\s*[lIl1_])*(?:\s*[vV])?(?:\s*[eE])?(?:\s*[rR_])*"
 _SILVER_PATTERN = re.compile(_SILVER_PATTERN_RAW, re.IGNORECASE)
 _WORTH_SILVER_PATTERN = re.compile(fr"\bworth\s+[0-9OolI\|\s,\.]+\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _PRICE_WITH_SILVER_PATTERN = re.compile(fr"([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
 _MULTIPLIER_THEN_PRICE_PATTERN = re.compile(fr"{_MULTIPLIER_SYMBOL}[\s\S]*?([0-9OolI\|SsZzBb\s,\.]{3,})\s*{_SILVER_PATTERN_RAW}", re.IGNORECASE)
-_SILVER_VARIANT_PATTERN = re.compile(r"\b(?:silve|silv)[^a-z0-9]{0,2}", re.IGNORECASE)
+_SILVER_VARIANT_PATTERN = re.compile(r"\b(?:silve|silv|si_)[^a-z0-9]{0,2}", re.IGNORECASE)
 
 _UI_COLLECT_BLOCK_PATTERN = re.compile(
     r"(?:\s|^)[^\n]*?Orders\s+[0-9OolI\|,\.]+\s+Orders\s+Completed\s+[0-9OolI\|,\.]+\s+Collect(?:\s+Re-?list)?",
@@ -598,9 +598,11 @@ def extract_details_from_entry(ts_text, entry_text):
     if typ in ("transaction", "purchased", "listed", "placed", "withdrew"):
         # For transaction lines, prefer 'worth <N> Silver' (net amount)
         if typ == "transaction":
-            # allow OCR variants of 'silver' such as 's1lver', 'si1ver', 'siluer'
-            # CRITICAL: Use lowercase 'i' not uppercase 'I' for matching lowercase 'i' in 'Silver'
-            silver_pat = r's\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]'
+            # CRITICAL FIX: Robustes Silver-Pattern für OCR-Fehler wie "Si__", "Si_", "Sil", "Silv"
+            # allow OCR variants of 'silver' such as 's1lver', 'si1ver', 'siluer', 'Si__', 'Si_'
+            # Pattern matched mindestens "Si" + optional weitere Buchstaben/Unterstriche
+            # Dies fängt auch unvollständige OCR-Erkennungen am Zeilenende ab
+            silver_pat = r's\s*[iIl1](?:\s*[lIl1_])*(?:\s*[vV])?(?:\s*[eE])?(?:\s*[rR_])*'
             silver_sep = r'(?:\s|[^A-Za-z0-9]{1,3})*'
             # strict 'worth <N> Silver' first (allow small punctuation between number and Silver)
             # detect if a leading digit may be missing (e.g., "worth ,809,990,000 Silver")
