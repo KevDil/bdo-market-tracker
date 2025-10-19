@@ -113,8 +113,8 @@ sqlite3 bdo_tracker.db "SELECT * FROM transactions ORDER BY id DESC LIMIT 10;"
 |--------|----------|------|------------|
 | sell_overview | "Sales Completed" | ✅ JA | Verkaufs-Transaktionen |
 | buy_overview | "Orders Completed" | ✅ JA | Kauf-Transaktionen |
-| sell_item | "Set Price" + "Register Quantity" | ❌ NEIN | Item zum Verkauf einstellen |
-| buy_item | "Desired Price" + "Desired Amount" | ❌ NEIN | Kauforder platzieren |
+| sell_item | "Set Price" + "MAX" + "MIN" (Register Quantity optional) | ❌ NEIN | Item zum Verkauf einstellen |
+| buy_item | "Desired Price" + "MAX" + "MIN" (Desired Amount optional) | ❌ NEIN | Kauforder platzieren |
 
 **WICHTIG:** Es ist IMMER nur EIN Tab sichtbar (Buy ODER Sell)
 

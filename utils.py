@@ -1058,11 +1058,54 @@ def detect_window_type(ocr_text: str) -> str:
             return norm.replace(" ", "") in condensed_text
         return norm in normalized_tokens
 
-    # Detail-Fenster (Item-Dialoge)
-    if has_phrase("set price") and has_phrase("register quantity"):
-        return "sell_item"
-    if has_phrase("desired price") and has_phrase("desired amount"):
+    def has_candidate(candidates: Sequence[str]) -> bool:
+        for cand in candidates:
+            norm = _normalize_token_text_local(cand)
+            if not norm:
+                continue
+            if " " in norm:
+                comp = norm.replace(" ", "")
+                if norm in normalized_text or comp in condensed_text:
+                    return True
+            else:
+                if norm in normalized_tokens:
+                    return True
+        return False
+
+    def phrase_index(phrase: str) -> int:
+        norm = _normalize_token_text_local(phrase)
+        if not norm:
+            return -1
+        comp = norm.replace(" ", "")
+        if norm in normalized_text:
+            return normalized_text.index(norm)
+        if comp in condensed_text:
+            return condensed_text.index(comp)
+        return -1
+
+    sell_core = has_candidate(["set price"])
+    sell_max = has_candidate(["max", "m4x", "rnax"])
+    sell_min = has_candidate(["min", "m1n", "mln", "rnin"])
+    buy_core = has_candidate(["desired price"])
+    buy_max = has_candidate(["max", "m4x", "rnax"])
+    buy_min = has_candidate(["min", "m1n", "mln", "rnin"])
+
+    buy_detail = buy_core and buy_max and buy_min
+    sell_detail = sell_core and sell_max and sell_min
+
+    if buy_detail and sell_detail:
+        buy_pos = phrase_index("desired price")
+        sell_pos = phrase_index("set price")
+        if buy_pos >= 0 and (sell_pos < 0 or buy_pos >= sell_pos):
+            return "buy_item"
+        if sell_pos >= 0 and (buy_pos < 0 or sell_pos > buy_pos):
+            return "sell_item"
+        # Fallback: prefer buy if both ambiguous
         return "buy_item"
+    if buy_detail:
+        return "buy_item"
+    if sell_detail:
+        return "sell_item"
 
     # Overview-Fenster
     if has_phrase("items listed") and has_phrase("sales completed"):

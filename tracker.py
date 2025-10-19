@@ -307,6 +307,8 @@ class MarketTracker:
 
             self._scan_counter += 1
 
+            text_lower = (text or "").lower()
+
             label_text = ""
             label_roi = detect_window_label_roi(img)
             if label_roi:
@@ -330,6 +332,8 @@ class MarketTracker:
                 or (self._scan_counter % self._metrics_refresh_interval == 0)
                 or self._request_immediate_rescan > 0
             )
+            if not re.search(r"(transaction\s+of|placed\s+order|withdrew\s+order|sales\s+completed|orders\s+completed)", text_lower):
+                refresh_metrics = True
             if refresh_metrics:
                 metrics_roi = detect_metrics_roi(img)
                 if metrics_roi:
