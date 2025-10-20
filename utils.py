@@ -78,6 +78,234 @@ def set_preprocessed_frame(frame_hash: str, image: Any) -> None:
             oldest_key = min(_preprocessed_cache.items(), key=lambda x: x[1][0])[0]
             del _preprocessed_cache[oldest_key]
 
+
+# -----------------------
+# ROI-Diffing: Statistical Signature-based Change Detection
+# -----------------------
+# Note: Cache variable keeps legacy name for compatibility, but stores signatures now
+_roi_hash_cache: dict[str, tuple[float, str, str]] = {}  # {roi_label: (timestamp, signature_value, cached_ocr_result)}
+_roi_comparison_stats = {
+    "total_checks": 0,
+    "cache_hits": 0,
+    "signature_computation_ms": [],
+}
+
+
+def compute_roi_stats_signature(img, roi: tuple[int, int, int, int]) -> str:
+    """
+    Berechnet statistische Signatur über ROI-Bereich für robuste Change Detection.
+    
+    Im Gegensatz zu bit-perfect Hashing toleriert diese Methode minimale Pixel-Unterschiede
+    die durch Windows-Screenshot-Capturing entstehen (GPU-Timing, V-Sync, ClearType).
+    
+    Performance: ~0.05-0.1ms (numpy operations, ultra-schnell)
+    
+    Args:
+        img: Preprocessed grayscale image (numpy array)
+        roi: (x, y, width, height) tuple defining the region
+    
+    Returns:
+        Statistische Signatur als String: "mean:123.45_std:42.67"
+        
+    Example:
+        >>> roi = (100, 50, 200, 150)  # x, y, w, h
+        >>> sig1 = compute_roi_stats_signature(img1, roi)
+        >>> sig2 = compute_roi_stats_signature(img2, roi)
+        >>> if compare_roi_signatures(sig1, sig2):
+        >>>     print("ROI unchanged - skip OCR")
+    """
+    try:
+        x, y, w, h = roi
+        # Extract ROI region
+        roi_data = img[y:y+h, x:x+w]
+        
+        # Downsample to 1/4 resolution for faster computation
+        # Same strategy as hash-based approach for consistency
+        small_w = max(1, w // 4)
+        small_h = max(1, h // 4)
+        small = cv2.resize(roi_data, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        
+        # Compute statistical metrics (ultra-fast numpy operations)
+        mean_val = float(np.mean(small))
+        std_val = float(np.std(small))
+        
+        # Format as string for caching and comparison
+        # 2 decimal places sufficient for 1% threshold detection
+        return f"mean:{mean_val:.2f}_std:{std_val:.2f}"
+    except Exception as e:
+        # Fallback: Return empty signature to force OCR on error
+        log_debug(f"[ROI-STATS] Error computing signature: {e}")
+        return ""
+
+
+def compare_roi_signatures(sig1: str, sig2: str, threshold_pct: float = 1.0) -> bool:
+    """
+    Vergleicht zwei statistische Signaturen mit relativem Threshold.
+    
+    Toleriert minimale Änderungen (< threshold_pct) die durch Pixel-Rauschen
+    entstehen, während echte UI-Änderungen zuverlässig erkannt werden.
+    
+    Args:
+        sig1: Erste Signatur ("mean:X_std:Y")
+        sig2: Zweite Signatur ("mean:X_std:Y")
+        threshold_pct: Maximale erlaubte Änderung in Prozent (default: 1.0%)
+    
+    Returns:
+        True wenn ROIs als "unchanged" gelten (< threshold Änderung)
+        False wenn ROIs sich signifikant geändert haben (>= threshold)
+        
+    Example:
+        >>> sig1 = "mean:128.50_std:42.30"
+        >>> sig2 = "mean:128.75_std:42.35"  # 0.2% Änderung
+        >>> compare_roi_signatures(sig1, sig2)  # → True (unchanged)
+        
+        >>> sig3 = "mean:135.20_std:45.10"  # 5.2% Änderung
+        >>> compare_roi_signatures(sig1, sig3)  # → False (changed)
+    """
+    try:
+        # Parse signatures
+        def parse_sig(sig: str) -> tuple[float, float]:
+            parts = sig.split("_")
+            mean = float(parts[0].split(":")[1])
+            std = float(parts[1].split(":")[1])
+            return mean, std
+        
+        mean1, std1 = parse_sig(sig1)
+        mean2, std2 = parse_sig(sig2)
+        
+        # Compute relative changes in percent
+        # Use max(val, 1.0) to avoid division by zero for dark ROIs
+        mean_change_pct = abs(mean1 - mean2) / max(mean1, 1.0) * 100.0
+        std_change_pct = abs(std1 - std2) / max(std1, 1.0) * 100.0
+        
+        # Both metrics must be below threshold
+        unchanged = (mean_change_pct < threshold_pct and std_change_pct < threshold_pct)
+        
+        return unchanged
+    except Exception as e:
+        # Fallback: Return False (changed) on parse error to force OCR
+        log_debug(f"[ROI-STATS] Error comparing signatures: {e}")
+        return False
+
+
+def compute_roi_hash(img, roi: tuple[int, int, int, int]) -> str:
+    """
+    LEGACY: Berechnet blake2s Hash über ROI-Bereich für Change Detection.
+    
+    DEPRECATED: Diese Methode ist bit-perfect und toleriert keine Pixel-Varianz.
+    Use compute_roi_stats_signature() instead für robustere Change Detection.
+    
+    Performance: ~0.5-1ms für typische ROI-Größen durch Downsampling.
+    
+    Args:
+        img: Preprocessed grayscale image (numpy array)
+        roi: (x, y, width, height) tuple defining the region
+    
+    Returns:
+        Hexadezimaler Hash-String (16 chars)
+    """
+    try:
+        x, y, w, h = roi
+        # Extract ROI region
+        roi_data = img[y:y+h, x:x+w]
+        
+        # Downsample to 1/4 resolution for faster hashing
+        small_w = max(1, w // 4)
+        small_h = max(1, h // 4)
+        small = cv2.resize(roi_data, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        
+        # Use blake2s for fast, collision-resistant hashing
+        hash_bytes = hashlib.blake2s(small.tobytes(), digest_size=8).hexdigest()
+        
+        return hash_bytes
+    except Exception as e:
+        # Fallback: Return empty hash to force OCR on error
+        log_debug(f"[ROI-HASH] Error computing hash: {e}")
+        return ""
+
+
+def get_roi_signature_cached(roi_label: str) -> tuple[str, str] | None:
+    """
+    Holt gecachte ROI-Signatur und OCR-Result falls noch gültig.
+    
+    Args:
+        roi_label: Identifier für ROI ("log", "label", "metrics")
+    
+    Returns:
+        (signature_value, cached_ocr_result) oder None wenn expired/missing
+    """
+    now = time.time()
+    with _cache_lock:
+        entry = _roi_hash_cache.get(roi_label)
+        if not entry:
+            return None
+        ts, sig_val, ocr_result = entry
+        if now - ts < CACHE_TTL:
+            return (sig_val, ocr_result)
+        # Expired - remove from cache
+        del _roi_hash_cache[roi_label]
+        return None
+
+
+def set_roi_signature_cached(roi_label: str, signature: str, ocr_result: str) -> None:
+    """
+    Speichert ROI-Signatur und zugehöriges OCR-Result im Cache.
+    
+    Args:
+        roi_label: Identifier für ROI ("log", "label", "metrics")
+        signature: Computed signature from compute_roi_stats_signature()
+        ocr_result: OCR text result for this ROI
+    """
+    with _cache_lock:
+        _roi_hash_cache[roi_label] = (time.time(), signature, ocr_result)
+        # Optional: Limit cache size (not critical as we only have 3 ROIs)
+        if len(_roi_hash_cache) > MAX_CACHE_SIZE:
+            oldest_key = min(_roi_hash_cache.items(), key=lambda x: x[1][0])[0]
+            del _roi_hash_cache[oldest_key]
+
+
+# Legacy function for backwards compatibility
+def get_roi_hash_cached(roi_label: str) -> tuple[str, str] | None:
+    """DEPRECATED: Use get_roi_signature_cached() instead."""
+    return get_roi_signature_cached(roi_label)
+
+
+def set_roi_hash_cached(roi_label: str, hash_value: str, ocr_result: str) -> None:
+    """DEPRECATED: Use set_roi_signature_cached() instead."""
+    set_roi_signature_cached(roi_label, hash_value, ocr_result)
+
+
+def compare_roi_similarity(img, roi: tuple[int, int, int, int], hist_ref: Optional[Any]) -> float:
+    """
+    Alternative zu Hash-basiertem Vergleich: Histogram-Korrelation.
+    
+    Robuster gegen minimale Helligkeitsänderungen, aber langsamer.
+    Aktuell nicht verwendet - hier als Fallback-Option dokumentiert.
+    
+    Args:
+        img: Preprocessed grayscale image
+        roi: (x, y, width, height)
+        hist_ref: Referenz-Histogram zum Vergleich
+    
+    Returns:
+        Similarity score 0.0-1.0 (1.0 = identisch)
+    """
+    try:
+        x, y, w, h = roi
+        roi_data = img[y:y+h, x:x+w]
+        hist = cv2.calcHist([roi_data], [0], None, [64], [0, 256])
+        hist_norm = cv2.normalize(hist, hist).flatten()
+        
+        if hist_ref is None:
+            return 0.0
+        
+        # Correlation method: 1.0 = perfect match, -1.0 = inverse
+        similarity = cv2.compareHist(hist_norm, hist_ref, cv2.HISTCMP_CORREL)
+        return float(similarity)
+    except Exception:
+        return 0.0
+
+
 _OCR_TOKEN_TRANSLATION = str.maketrans({
     '0': 'o',
     '1': 'l',

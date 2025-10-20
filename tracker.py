@@ -47,6 +47,14 @@ from utils import (
     MARKET_SELL_NET_FACTOR,
     get_preprocessed_frame,
     set_preprocessed_frame,
+    compute_roi_stats_signature,
+    compare_roi_signatures,
+    get_roi_signature_cached,
+    set_roi_signature_cached,
+    # Legacy hash functions (kept for backwards compatibility)
+    compute_roi_hash,
+    get_roi_hash_cached,
+    set_roi_hash_cached,
 )
 from database import (
     get_cursor,
@@ -216,6 +224,32 @@ class MarketTracker:
         self._occurrence_runtime_cache = {}
         # Async pipeline controller placeholder
         self._async_controller = None
+        
+        # ROI-Diffing: State für Statistical Signature-based Change Detection
+        self._last_roi_signatures = {
+            "log": None,      # Statistical signature des letzten Log-ROI
+            "label": None,    # Statistical signature des letzten Label-ROI
+            "metrics": None,  # Statistical signature des letzten Metrics-ROI
+        }
+        self._last_roi_results = {
+            "log": "",       # Cached OCR result
+            "label": "",
+            "metrics": "",
+        }
+        self._roi_skip_counters = {
+            "log": 0,        # Anzahl aufeinanderfolgender Skips
+            "label": 0,
+            "metrics": 0,
+        }
+        self._roi_force_refresh_threshold = 10  # Force-Refresh nach N Skips
+        self._metrics_refresh_failures = 0  # Counter für ROI-Detection-Failures
+        
+        # Window-Detection-Hysteresis: Requires 2 consecutive same detections
+        self._window_detection_history = []  # Last 3 detections
+        self._stable_window = 'unknown'  # Last confirmed stable window
+        
+        # Metrics-Refresh-Rate-Limiting: Minimum delay between refreshes
+        self._last_metrics_refresh_time = None
 
         if self.debug:
             log_debug(f"[INIT] Baseline initialized: {self._baseline_initialized}, Poll interval: {self.poll_interval}s")
@@ -297,29 +331,109 @@ class MarketTracker:
             if allow_debug and self.debug:
                 self._write_debug_images(img, proc, context)
 
+            # ========================================
+            # ROI-DIFFING: Change Detection vor OCR
+            # ========================================
+            # Detect all three ROIs
+            label_roi = detect_window_label_roi(img)
+            log_roi = detect_log_roi(img)
+            metrics_roi = detect_metrics_roi(img)
+            
+            # Compute hashes for change detection
+            roi_changed = {
+                "log": False,
+                "label": False,
+                "metrics": False,
+            }
+            
+            roi_stats_start = time.perf_counter()
+            for roi_name, roi_coords in [
+                ("label", label_roi),
+                ("log", log_roi),
+                ("metrics", metrics_roi),
+            ]:
+                if roi_coords is None:
+                    # No ROI detected -> force OCR
+                    roi_changed[roi_name] = True
+                    continue
+                
+                # Compute statistical signature for this ROI
+                current_sig = compute_roi_stats_signature(proc, roi_coords)
+                last_sig = self._last_roi_signatures.get(roi_name)
+                
+                if current_sig and last_sig and compare_roi_signatures(current_sig, last_sig):
+                    # ROI unchanged (within threshold) -> skip OCR
+                    self._roi_skip_counters[roi_name] += 1
+                    roi_changed[roi_name] = False
+                    if self.debug and self._scan_counter > 1:
+                        log_debug(f"[ROI-STATS] {roi_name.upper()}-ROI unchanged (skip #{self._roi_skip_counters[roi_name]})")
+                else:
+                    # ROI changed -> run OCR
+                    self._last_roi_signatures[roi_name] = current_sig
+                    self._roi_skip_counters[roi_name] = 0
+                    roi_changed[roi_name] = True
+            
+            roi_stats_time = (time.perf_counter() - roi_stats_start) * 1000
+            if metrics is not None and self.debug:
+                metrics["roi_stats_ms"] = roi_stats_time
+            
+            # Force-Refresh Heuristiken
+            force_refresh = (
+                self._pending_metrics_refresh or
+                self._request_immediate_rescan > 0 or
+                any(count >= self._roi_force_refresh_threshold 
+                    for count in self._roi_skip_counters.values())
+            )
+            
+            if force_refresh:
+                if self.debug:
+                    reasons = []
+                    if self._pending_metrics_refresh:
+                        reasons.append("metrics_pending")
+                    if self._request_immediate_rescan > 0:
+                        reasons.append(f"burst_rescan={self._request_immediate_rescan}")
+                    for key, count in self._roi_skip_counters.items():
+                        if count >= self._roi_force_refresh_threshold:
+                            reasons.append(f"{key}_skip_limit={count}")
+                    log_debug(f"[ROI-STATS] Force refresh: {', '.join(reasons)}")
+                
+                for key in roi_changed:
+                    roi_changed[key] = True
+                    self._roi_skip_counters[key] = 0
+
             # First, OCR the label ROI to determine window context.
             label_text = ""
-            label_roi = detect_window_label_roi(img)
             label_ms = 0.0
+            label_roi_skipped = False
             if label_roi:
-                label_start = time.perf_counter()
-                label_text, label_cached, label_stats = ocr_image_cached(
-                    img,
-                    method='auto',
-                    use_roi=True,
-                    preprocessed=proc,
-                    fast_mode=use_fast_preprocess,
-                    roi=label_roi,
-                    roi_label="label",
-                    cache_tag="label",
-                )
-                label_ms = (time.perf_counter() - label_start) * 1000
-                if label_text:
-                    self._last_label_text = label_text
-                if metrics is not None:
-                    metrics["label_cache_hit"] = bool(label_cached)
-                    metrics["label_cache_age_s"] = label_stats.get("cache_age")
-                    metrics["label_ms"] = label_ms
+                if roi_changed["label"]:
+                    label_start = time.perf_counter()
+                    label_text, label_cached, label_stats = ocr_image_cached(
+                        img,
+                        method='auto',
+                        use_roi=True,
+                        preprocessed=proc,
+                        fast_mode=use_fast_preprocess,
+                        roi=label_roi,
+                        roi_label="label",
+                        cache_tag="label",
+                    )
+                    label_ms = (time.perf_counter() - label_start) * 1000
+                    if label_text:
+                        self._last_label_text = label_text
+                        self._last_roi_results["label"] = label_text
+                    if metrics is not None:
+                        metrics["label_cache_hit"] = bool(label_cached)
+                        metrics["label_cache_age_s"] = label_stats.get("cache_age")
+                        metrics["label_ms"] = label_ms
+                else:
+                    # Use cached result from last scan
+                    label_text = self._last_roi_results["label"]
+                    label_roi_skipped = True
+                    if metrics is not None:
+                        metrics["roi_label_skipped"] = True
+                        metrics["label_ms"] = 0.0
+            
             cached_label = self._last_label_text if not label_text else label_text
             label_lower = (cached_label or "").lower()
 
@@ -337,24 +451,37 @@ class MarketTracker:
             text = ""
             ocr_time = 0.0
             was_cached = False
+            log_roi_skipped = False
             cache_stats = {"hit_rate": 0.0, "cache_size": 0, "cache_age": None}
+            
             if need_log_ocr:
-                ocr_start = time.perf_counter()
-                text, was_cached, cache_stats = ocr_image_cached(
-                    img,
-                    method='auto',
-                    use_roi=True,
-                    preprocessed=proc,
-                    fast_mode=True,
-                )
-                ocr_elapsed = time.perf_counter() - ocr_start
-                ocr_time = ocr_elapsed * 1000
-                if self.debug:
-                    cache_indicator = " [CACHED]" if was_cached else ""
-                    log_debug(
-                        f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
-                        f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
+                if roi_changed["log"]:
+                    ocr_start = time.perf_counter()
+                    text, was_cached, cache_stats = ocr_image_cached(
+                        img,
+                        method='auto',
+                        use_roi=True,
+                        preprocessed=proc,
+                        fast_mode=True,
                     )
+                    ocr_elapsed = time.perf_counter() - ocr_start
+                    ocr_time = ocr_elapsed * 1000
+                    if text:
+                        self._last_roi_results["log"] = text
+                    if self.debug:
+                        cache_indicator = " [CACHED]" if was_cached else ""
+                        log_debug(
+                            f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
+                            f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
+                        )
+                else:
+                    # Use cached result from ROI-Diffing
+                    text = self._last_roi_results["log"]
+                    log_roi_skipped = True
+                    if self.debug:
+                        log_debug(f"{perf_prefix} Log-OCR skipped via ROI-Diff")
+                    if metrics is not None:
+                        metrics["roi_log_skipped"] = True
             else:
                 if self.debug:
                     log_debug(f"{perf_prefix} Skip log OCR (detail window detected via label)")
@@ -425,11 +552,13 @@ class MarketTracker:
             # Diese führten zu ständigem Auslesen auch ohne Transaktionen
             
             metrics_refresh_ran = False
+            metrics_roi_skipped = False
             if detail_window_detected:
                 refresh_metrics = False
                 self._pending_metrics_refresh = True
-            if refresh_metrics:
-                metrics_roi = detect_metrics_roi(img)
+            
+            if refresh_metrics and roi_changed["metrics"]:
+                # Metrics-ROI hat sich geändert UND Refresh ist angefordert
                 if metrics_roi:
                     metrics_text, metrics_cached, metrics_stats = ocr_image_cached(
                         img,
@@ -443,16 +572,41 @@ class MarketTracker:
                     )
                     if metrics_text:
                         self._last_metrics_text = metrics_text
+                        self._last_roi_results["metrics"] = metrics_text
                     metrics_refresh_ran = True
                     if metrics is not None:
                         metrics["metrics_cache_hit"] = bool(metrics_cached)
                         metrics["metrics_cache_size"] = metrics_stats.get("cache_size")
                         metrics["metrics_cache_age_s"] = metrics_stats.get("cache_age")
                     self._pending_metrics_refresh = False
+                    self._metrics_refresh_failures = 0  # Reset counter on success
+                    self._last_metrics_refresh_time = now_dt  # Update rate-limiting timer
                     self._last_metrics_refresh_ts = now_dt
                 else:
-                    # Retry on next scan if ROI detection failed
-                    self._pending_metrics_refresh = True
+                    # ROI detection failed - count failure
+                    self._metrics_refresh_failures += 1
+                    if self._metrics_refresh_failures >= 3:
+                        # Give up after 3 failures to prevent stuck state
+                        self._pending_metrics_refresh = False
+                        self._metrics_refresh_failures = 0
+                        if self.debug:
+                            log_debug("[ROI-STATS] Cleared stuck metrics_refresh after 3 ROI detection failures")
+                    else:
+                        # Retry on next scan
+                        self._pending_metrics_refresh = True
+            elif refresh_metrics and not roi_changed["metrics"]:
+                # Refresh angefordert, aber Metrics-ROI unverändert -> Use cached
+                metrics_text = self._last_roi_results["metrics"]
+                metrics_roi_skipped = True
+                self._pending_metrics_refresh = False  # Clear flag after using cache
+                self._last_metrics_refresh_time = now_dt  # Update rate-limiting timer
+                if self.debug:
+                    log_debug(f"{perf_prefix} Metrics-OCR skipped via ROI-Diff")
+                if metrics is not None:
+                    metrics["roi_metrics_skipped"] = True
+                self._pending_metrics_refresh = False  # Mark as refreshed
+                self._metrics_refresh_failures = 0  # Reset counter
+                self._last_metrics_refresh_ts = now_dt
             if metrics is not None:
                 metrics["metrics_refresh"] = metrics_refresh_ran
             cached_metrics = self._last_metrics_text if not metrics_text else metrics_text
@@ -1747,8 +1901,30 @@ class MarketTracker:
 
         # Fenster-Typ erkennen und State updaten
         prev_window = self.current_window
-        wtype = detect_window_type(full_text)
+        detected_wtype = detect_window_type(full_text)
         now = datetime.datetime.now()
+        
+        # HYSTERESIS: Require 2 consecutive same detections before accepting transition
+        self._window_detection_history.append(detected_wtype)
+        if len(self._window_detection_history) > 3:
+            self._window_detection_history = self._window_detection_history[-3:]
+        
+        # Check if last 2 detections agree
+        if (len(self._window_detection_history) >= 2 and
+            self._window_detection_history[-1] == self._window_detection_history[-2]):
+            # Stable detection - use this as the actual window type
+            wtype = self._window_detection_history[-1]
+            if wtype != self._stable_window:
+                # Real transition confirmed
+                if self.debug:
+                    log_debug(f"[WINDOW-HYSTERESIS] Stable transition confirmed: {self._stable_window} → {wtype}")
+                self._stable_window = wtype
+        else:
+            # No stable detection yet - use previous stable state
+            wtype = self._stable_window if self._stable_window != 'unknown' else detected_wtype
+            if self.debug:
+                log_debug(f"[WINDOW-HYSTERESIS] Unstable detection {detected_wtype}, using stable state {wtype}")
+        
         self.current_window = wtype
         self.window_history.append((now, wtype))
         if len(self.window_history) > 5:
@@ -1758,7 +1934,27 @@ class MarketTracker:
         if self.debug and prev_window != wtype:
             log_debug(f"[WINDOW] Transition: {prev_window} → {wtype}")
         if prev_window != wtype:
-            self._pending_metrics_refresh = True
+            # RATE-LIMITING: Only set refresh flag if enough time has passed
+            # or if we're in a burst scan (which overrides rate limits)
+            time_since_last_refresh = None
+            if self._last_metrics_refresh_time is not None:
+                time_since_last_refresh = (now - self._last_metrics_refresh_time).total_seconds()
+            
+            is_burst = (self._burst_until and now < self._burst_until) or self._request_immediate_rescan > 0
+            
+            if is_burst or time_since_last_refresh is None or time_since_last_refresh >= 1.0:
+                self._pending_metrics_refresh = True
+                if self.debug:
+                    log_debug(f"[METRICS-REFRESH] Scheduled on window transition (burst={is_burst}, time_since_last={time_since_last_refresh}s)")
+            else:
+                if self.debug:
+                    log_debug(f"[METRICS-REFRESH] Skipped due to rate-limiting (time_since_last={time_since_last_refresh:.2f}s < 1.0s)")
+            
+            # ROI-DIFFING: Reset signatures bei Fensterwechsel
+            self._last_roi_signatures = {"log": None, "label": None, "metrics": None}
+            self._roi_skip_counters = {"log": 0, "label": 0, "metrics": 0}
+            if self.debug:
+                log_debug("[ROI-STATS] Signatures reset due to window transition")
         if wtype in ("sell_overview", "buy_overview"):
             self.last_overview = wtype
 

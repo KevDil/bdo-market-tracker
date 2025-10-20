@@ -131,12 +131,35 @@
    - Senke den Burst-Schlaf (`tracker.py:102-112`) nur bei echten `sell_item`/`buy_item`-Fenstern und halte das Standard-Polling bei 0,15 s, um unnötige Scans zu reduzieren.
 
 ## Phase 2 – Strukturelle Verbesserungen (eine Sprint-Länge)
-1. **Asynchrones Capture/OCR reaktivieren**  
+1. **Asynchrones Capture/OCR reaktivieren** ✅ **ABGESCHLOSSEN**
    - Reaktiviere `USE_ASYNC_PIPELINE` mit `ASYNC_QUEUE_MAXSIZE=1`, aber ermögliche ein zweites Worker-Thread für OCR, um Capture zu überlappen (`config.py:189-200`, `tracker.py:3950-4135`).  
    - Stelle sicher, dass die Queue ältere Frames droppt und füge Cancel-Backoff hinzu, um GUI-Stops responsiv zu halten.
-2. **ROI-Diffing vor OCR**  
+2. **ROI-Diffing vor OCR** ✅ **ABGESCHLOSSEN**
    - Implementiere schnelle Pixel-/Histogram-Vergleiche pro Sub-ROI (Log, Metriken, Fenster-Labels); wenn ein Abschnitt unverändert bleibt, überspringe die OCR dafür und nutze den Cache.  
    - Halte die Heuristiken im Tracker-State (`tracker.py:115-160`) fest, damit keine Events verloren gehen und Sub-ROIs synchron bleiben.
+   
+   **Implementierung (2025-10-20):**
+   - ✅ `compute_roi_hash()` in `utils.py` - blake2s Hash mit 1/4 Downsampling (~0.5-1ms)
+   - ✅ ROI-State-Management in `MarketTracker` - `_last_roi_hashes`, `_last_roi_results`, `_roi_skip_counters`
+   - ✅ Force-Refresh-Mechanismen: Nach 10 Skips, bei Fensterwechseln, bei Burst-Scans
+   - ✅ Integration in `_process_image()` - Hash-Check vor jedem OCR-Call
+   - ✅ 16 Unit-Tests in `tests/unit/test_roi_diffing.py` - alle bestanden
+   - ✅ Vollständige Test-Suite (19/19 Tests) - alle bestanden
+   
+   **Erwartetes Ergebnis:**
+   - Statische Frames: ~2ms statt ~992ms OCR (99.8% Reduktion)
+   - Wechselnde Frames: ~500ms statt ~992ms (50% Reduktion)
+   - Gewichteter Durchschnitt (80% idle, 20% aktiv): ~101ms statt 992ms (89.8% Reduktion)
+   
+   **❌ KRITISCHER BEFUND (2025-10-20):**
+   - Benchmark-Ergebnis: 966.8ms (statt erwartete 101ms)
+   - Performance-Regression: +2.2% statt -89.8%
+   - Root Cause: `_pending_metrics_refresh` stuck in True-State
+   - Konsequenz: 0% Skip-Rate, alle Scans laufen Full-OCR
+   - Details: `docs/ROI_DIFFING_BENCHMARK_ANALYSIS.md`
+   
+   **Status:** ⚠️ Funktioniert nicht - Rollback empfohlen
+   **Fix benötigt:** Metrics-Refresh-Logik + Window-Detection-Stabilität
 3. **OCR-Engine evaluieren**  
    - Teste PaddleOCR mit GPU („PPOCRv4 server“) und optimierten Parametern (`ocr_engines.py:118-206`) in separaten Benchmarkläufen.  
    - Alternativ evaluiere RapidOCR oder Tencent OCR (Python bindings), falls EasyOCR weiterhin >800 ms benötigt.
