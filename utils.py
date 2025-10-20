@@ -483,6 +483,116 @@ def detect_metrics_roi(img):
         return None
 
 
+def detect_detail_item_name_roi(img, window_type: str):
+    """
+    ROI für Item-Name im Detail-Fenster.
+    
+    Position: Oben links im Detail-Fenster
+    Text: Item-Name (z.B. "Powder of Darkness", "Brutal Death Elixir")
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        if window_type == 'sell_item':
+            x_start = int(w * 0.08)
+            x_end = int(w * 0.45)
+            y_start = int(h * 0.03)
+            y_end = int(h * 0.09)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.09)
+            x_end = int(w * 0.45)
+            y_start = int(h * 0.08)
+            y_end = int(h * 0.14)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
+def detect_detail_balance_roi(img, window_type: str):
+    """
+    ROI für Kontostand (Balance) im Detail-Fenster.
+    
+    Position: Mittig links
+    Text: "Balance: <amount> Silver"
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        if window_type == 'sell_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.23)
+            y_start = int(h * 0.46)
+            y_end = int(h * 0.55)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.23)
+            y_start = int(h * 0.50)
+            y_end = int(h * 0.59)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
+def detect_detail_warehouse_roi(img, window_type: str):
+    """
+    ROI für Lagerbestand (Warehouse Quantity) im Detail-Fenster.
+    
+    Position abhängig von Fenstertyp:
+    - Sell-Item: Relativ weit oben links
+    - Buy-Item: Relativ weit unten links
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        
+        if window_type == 'sell_item':
+            x_start = int(w * 0.03)
+            x_end = int(w * 0.10)
+            y_start = int(h * 0.11)
+            y_end = int(h * 0.20)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.43)
+            y_start = int(h * 0.84)
+            y_end = int(h * 0.89)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
 def easyocr_uses_gpu() -> bool:
     if not USE_EASYOCR or reader is None:
         return False
@@ -1397,8 +1507,10 @@ def detect_window_type(ocr_text: str) -> str:
     buy_max = has_candidate(["max", "m4x", "rnax"])
     buy_min = has_candidate(["min", "m1n", "mln", "rnin"])
 
-    buy_detail = buy_core and buy_max and buy_min
-    sell_detail = sell_core and sell_max and sell_min
+    # Detail-Fenster: Core-Keyword + (MIN ODER MAX)
+    # Robuster gegen Layout-Varianten und OCR-Fehler
+    buy_detail = buy_core and (buy_max or buy_min)
+    sell_detail = sell_core and (sell_max or sell_min)
 
     if buy_detail and sell_detail:
         buy_pos = phrase_index("desired price")

@@ -222,6 +222,18 @@ class MarketTracker:
             self._occurrence_state = {}
         self._occurrence_state_dirty = False
         self._occurrence_runtime_cache = {}
+        
+        # Detail-Window Transaction Monitoring State
+        self._detail_window_active = False  # True wenn in Detail-Fenster (buy_item/sell_item)
+        self._detail_window_type = None  # 'sell_item' oder 'buy_item'
+        self._detail_window_item = None  # Item-Name aus Detail-Fenster
+        self._detail_baseline_balance = None  # Baseline Balance beim Fenster-Eintritt
+        self._detail_baseline_warehouse = None  # Baseline Warehouse beim Fenster-Eintritt
+        self._detail_last_metrics = None  # Letzte bekannte Metriken (dict)
+        self._detail_confirmation_pending = False  # True wenn Bestätigung erwartet wird
+        self._detail_confirmation_timestamp = None  # Timestamp der letzten erkannten Änderung
+        self._detail_confirmation_timeout = 5.0  # Sekunden bis Timeout (Reset)
+        
         # Async pipeline controller placeholder
         self._async_controller = None
         
@@ -613,12 +625,91 @@ class MarketTracker:
             if detail_window_detected:
                 cached_metrics = ""
 
+            # DETAIL-WINDOW: Extrahiere Item-Name, Balance und Warehouse aus Detail-Fenstern
+            detail_window_text = ""
+            if detail_window_detected and cached_label:
+                # Bestimme Fenstertyp
+                label_text_lower = cached_label.lower()
+                if 'set price' in label_text_lower or 'register' in label_text_lower:
+                    detected_detail_type = 'sell_item'
+                elif 'desired price' in label_text_lower or 'desired amount' in label_text_lower:
+                    detected_detail_type = 'buy_item'
+                else:
+                    detected_detail_type = None
+                
+                if detected_detail_type:
+                    # Import Detail-ROI-Funktionen
+                    from utils import detect_detail_item_name_roi, detect_detail_balance_roi, detect_detail_warehouse_roi
+                    
+                    # Extrahiere Item-Name-ROI
+                    item_name_roi = detect_detail_item_name_roi(proc, detected_detail_type)
+                    item_name_text = ""
+                    if item_name_roi:
+                        item_name_text, _, _ = ocr_image_cached(
+                            img,
+                            method='auto',
+                            use_roi=True,
+                            preprocessed=proc,
+                            fast_mode=use_fast_preprocess,
+                            roi=item_name_roi,
+                            roi_label="detail_item_name",
+                            cache_tag="detail_item_name",
+                        )
+                    
+                    # Extrahiere Balance-ROI
+                    balance_roi = detect_detail_balance_roi(proc, detected_detail_type)
+                    balance_text = ""
+                    if balance_roi:
+                        balance_text, _, _ = ocr_image_cached(
+                            img,
+                            method='auto',
+                            use_roi=True,
+                            preprocessed=proc,
+                            fast_mode=use_fast_preprocess,
+                            roi=balance_roi,
+                            roi_label="detail_balance",
+                            cache_tag="detail_balance",
+                        )
+                    
+                    # Extrahiere Warehouse-ROI
+                    warehouse_roi = detect_detail_warehouse_roi(proc, detected_detail_type)
+                    warehouse_text = ""
+                    if warehouse_roi:
+                        warehouse_text, _, _ = ocr_image_cached(
+                            img,
+                            method='auto',
+                            use_roi=True,
+                            preprocessed=proc,
+                            fast_mode=use_fast_preprocess,
+                            roi=warehouse_roi,
+                            roi_label="detail_warehouse",
+                            cache_tag="detail_warehouse",
+                        )
+                    
+                    # Kombiniere Detail-Window-Text
+                    detail_parts = []
+                    if item_name_text:
+                        detail_parts.append(item_name_text)
+                    if balance_text:
+                        detail_parts.append(balance_text)
+                    if warehouse_text:
+                        detail_parts.append(warehouse_text)
+                    detail_window_text = "\n".join(part for part in detail_parts if part)
+                    
+                    if self.debug and detail_window_text:
+                        log_debug(f"[DETAIL] Extracted detail window metrics:\n{detail_window_text[:200]}")
+
             combined_parts = []
             if cached_label:
                 combined_parts.append(cached_label)
-            if text:
+            if detail_window_text:
+                # Bei Detail-Fenstern: Label + Detail-ROIs (kein Log-Text)
+                combined_parts.append(detail_window_text)
+            elif text:
+                # Bei Overview-Fenstern: Log-Text
                 combined_parts.append(text)
-            if cached_metrics:
+            if cached_metrics and not detail_window_detected:
+                # Metrics nur bei Overview-Fenstern
                 combined_parts.append(cached_metrics)
             full_text = "\n".join(part for part in combined_parts if part)
 
@@ -1421,6 +1512,183 @@ class MarketTracker:
             pass
         return metrics
 
+    def _extract_detail_window_metrics(self, ocr_text: str, window_type: str) -> dict | None:
+        """
+        Extrahiert Metriken aus Detail-Fenster (Buy-Item / Sell-Item).
+        
+        Extrahierte Daten:
+        - balance: Aktueller Kontostand (Silver)
+        - warehouse_qty: Aktueller Lagerbestand (Anzahl Items)
+        - item_name: Name des Items (falls erkannt)
+        - set_price: Eingestellter Preis (bei Sell-Item, optional)
+        - desired_price: Gewünschter Preis (bei Buy-Item, optional)
+        - quantity: Eingestellte Menge (optional)
+        
+        Args:
+            ocr_text: OCR-Text aus Detail-Window (kombiniert aus allen ROIs)
+            window_type: 'sell_item' oder 'buy_item'
+        
+        Returns:
+            dict mit Metriken oder None
+        """
+        if not ocr_text:
+            return None
+        
+        try:
+            # Normalisiere Text (PRESERVE NEWLINES für Item-Name-Extraction!)
+            # Ersetze nur wiederholte Spaces/Tabs, aber NICHT Newlines
+            s = re.sub(r'[ \t]+', ' ', ocr_text)  # Nur horizontale Whitespaces
+            s = s.replace('：', ':').replace('．', '.').replace('／', '/')
+            
+            metrics = {}
+            
+            # 1. Balance extrahieren
+            # Pattern: "Balance: 1,234,567,890 Silver" oder "Balance 1,234,567,890" (Detail-ROI)
+            balance_pattern = re.compile(
+                r'Balance\s*[:;]?\s*([0-9,\.]+)(?:\s*Silver)?',  # "Silver" ist optional
+                re.IGNORECASE
+            )
+            m = balance_pattern.search(s)
+            if m:
+                balance_val = normalize_numeric_str(m.group(1))
+                if balance_val is not None:
+                    metrics['balance'] = balance_val
+            
+            # 2. Warehouse Quantity extrahieren
+            # Zwei Formate möglich:
+            # - Overview: "Warehouse Quantity: 50" oder "WH: 50"
+            # - Detail-ROI: "10,000 Warehouse Quantity" (Zahl ZUERST)
+            
+            # Versuche zuerst Overview-Format (Warehouse ZUERST)
+            warehouse_pattern_overview = re.compile(
+                r'(?:Warehouse\s*(?:Quantity)?|WH)\s*[:;]?\s*([0-9,\.]+)',
+                re.IGNORECASE
+            )
+            m = warehouse_pattern_overview.search(s)
+            if m:
+                wh_val = normalize_numeric_str(m.group(1))
+                if wh_val is not None:
+                    metrics['warehouse_qty'] = wh_val
+            else:
+                # Fallback: Detail-ROI-Format (Zahl ZUERST)
+                # Aber nur wenn "Warehouse Quantity" DIREKT nach der Zahl kommt (gleiche Zeile)
+                warehouse_pattern_detail = re.compile(
+                    r'([0-9,\.]+)\s+Warehouse\s+Quantity',
+                    re.IGNORECASE
+                )
+                for line in s.split('\n'):
+                    m = warehouse_pattern_detail.search(line)
+                    if m:
+                        wh_val = normalize_numeric_str(m.group(1))
+                        if wh_val is not None:
+                            metrics['warehouse_qty'] = wh_val
+                            break
+            
+            # 3. Set Price / Desired Price extrahieren
+            # Sell-Item: "Set Price: 15,000 Silver"
+            # Buy-Item: "Desired Price: 4,500,000 Silver"
+            if window_type == 'sell_item':
+                price_pattern = re.compile(
+                    r'Set\s+Price\s*[:;]?\s*([0-9,\.]+)\s*Silver',
+                    re.IGNORECASE
+                )
+            else:  # buy_item
+                price_pattern = re.compile(
+                    r'Desired\s+Price\s*[:;]?\s*([0-9,\.]+)\s*Silver',
+                    re.IGNORECASE
+                )
+            
+            m = price_pattern.search(s)
+            if m:
+                price_val = normalize_numeric_str(m.group(1))
+                if price_val is not None:
+                    if window_type == 'sell_item':
+                        metrics['set_price'] = price_val
+                    else:
+                        metrics['desired_price'] = price_val
+            
+            # 4. Register Quantity / Desired Amount extrahieren
+            # Sell-Item: "Register Quantity: 100"
+            # Buy-Item: "Desired Amount: 5"
+            if window_type == 'sell_item':
+                qty_pattern = re.compile(
+                    r'Register\s+Quantity\s*[:;]?\s*([0-9,\.]+)',
+                    re.IGNORECASE
+                )
+            else:  # buy_item
+                qty_pattern = re.compile(
+                    r'Desired\s+Amount\s*[:;]?\s*([0-9,\.]+)',
+                    re.IGNORECASE
+                )
+            
+            m = qty_pattern.search(s)
+            if m:
+                qty_val = normalize_numeric_str(m.group(1))
+                if qty_val is not None and 1 <= qty_val <= 5000:
+                    metrics['quantity'] = qty_val
+            
+            # 5. Item-Name extrahieren (aus Item-Name-ROI)
+            # Pattern: Suche nach zusammenhängendem Text ohne UI-Keywords
+            # Oft Format: "<ItemName>" oder "[Grade] ItemName"
+            # Detail-ROI liefert oft Timestamp-Präfix: "2025.10.20 19.23 ItemName"
+            
+            # Entferne Timestamp-Präfix wenn vorhanden
+            s_cleaned = re.sub(
+                r'^\d{4}\.\d{2}\.\d{2}\s+\d{2}\.\d{2}\s+',  # Timestamp-Präfix (YYYY.MM.DD HH.MM)
+                '',
+                s
+            )
+            
+            # Versuche Item-Name am Anfang des Textes zu finden
+            lines = s_cleaned.split('\n')
+            for line in lines[:10]:  # Erste 10 Zeilen prüfen
+                line = line.strip()
+                if not line or len(line) < 3:
+                    continue
+                # Filtere UI-Keywords und Zahlen-dominierte Zeilen
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in ['balance', 'warehouse', 'set price', 'desired', 'register', 'quantity', 'silver', 'max', 'min', 'collect', 're-list']):
+                    continue
+                # Filtere Zeilen die hauptsächlich aus Zahlen/Kommas bestehen
+                alpha_count = sum(c.isalpha() for c in line)
+                if alpha_count < 3:
+                    continue
+                # Bereinige Grade-Brackets
+                cleaned = re.sub(r'\[.*?\]', '', line).strip()
+                if cleaned and len(cleaned) >= 3:
+                    # Entferne führende/trailing Sonderzeichen
+                    cleaned = re.sub(r'^[^A-Za-z0-9]+', '', cleaned)
+                    cleaned = re.sub(r'[^A-Za-z0-9\s\-\'\(\)]+$', '', cleaned).strip()
+                    if cleaned:
+                        metrics['item_name'] = cleaned
+                        break
+            
+            # Debug-Logging für extrahierte Metriken
+            if self.debug and metrics:
+                log_debug(f"[DETAIL-EXTRACT] Extracted metrics for {window_type}:")
+                log_debug(f"   Balance: {metrics.get('balance')}")
+                log_debug(f"   Warehouse: {metrics.get('warehouse_qty')}")
+                log_debug(f"   Item: {metrics.get('item_name')}")
+                if len(s) <= 200:
+                    log_debug(f"   OCR Text: {s}")
+                else:
+                    log_debug(f"   OCR Preview: {s[:200]}...")
+            
+            # Return-Logik: Balance ist Pflicht, Warehouse optional
+            # (Warehouse-Änderung ist nicht immer sofort sichtbar)
+            if 'balance' in metrics:
+                return metrics
+            
+            # Keine Balance erkannt → None zurückgeben
+            if self.debug:
+                log_debug(f"[DETAIL-EXTRACT] No balance found in metrics, returning None")
+            return None
+            
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[DETAIL] Error extracting detail window metrics: {e}")
+            return None
+
     @lru_cache(maxsize=500)
     def _valid_item_name(self, name: str) -> bool:
         """
@@ -1887,6 +2155,280 @@ class MarketTracker:
                 print("DB Error beim Speichern:", e)
                 return False
 
+    def _reset_detail_window_state(self):
+        """Reset Detail-Fenster State."""
+        self._detail_window_active = False
+        self._detail_window_type = None
+        self._detail_window_item = None
+        self._detail_baseline_balance = None
+        self._detail_baseline_warehouse = None
+        self._detail_last_metrics = None
+        self._detail_confirmation_pending = False
+        self._detail_confirmation_timestamp = None
+
+    def _infer_transaction_from_deltas(
+        self,
+        window_type: str,
+        balance_delta: int,
+        warehouse_delta: int,
+        current_metrics: dict,
+        last_metrics: dict
+    ) -> dict | None:
+        """
+        Leitet Transaktion aus Balance- und Warehouse-Deltas ab.
+        
+        Regeln:
+        
+        Sell-Item Window:
+        - Balance steigt → Verkauf erfolgreich
+        - Warehouse sinkt → Ware wurde entnommen
+        - Preis = Balance-Delta / Tax-Factor (0.88725)
+        - Menge = abs(Warehouse-Delta)
+        - Typ = 'sell'
+        
+        Buy-Item Window:
+        - Balance sinkt → Kauf erfolgreich
+        - Warehouse steigt → Ware wurde hinzugefügt
+        - Preis = abs(Balance-Delta)
+        - Menge = Warehouse-Delta
+        - Typ = 'buy'
+        
+        Args:
+            window_type: 'sell_item' oder 'buy_item'
+            balance_delta: Änderung der Balance (positiv = mehr Geld)
+            warehouse_delta: Änderung der Warehouse (positiv = mehr Items)
+            current_metrics: Aktuelle Metriken (mit set_price/desired_price/quantity)
+            last_metrics: Letzte Metriken vor Änderung
+        
+        Returns:
+            dict mit Transaction-Daten oder None
+        """
+        try:
+            TAX_FACTOR = 0.88725  # BDO Central Market Tax
+            
+            if window_type == 'sell_item':
+                # Sell: Balance steigt, Warehouse sinkt
+                if balance_delta <= 0 or warehouse_delta >= 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] Sell-Transaction rejected: balance_delta={balance_delta}, warehouse_delta={warehouse_delta}")
+                    return None
+                
+                # Berechne Brutto-Preis (vor Steuern)
+                gross_price = int(balance_delta / TAX_FACTOR)
+                quantity = abs(warehouse_delta)
+                
+                # Plausibilitätsprüfung: Vergleiche mit set_price falls vorhanden
+                set_price = current_metrics.get('set_price') or last_metrics.get('set_price')
+                if set_price:
+                    expected_gross = set_price * quantity
+                    # Toleriere 5% Abweichung
+                    if abs(gross_price - expected_gross) / expected_gross > 0.05:
+                        if self.debug:
+                            log_debug(f"[DETAIL] Sell price mismatch: calculated={gross_price}, expected={expected_gross}")
+                        # Nutze set_price wenn plausibel
+                        gross_price = expected_gross
+                
+                transaction_type = 'sell'
+                tx_case = 'sell_collect'  # Detail-Window-Verkäufe sind immer direkte Collects
+                
+            elif window_type == 'buy_item':
+                # Buy: Balance sinkt, Warehouse steigt
+                if balance_delta >= 0 or warehouse_delta <= 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] Buy-Transaction rejected: balance_delta={balance_delta}, warehouse_delta={warehouse_delta}")
+                    return None
+                
+                # Preis = Betrag den wir bezahlt haben (positiv)
+                gross_price = abs(balance_delta)
+                quantity = warehouse_delta
+                
+                # Plausibilitätsprüfung: Vergleiche mit desired_price falls vorhanden
+                desired_price = current_metrics.get('desired_price') or last_metrics.get('desired_price')
+                if desired_price:
+                    expected_gross = desired_price * quantity
+                    # Toleriere 5% Abweichung
+                    if abs(gross_price - expected_gross) / expected_gross > 0.05:
+                        if self.debug:
+                            log_debug(f"[DETAIL] Buy price mismatch: calculated={gross_price}, expected={expected_gross}")
+                        # Nutze desired_price wenn plausibel
+                        gross_price = expected_gross
+                
+                transaction_type = 'buy'
+                tx_case = 'buy_collect'  # Detail-Window-Käufe sind immer direkte Collects
+                
+            else:
+                return None
+            
+            # Item-Name aus Metriken holen
+            item_name = current_metrics.get('item_name') or last_metrics.get('item_name') or self._detail_window_item
+            if not item_name:
+                if self.debug:
+                    log_debug("[DETAIL] Transaction rejected: No item name available")
+                return None
+            
+            # Validiere und korrigiere Item-Name
+            from market_json_manager import correct_item_name
+            corrected_result = correct_item_name(item_name)
+            if not corrected_result or not corrected_result[0]:
+                if self.debug:
+                    log_debug(f"[DETAIL] Transaction rejected: Item name '{item_name}' not in whitelist")
+                return None
+            
+            corrected_name = corrected_result[0]  # Nur den Namen extrahieren (Tuple: (name, was_corrected))
+            
+            # Validiere Menge
+            if not (1 <= quantity <= 5000):
+                if self.debug:
+                    log_debug(f"[DETAIL] Transaction rejected: Invalid quantity {quantity}")
+                return None
+            
+            # Erstelle Transaction-Dict
+            transaction = {
+                'item_name': corrected_name,
+                'quantity': quantity,
+                'price': gross_price,
+                'transaction_type': transaction_type,
+                'timestamp': datetime.datetime.now(),  # System-Timestamp!
+                'tx_case': tx_case,
+                '_from_detail_window': True,  # Markierung für Deduplication
+            }
+            
+            if self.debug:
+                log_debug(f"[DETAIL] ✅ Inferred transaction: {transaction_type} {quantity}x {corrected_name} @ {gross_price} Silver (total)")
+            
+            return transaction
+            
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[DETAIL] Error inferring transaction from deltas: {e}")
+            return None
+
+    def _monitor_detail_window(self, window_type: str, ocr_text: str):
+        """
+        Überwacht Detail-Fenster und erkennt Transaktionen durch Balance/Warehouse-Deltas.
+        
+        State-Machine:
+        1. IDLE → Detail-Fenster erkannt → Baseline erfassen → MONITORING
+        2. MONITORING → Balance/Warehouse-Änderung → TRANSACTION_DETECTED
+        3. TRANSACTION_DETECTED → Transaktion speichern → Baseline updaten → MONITORING
+        4. MONITORING → Timeout (5s ohne Änderung) → IDLE
+        
+        Args:
+            window_type: 'sell_item' oder 'buy_item'
+            ocr_text: Kombinierter OCR-Text (Label + Item-Name + Balance + Warehouse)
+        
+        Returns:
+            None (speichert Transaktion direkt wenn erkannt)
+        """
+        now = datetime.datetime.now()
+        
+        # Extrahiere aktuelle Metriken
+        current_metrics = self._extract_detail_window_metrics(ocr_text, window_type)
+        
+        if not current_metrics:
+            # Keine gültigen Metriken → Prüfe Timeout
+            if self._detail_confirmation_pending and self._detail_confirmation_timestamp:
+                elapsed = (now - self._detail_confirmation_timestamp).total_seconds()
+                if elapsed > self._detail_confirmation_timeout:
+                    if self.debug:
+                        log_debug(f"[DETAIL] Timeout after {elapsed:.1f}s - resetting state")
+                    self._reset_detail_window_state()
+            return
+        
+        # 1. Detail-Fenster-Eintritt: Baseline setzen
+        if not self._detail_window_active:
+            self._detail_window_active = True
+            self._detail_window_type = window_type
+            self._detail_baseline_balance = current_metrics.get('balance')
+            self._detail_baseline_warehouse = current_metrics.get('warehouse_qty')
+            self._detail_last_metrics = current_metrics
+            self._detail_window_item = current_metrics.get('item_name')
+            
+            if self.debug:
+                log_debug(
+                    f"[DETAIL] Entered {window_type} window\n"
+                    f"   Item: {self._detail_window_item}\n"
+                    f"   Balance baseline: {self._detail_baseline_balance}\n"
+                    f"   Warehouse baseline: {self._detail_baseline_warehouse}"
+                )
+            return
+        
+        # 2. Überprüfe ob Fenstertyp geändert hat (sollte nicht passieren)
+        if self._detail_window_type != window_type:
+            if self.debug:
+                log_debug(f"[DETAIL] Window type changed from {self._detail_window_type} to {window_type} - resetting")
+            self._reset_detail_window_state()
+            # Rekursiv aufrufen um neue Baseline zu setzen
+            self._monitor_detail_window(window_type, ocr_text)
+            return
+        
+        # 3. Vergleiche Balance und Warehouse mit Baseline
+        current_balance = current_metrics.get('balance')
+        current_warehouse = current_metrics.get('warehouse_qty')
+        
+        if current_balance is None or current_warehouse is None:
+            # Unvollständige Metriken → Weiter warten
+            return
+        
+        # 4. Prüfe ob Änderung vorhanden
+        balance_changed = (
+            self._detail_baseline_balance is not None and
+            current_balance != self._detail_baseline_balance
+        )
+        warehouse_changed = (
+            self._detail_baseline_warehouse is not None and
+            current_warehouse != self._detail_baseline_warehouse
+        )
+        
+        if not balance_changed and not warehouse_changed:
+            # Keine Änderung → Weiter warten
+            # Update last_metrics für spätere Vergleiche
+            self._detail_last_metrics = current_metrics
+            # Update Item-Name falls jetzt erkannt
+            if not self._detail_window_item and current_metrics.get('item_name'):
+                self._detail_window_item = current_metrics.get('item_name')
+                if self.debug:
+                    log_debug(f"[DETAIL] Item name detected: {self._detail_window_item}")
+            return
+        
+        # 5. Änderung erkannt → Transaktion verarbeiten
+        if self.debug:
+            balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance else 0
+            warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse else 0
+            log_debug(
+                f"[DETAIL] Change detected in {window_type}\n"
+                f"   Balance: {self._detail_baseline_balance} → {current_balance} (Δ {balance_delta:+,})\n"
+                f"   Warehouse: {self._detail_baseline_warehouse} → {current_warehouse} (Δ {warehouse_delta:+})"
+            )
+        
+        # 6. Berechne Deltas
+        balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance else 0
+        warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse else 0
+        
+        # 7. Bestimme Transaktionstyp und -werte
+        transaction = self._infer_transaction_from_deltas(
+            window_type,
+            balance_delta,
+            warehouse_delta,
+            current_metrics,
+            self._detail_last_metrics or {}
+        )
+        
+        if transaction:
+            # 8. Speichere Transaktion
+            success = self.store_transaction_db(transaction)
+            if success and self.debug:
+                log_debug(f"[DETAIL] ✅ Transaction saved successfully")
+            elif not success and self.debug:
+                log_debug(f"[DETAIL] ⚠️ Transaction not saved (duplicate or error)")
+        
+        # 9. Reset State für nächste Transaktion
+        # Update Baseline mit aktuellen Werten
+        self._detail_baseline_balance = current_balance
+        self._detail_baseline_warehouse = current_warehouse
+        self._detail_last_metrics = current_metrics
+        self._detail_confirmation_pending = False
+
     def process_ocr_text(self, full_text):
         """
         Hauptfunktion:
@@ -1967,10 +2509,12 @@ class MarketTracker:
                 msg = f"window='{wtype}' -> keine Auswertung"
                 print("DEBUG:", msg)
                 log_debug(msg)
-            # Kein Update von last_overview_text hier, damit Delta sauber bleibt
-            # Wenn Detail-Fenster aktiv ist, aktiviere einen kurzen Burst-Scan, um das Zurückspringen
-            # ins Overview-Fenster mit hoher Wahrscheinlichkeit zu erwischen.
+            # Detail-Window-Monitoring: Überwache Balance/Warehouse-Deltas
             if wtype in ("buy_item", "sell_item"):
+                # Aktiviere Detail-Window-Monitoring
+                self._monitor_detail_window(wtype, full_text)
+                
+                # Burst-Scan für schnelles Zurückspringen zum Overview
                 self._burst_until = now + datetime.timedelta(seconds=4.0)
                 self._burst_source = 'item_window'
                 # schedule multiple immediate fast scans
@@ -1979,6 +2523,13 @@ class MarketTracker:
                 self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                 if self.debug:
                     log_debug(f"burst scan enabled until {self._burst_until} (+{self._burst_fast_scans} fast scans) due to item window '{wtype}'")
+            else:
+                # Nicht in Detail-Fenster → Reset State
+                if self._detail_window_active:
+                    if self.debug:
+                        log_debug("[DETAIL] Left detail window - resetting state")
+                    self._reset_detail_window_state()
+            # Kein Update von last_overview_text hier, damit Delta sauber bleibt
             return
 
         # detect current tab from the whole OCR snapshot (nur zur Diagnose); Entscheidung über Seite strikt aus Window-Type
