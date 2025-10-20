@@ -99,10 +99,24 @@ _base_cur.execute(
     """
 )
 
+# Item presets table for filter presets (e.g., "Harmony Draught" materials)
+_base_cur.execute(
+    """
+    CREATE TABLE IF NOT EXISTS item_presets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        items TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+)
+
 _base_conn.commit()
 
 # Thread-local connections
 _local = threading.local()
+
 
 def get_connection():
     conn = getattr(_local, 'conn', None)
@@ -373,3 +387,296 @@ def transaction_exists_by_values_near_time(item_name: str, quantity: int, price:
         return c.fetchone() is not None
     except Exception:
         return False
+
+
+# -----------------------
+# Item Presets Management
+# -----------------------
+
+def get_all_presets() -> list[dict[str, any]]:
+    """Retrieve all item presets from the database.
+    
+    Returns:
+        List of dicts with keys: id, name, items (list), created_at, updated_at
+    """
+    try:
+        import json
+        c = get_cursor()
+        c.execute("""
+            SELECT id, name, items, created_at, updated_at 
+            FROM item_presets 
+            ORDER BY name ASC
+        """)
+        rows = c.fetchall()
+        result = []
+        for row in rows:
+            preset_id, name, items_json, created_at, updated_at = row
+            try:
+                items_list = json.loads(items_json)
+            except Exception:
+                items_list = []
+            result.append({
+                'id': preset_id,
+                'name': name,
+                'items': items_list,
+                'created_at': created_at,
+                'updated_at': updated_at
+            })
+        return result
+    except Exception as e:
+        print(f"Error loading presets: {e}")
+        return []
+
+
+def get_preset_by_name(name: str) -> dict[str, any] | None:
+    """Retrieve a single preset by name.
+    
+    Args:
+        name: The preset name
+        
+    Returns:
+        Dict with keys: id, name, items (list), created_at, updated_at, or None if not found
+    """
+    try:
+        import json
+        c = get_cursor()
+        c.execute("""
+            SELECT id, name, items, created_at, updated_at 
+            FROM item_presets 
+            WHERE name = ?
+        """, (name,))
+        row = c.fetchone()
+        if not row:
+            return None
+        preset_id, name, items_json, created_at, updated_at = row
+        try:
+            items_list = json.loads(items_json)
+        except Exception:
+            items_list = []
+        return {
+            'id': preset_id,
+            'name': name,
+            'items': items_list,
+            'created_at': created_at,
+            'updated_at': updated_at
+        }
+    except Exception as e:
+        print(f"Error loading preset '{name}': {e}")
+        return None
+
+
+def save_preset(name: str, items: list[str]) -> bool:
+    """Create or update an item preset.
+    
+    Args:
+        name: The preset name (unique identifier)
+        items: List of item names to include in the preset
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        import json
+        items_json = json.dumps(items, ensure_ascii=False)
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO item_presets (name, items, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (name, items_json))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error saving preset '{name}': {e}")
+        return False
+
+
+def delete_preset(name: str) -> bool:
+    """Delete an item preset by name.
+    
+    Args:
+        name: The preset name to delete
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        conn = get_connection()
+        c = conn.cursor()
+        c.execute("DELETE FROM item_presets WHERE name = ?", (name,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error deleting preset '{name}': {e}")
+        return False
+
+
+def get_transactions_by_preset(preset_name: str, start_date: str, end_date: str) -> list[tuple]:
+    """Retrieve transactions filtered by items in a preset.
+    
+    Args:
+        preset_name: Name of the preset to use for filtering
+        start_date: Start date (YYYY-MM-DD format)
+        end_date: End date (YYYY-MM-DD format)
+        
+    Returns:
+        List of transaction tuples
+    """
+    try:
+        preset = get_preset_by_name(preset_name)
+        if not preset or not preset['items']:
+            return []
+        
+        items = preset['items']
+        c = get_cursor()
+        
+        # Build IN clause with placeholders
+        placeholders = ','.join('?' * len(items))
+        query = f"""
+            SELECT * FROM transactions 
+            WHERE timestamp BETWEEN ? AND ?
+            AND item_name IN ({placeholders})
+            ORDER BY timestamp DESC
+        """
+        
+        params = [f"{start_date} 00:00:00", f"{end_date} 23:59:59"] + items
+        c.execute(query, params)
+        return c.fetchall()
+    except Exception as e:
+        print(f"Error querying transactions by preset '{preset_name}': {e}")
+        return []
+
+
+def initialize_default_presets():
+    """Create default presets if they don't exist yet.
+    
+    This function is called on database initialization to seed the presets table
+    with useful default configurations.
+    """
+    # Check if "Harmony Draught" preset already exists
+    if get_preset_by_name("Harmony Draught") is not None:
+        return
+    
+    # Harmony Draught preset: All items related to crafting and selling Harmony Draught elixirs
+    harmony_draught_items = [
+        # All Harmony Draught variants
+        "Harmony Draught",
+        "[Party] Harmony Draught - Human",
+        "[Party] Harmony Draught - Demihuman",
+        "[Party] Harmony Draught - Kamasylvia",
+        "[Party] Harmony Draught - Edania",
+        "[Party] Immortal: Harmony Draught - Human",
+        
+        # All Elixirs (commonly used/traded alongside Harmony Draughts)
+        "Brutal Death Elixir",
+        "Defense Elixir",
+        "Elixir of Advanced Concentration",
+        "Elixir of Agile Spells",
+        "Elixir of Assassination",
+        "Elixir of Brutal Carnage",
+        "Elixir of Brutal Perforation",
+        "Elixir of Carnage",
+        "Elixir of Concentration",
+        "Elixir of Death",
+        "Elixir of Destruction",
+        "Elixir of Detection",
+        "Elixir of Draining",
+        "Elixir of Edania",
+        "Elixir of Endless Frenzy",
+        "Elixir of Endurance",
+        "Elixir of Flowing Wind",
+        "Elixir of Frenzy",
+        "Elixir of Intrepid Swiftness",
+        "Elixir of Lethal Assassin", 
+        "Elixir of Lethal Destruction",
+        "Elixir of Life",
+        "Elixir of Overwhelming Endurance",
+        "Elixir of Perforation",
+        "Elixir of Sharp Detection",
+        "Elixir of Shock",
+        "Elixir of Sky",
+        "Elixir of Spells",
+        "Elixir of Steel Defense",
+        "Elixir of Strong Draining",
+        "Elixir of Strong Life",
+        "Elixir of Strong Shock",
+        "Elixir of Swiftness",
+        "Elixir of Remarkable Will",
+        "Elixir of Will",
+        "Elixir of Wind",
+        "Grim Reaper's Elixir",
+        "Grim Soul Reaper's Elixir",
+        "Helix Elixir",
+        "Merciless Sky Elixir",
+        "Splendid Helix Elixir",
+        "Strong Elixir of Edania",
+        
+        # Crafting materials (mushrooms, saps, powders, etc.)
+        "Arrow Mushroom",
+        "Ash Sap",
+        "Birch Sap",
+        "Black Stone Powder",
+        "Bloody Tree Knot",
+        "Caphras Tree Sap",
+        "Cedar Sap",
+        "Clear Liquid Reagent",
+        "Cloud Mushroom",
+        "Clown's Blood",
+        "Dwarf Mushroom",
+        "Emperor Mushroom",
+        "Fir Sap",
+        "Fire Flake Flower",
+        "Fortune Teller Mushroom",
+        "Fox Blood",
+        "Ghost Mushroom",
+        "HP Potion (Small)",
+        "Ibellab's Essence",
+        "Legendary Beast's Blood",
+        "Lion Blood",
+        "Maple Sap",
+        "Monk's Branch",
+        "Oil of Corruption",
+        "Oil of Fortitude",
+        "Oil of Regeneration",
+        "Oil of Storms",
+        "Oil of Tranquility",
+        "Old Tree Bark",
+        "Pig Blood",
+        "Pine Sap",
+        "Powder of Darkness",
+        "Powder of Flame",
+        "Powder of Time",
+        "Pure Powder Reagent",
+        "Purified Water",
+        "Red Tree Lump",
+        "Rhino Blood",
+        "Silver Azalea",
+        "Sinner's Blood",
+        "Sky Mushroom",
+        "Snowfield Cedar Sap",
+        "Special Amanita Mushroom",
+        "Special Ancient Mushroom",
+        "Special Bluffer Mushroom",
+        "Special Hump Mushroom",
+        "Spellbound Catalyst",
+        "Spirit's Leaf",
+        "Sunrise Herb",
+        "Thuja Sap",
+        "Tiger Mushroom",
+        "Trace of Nature",
+        "Truffle Mushroom",
+        "Tyrant's Blood",
+        "Wild Grass",
+        "Wise Man's Blood",
+    ]
+    
+    save_preset("Harmony Draught", harmony_draught_items)
+    print("[DB] Initialized default preset: 'Harmony Draught'")
+
+
+# Initialize default presets on module load
+try:
+    initialize_default_presets()
+except Exception as e:
+    print(f"[WARNING] Could not initialize default presets: {e}")
+
