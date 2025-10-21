@@ -143,7 +143,7 @@ class TestTransactionInference:
         assert tx['item_name'] == 'Powder of Darkness'
         # Preis sollte ca. 15000*10 = 150000 sein (Brutto)
         assert 140000 <= tx['price'] <= 170000
-        assert tx['tx_case'] == 'sell_collect'
+        assert tx['tx_case'] == 'sell_collect_ui_inferred'  # Detail-Window transactions use _ui_inferred suffix
         assert tx['_from_detail_window'] is True
     
     def test_infer_buy_transaction_basic(self):
@@ -176,7 +176,7 @@ class TestTransactionInference:
         assert tx['item_name'] == 'Brutal Death Elixir'
         # Preis sollte ca. 4500000*5 = 22500000 sein
         assert 22000000 <= tx['price'] <= 23000000
-        assert tx['tx_case'] == 'buy_collect'
+        assert tx['tx_case'] == 'buy_collect_ui_inferred'  # Detail-Window transactions use _ui_inferred suffix
         assert tx['_from_detail_window'] is True
     
     def test_infer_sell_invalid_deltas(self):
@@ -204,6 +204,106 @@ class TestTransactionInference:
         
         assert tx is None
     
+    def test_infer_buy_warehouse_only_delta(self):
+        """Test: Warehouse-Only Delta (Preorder-Collect ohne Kauf)
+        
+        Wenn warehouse_delta > 0 ABER balance_delta = 0:
+        → Preorder wurde collected, aber noch kein Kauf
+        → Sollte KEINE Transaktion erstellen (warten auf echten Kauf)
+        """
+        current_metrics = {
+            'item_name': 'Powder of Flame',
+            'desired_price': 2230000,
+            'balance': 10000000,  # Unverändert
+            'warehouse_qty': 5000,  # +5000 (Preorder collected)
+        }
+        last_metrics = {
+            'balance': 10000000,  # Gleich!
+            'warehouse_qty': 0,
+        }
+        
+        balance_delta = 0  # Keine Balance-Änderung
+        warehouse_delta = 5000  # +5000 Items
+        
+        tx = self.tracker._infer_transaction_from_deltas(
+            'buy_item',
+            balance_delta,
+            warehouse_delta,
+            current_metrics,
+            last_metrics
+        )
+        
+        # Sollte None zurückgeben (warten auf echten Kauf mit balance_delta < 0)
+        assert tx is None
+        # pending_collect_qty sollte gesetzt sein
+        assert self.tracker._detail_pending_collect_qty == 5000
+    
+    def test_infer_buy_preorder_collect_combo(self):
+        """Test: Preorder-Collect + Purchase kombiniert (Lion Blood Szenario)
+        
+        Sequenz:
+        1. Warehouse-Only Delta +3048 (Preorder collected) → pending_collect_qty = 3048
+        2. Combined Delta: Balance -95.5M, Warehouse +5000 (Purchase)
+        → Sollte 8048x @ 95.5M total erstellen
+        """
+        # Schritt 1: Warehouse-Only Delta (Preorder-Collect)
+        self.tracker._detail_pending_collect_qty = 0
+        self.tracker._detail_partial_balance_delta = 0
+        self.tracker._detail_partial_warehouse_delta = 0
+        
+        current_metrics_1 = {
+            'item_name': 'Lion Blood',
+            'desired_price': 19100,
+            'balance': 10000000,  # Unverändert
+            'warehouse_qty': 3048,  # +3048 (Preorder collected)
+        }
+        last_metrics_1 = {
+            'balance': 10000000,
+            'warehouse_qty': 0,
+        }
+        
+        tx1 = self.tracker._infer_transaction_from_deltas(
+            'buy_item',
+            0,  # balance_delta = 0
+            3048,  # warehouse_delta = +3048
+            current_metrics_1,
+            last_metrics_1
+        )
+        
+        # Sollte None zurückgeben, aber pending_collect_qty setzen
+        assert tx1 is None
+        assert self.tracker._detail_pending_collect_qty == 3048
+        
+        # Schritt 2: Combined Delta (Balance + Warehouse)
+        current_metrics_2 = {
+            'item_name': 'Lion Blood',
+            'desired_price': 19100,
+            'balance': 9904500000,  # -95.5M
+            'warehouse_qty': 8048,  # +5000 (total 3048+5000)
+        }
+        last_metrics_2 = {
+            'balance': 10000000,
+            'warehouse_qty': 3048,
+        }
+        
+        tx2 = self.tracker._infer_transaction_from_deltas(
+            'buy_item',
+            -95500000,  # balance_delta = -95.5M
+            5000,  # warehouse_delta = +5000
+            current_metrics_2,
+            last_metrics_2
+        )
+        
+        # Sollte Transaction mit kombinierter Menge erstellen
+        assert tx2 is not None
+        assert tx2['transaction_type'] == 'buy'
+        assert tx2['quantity'] == 8048  # 3048 (preorder) + 5000 (purchase)
+        assert tx2['price'] == 95500000  # Nur neuer Kauf-Preis
+        assert tx2['item_name'] == 'Lion Blood'
+        assert tx2['tx_case'] == 'buy_collect_ui_inferred'
+        # pending_collect_qty sollte zurückgesetzt sein
+        assert self.tracker._detail_pending_collect_qty == 0
+    
     def test_infer_buy_invalid_deltas(self):
         """Test: Ungültige Buy-Deltas (Warehouse sinkt statt steigt)"""
         current_metrics = {
@@ -228,6 +328,48 @@ class TestTransactionInference:
         )
         
         assert tx is None
+    
+    def test_infer_buy_with_new_preorder(self):
+        """Test: Purchase + neue Preorder (warehouse_delta = 0)
+        
+        Wenn gleichzeitig gekauft UND neue Preorder gesetzt wird:
+        - Balance: -95.5M (Kauf)
+        - Warehouse: 0 (5000 gekauft - 5000 neue Preorder = 0)
+        - OCR enthält "Placed order x5000"
+        → Sollte 5000x @ 95.5M erstellen
+        """
+        # Setze OCR-Text-Buffer mit "Placed order"
+        self.tracker._detail_last_ocr_text = "2025.10.20 21:43 Placed order of Lion Blood x5,000 for 95,500,000 Silver"
+        self.tracker._detail_pending_collect_qty = 0
+        self.tracker._detail_partial_balance_delta = 0
+        self.tracker._detail_partial_warehouse_delta = 0
+        
+        current_metrics = {
+            'item_name': 'Lion Blood',
+            'desired_price': 19100,
+            'balance': 9904500000,  # -95.5M
+            'warehouse_qty': 23048,  # Unchanged (5000 bought - 5000 placed = 0)
+        }
+        last_metrics = {
+            'balance': 10000000000,
+            'warehouse_qty': 23048,  # Same!
+        }
+        
+        tx = self.tracker._infer_transaction_from_deltas(
+            'buy_item',
+            -95500000,  # balance_delta = -95.5M
+            0,  # warehouse_delta = 0 (!)
+            current_metrics,
+            last_metrics
+        )
+        
+        # Sollte Transaction erstellen trotz warehouse_delta = 0
+        assert tx is not None
+        assert tx['transaction_type'] == 'buy'
+        assert tx['quantity'] == 5000  # Aus "Placed order" extrahiert
+        assert tx['price'] == 95500000
+        assert tx['item_name'] == 'Lion Blood'
+        assert tx['tx_case'] == 'buy_collect_ui_inferred'
     
     def test_infer_no_item_name(self):
         """Test: Keine Item-Name vorhanden (sollte fehlschlagen)"""
@@ -254,19 +396,26 @@ class TestTransactionInference:
         assert tx is None
     
     def test_infer_quantity_out_of_range(self):
-        """Test: Menge außerhalb gültiger Range (1-5000)"""
+        """Test: Menge außerhalb gültiger Range (1-500000)"""
+        self.tracker._detail_window_active = 'sell_item'
+        self.tracker._detail_window_item = 'Test Item'
+        self.tracker._detail_baseline_balance = 1000000
+        self.tracker._detail_baseline_warehouse = 600000
+        self.tracker._detail_partial_balance_delta = 0
+        self.tracker._detail_partial_warehouse_delta = 0
+        
         current_metrics = {
             'item_name': 'Test Item',
-            'balance': 2000000,
+            'balance': 200000000,  # +199M
             'warehouse_qty': 0,
         }
         last_metrics = {
             'balance': 1000000,
-            'warehouse_qty': 6000,  # 6000 Items verkauft = ungültig!
+            'warehouse_qty': 600000,  # 600000 Items verkauft (über 500000 Limit)
         }
         
-        balance_delta = 1000000
-        warehouse_delta = -6000
+        balance_delta = 199000000  # Großer Gewinn
+        warehouse_delta = -600000  # Zu viele Items (über Limit)
         
         tx = self.tracker._infer_transaction_from_deltas(
             'sell_item',
@@ -276,6 +425,7 @@ class TestTransactionInference:
             last_metrics
         )
         
+        # Sollte abgelehnt werden wegen quantity > 500000
         assert tx is None
 
 
@@ -287,7 +437,11 @@ class TestDetailWindowStateMachine:
         self.tracker = MarketTracker(debug=False)
     
     def test_state_initial_entry(self):
-        """Test: Erstes Betreten des Detail-Fensters setzt Baseline"""
+        """Test: Erstes Betreten des Detail-Fensters setzt Baseline
+        
+        Baseline wird direkt aus erster OCR-Ablesung gesetzt (keine Manipulation).
+        Warehouse-Only-Deltas (Preorder-Collect) werden später beim Transaction-Inference gefiltert.
+        """
         ocr_text = """
         Powder of Darkness
         Balance: 1,000,000 Silver
@@ -304,6 +458,7 @@ class TestDetailWindowStateMachine:
         assert self.tracker._detail_window_active
         assert self.tracker._detail_window_type == 'sell_item'
         assert self.tracker._detail_baseline_balance == 1000000
+        # Baseline wird direkt aus OCR-Ablesung gesetzt (keine Manipulation mehr)
         assert self.tracker._detail_baseline_warehouse == 50
     
     def test_state_no_change_no_transaction(self):
@@ -325,7 +480,10 @@ class TestDetailWindowStateMachine:
         assert len(self.tracker.seen_tx_signatures) == initial_sig_count
     
     def test_state_reset_on_window_change(self):
-        """Test: Fensterwechsel resettet State"""
+        """Test: Fensterwechsel resettet State
+        
+        Baseline wird aus OCR-Ablesung gesetzt (keine Manipulation).
+        """
         ocr_text_sell = "Balance: 1,000,000 Silver\nWarehouse Quantity: 50"
         ocr_text_buy = "Balance: 2,000,000 Silver\nWarehouse Quantity: 10"
         
@@ -339,6 +497,7 @@ class TestDetailWindowStateMachine:
         # State sollte neu initialisiert sein
         assert self.tracker._detail_window_type == 'buy_item'
         assert self.tracker._detail_baseline_balance == 2000000
+        # Baseline wird direkt aus OCR-Ablesung gesetzt
         assert self.tracker._detail_baseline_warehouse == 10
     
     def test_state_manual_reset(self):

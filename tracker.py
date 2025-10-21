@@ -233,6 +233,19 @@ class MarketTracker:
         self._detail_confirmation_pending = False  # True wenn Bestätigung erwartet wird
         self._detail_confirmation_timestamp = None  # Timestamp der letzten erkannten Änderung
         self._detail_confirmation_timeout = 5.0  # Sekunden bis Timeout (Reset)
+        # Partial Delta Accumulation (handles asynchronous Balance/Warehouse updates)
+        self._detail_partial_balance_delta = 0  # Akkumulierter Balance-Delta
+        self._detail_partial_warehouse_delta = 0  # Akkumulierter Warehouse-Delta
+        self._detail_balance_delta_timestamp = None  # Zeitpunkt des ersten balance_delta (für Timeout)
+        
+        # Sync-Tracking: Verhindert Plausibility Check bei partial updates
+        self._detail_balance_changed_once = False  # True wenn Balance sich mindestens 1x geändert hat
+        self._detail_warehouse_changed_once = False  # True wenn Warehouse sich mindestens 1x geändert hat
+        
+        # Frame-Perfect Baseline Capture (FIX: Pig Blood Issue)
+        self._detail_needs_baseline_capture = False  # True direkt nach Window-Transition
+        self._detail_baseline_captured = False  # True nachdem erste Baseline gesetzt wurde
+        self._detail_window_entry_item = None  # Item-Name beim Window-Entry (für Log-Fallback)
         
         # Async pipeline controller placeholder
         self._async_controller = None
@@ -262,6 +275,9 @@ class MarketTracker:
         
         # Metrics-Refresh-Rate-Limiting: Minimum delay between refreshes
         self._last_metrics_refresh_time = None
+        
+        # Log-Fallback für fehlende Detail-Window Transaktionen
+        self._pending_log_fallback_txs = []
 
         if self.debug:
             log_debug(f"[INIT] Baseline initialized: {self._baseline_initialized}, Poll interval: {self.poll_interval}s")
@@ -865,33 +881,25 @@ class MarketTracker:
             if self.debug:
                 log_debug(f"[PRICE] Item correction failed for base price lookup '{item_name}': {exc}")
 
+        # CRITICAL FIX: Use BDO API instead of market.json for base_price!
+        # market.json is ONLY used for item_name → item_id resolution
+        # Actual prices must come from BDO Trade Market API
         base_price: int | None = None
         for candidate in candidates:
             if not candidate:
                 continue
             try:
-                offline_price = get_base_price_from_cache(candidate, min_score=80)
-            except Exception as exc:
-                offline_price = None
-                if self.debug:
-                    log_debug(f"[PRICE] Local base price lookup failed for '{candidate}': {exc}")
-            if offline_price:
-                base_price = int(offline_price)
-                break
-
-        if base_price is None:
-            for candidate in candidates:
-                if not candidate:
-                    continue
-                try:
-                    data = get_item_price_range_by_name(candidate, use_cache=True)
-                except Exception as exc:
-                    if self.debug:
-                        log_debug(f"[PRICE] Base price lookup failed for '{candidate}': {exc}")
-                    continue
+                # Get live price data from BDO API
+                data = get_item_price_range_by_name(candidate, use_cache=True)
                 if data and data.get('base_price'):
                     base_price = int(data['base_price'])
+                    if self.debug:
+                        log_debug(f"[PRICE] Base price from BDO API for '{candidate}': {base_price:,}")
                     break
+            except Exception as exc:
+                if self.debug:
+                    log_debug(f"[PRICE] BDO API lookup failed for '{candidate}': {exc}")
+                continue
 
         # cache result (including None to avoid repeated lookups)
         self._base_price_cache[key] = base_price or 0
@@ -1584,50 +1592,7 @@ class MarketTracker:
                             metrics['warehouse_qty'] = wh_val
                             break
             
-            # 3. Set Price / Desired Price extrahieren
-            # Sell-Item: "Set Price: 15,000 Silver"
-            # Buy-Item: "Desired Price: 4,500,000 Silver"
-            if window_type == 'sell_item':
-                price_pattern = re.compile(
-                    r'Set\s+Price\s*[:;]?\s*([0-9,\.]+)\s*Silver',
-                    re.IGNORECASE
-                )
-            else:  # buy_item
-                price_pattern = re.compile(
-                    r'Desired\s+Price\s*[:;]?\s*([0-9,\.]+)\s*Silver',
-                    re.IGNORECASE
-                )
-            
-            m = price_pattern.search(s)
-            if m:
-                price_val = normalize_numeric_str(m.group(1))
-                if price_val is not None:
-                    if window_type == 'sell_item':
-                        metrics['set_price'] = price_val
-                    else:
-                        metrics['desired_price'] = price_val
-            
-            # 4. Register Quantity / Desired Amount extrahieren
-            # Sell-Item: "Register Quantity: 100"
-            # Buy-Item: "Desired Amount: 5"
-            if window_type == 'sell_item':
-                qty_pattern = re.compile(
-                    r'Register\s+Quantity\s*[:;]?\s*([0-9,\.]+)',
-                    re.IGNORECASE
-                )
-            else:  # buy_item
-                qty_pattern = re.compile(
-                    r'Desired\s+Amount\s*[:;]?\s*([0-9,\.]+)',
-                    re.IGNORECASE
-                )
-            
-            m = qty_pattern.search(s)
-            if m:
-                qty_val = normalize_numeric_str(m.group(1))
-                if qty_val is not None and 1 <= qty_val <= 5000:
-                    metrics['quantity'] = qty_val
-            
-            # 5. Item-Name extrahieren (aus Item-Name-ROI)
+            # 3. Item-Name extrahieren (aus Item-Name-ROI)
             # Pattern: Suche nach zusammenhängendem Text ohne UI-Keywords
             # Oft Format: "<ItemName>" oder "[Grade] ItemName"
             # Detail-ROI liefert oft Timestamp-Präfix: "2025.10.20 19.23 ItemName"
@@ -1922,8 +1887,29 @@ class MarketTracker:
         - Normalized raw text from transaction line
         - PRECEDING text (context before the transaction) to make each unique
         - Timestamp from OCR to distinguish same-second transactions
+        - For Detail-Window: Microsecond-precision timestamp to prevent collisions
         """
         try:
+            # SPECIAL HANDLING: Detail-Window transactions need microsecond precision
+            if tx.get('_from_detail_window'):
+                ts = tx.get('timestamp')
+                if isinstance(ts, datetime.datetime):
+                    # Include microseconds for sub-second distinction
+                    ts_precise = ts.strftime("%Y-%m-%d %H:%M:%S.%f")
+                else:
+                    ts_precise = str(ts)
+                
+                components = [
+                    (tx.get('item_name') or '').lower(),
+                    str(int(tx.get('quantity') or 0)),
+                    str(int(tx.get('price') or 0)),
+                    (tx.get('transaction_type') or '').lower(),
+                    ts_precise,
+                    'detail_window'  # Marker to prevent collision with log-based
+                ]
+                hash_input = "|".join(components)
+                return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]
+            
             # Try to use raw text + context from related entries
             raw_text = None
             context_before = ""
@@ -1983,7 +1969,7 @@ class MarketTracker:
         ttype = tx['transaction_type']
         ts = tx['timestamp']
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime.datetime) else str(ts)
-        case = tx.get('case')
+        case = tx.get('tx_case') or tx.get('case')  # Support both keys
         occ_idx_raw = tx.get('occurrence_index')
         try:
             occ_idx = int(occ_idx_raw) if occ_idx_raw is not None else 0
@@ -2070,6 +2056,50 @@ class MarketTracker:
         except Exception as e:
             if self.debug:
                 log_debug(f"[CONTENT-HASH] Check failed: {e}")
+        
+        # ADDITIONAL: Check for near-duplicate (Detail-Window vs Log-based)
+        # If log-based parsing tries to save a transaction that was already captured
+        # by detail-window monitoring (within 2 minutes), skip it
+        if not tx.get('_from_detail_window'):
+            try:
+                db_cur = get_cursor()
+                # Round timestamp to minute for comparison
+                if isinstance(ts, datetime.datetime):
+                    ts_minute = ts.strftime("%Y-%m-%d %H:%M")
+                    
+                    # FIX #3: Price-Similarity Check (±10% tolerance)
+                    # Verhindert dass zwei verschiedene Preise für selbe Transaktion gespeichert werden
+                    PRICE_TOLERANCE = 0.10  # ±10%
+                    price_min = int(price * (1 - PRICE_TOLERANCE))
+                    price_max = int(price * (1 + PRICE_TOLERANCE))
+                    
+                    # Check for similar transaction within ±2 minutes AND ±10% price
+                    db_cur.execute(
+                        """
+                        SELECT id, timestamp, tx_case, price FROM transactions 
+                        WHERE item_name = ? AND quantity = ? 
+                        AND CAST(price AS INTEGER) BETWEEN ? AND ?
+                        AND transaction_type = ?
+                        AND datetime(timestamp) BETWEEN datetime(?, '-2 minutes') AND datetime(?, '+2 minutes')
+                        LIMIT 1
+                        """,
+                        (item, int(qty), price_min, price_max, ttype, ts_str, ts_str)
+                    )
+                    near_duplicate = db_cur.fetchone()
+                    if near_duplicate:
+                        existing_id, existing_ts, existing_case, existing_price = near_duplicate
+                        # If existing was from detail-window, skip log-based duplicate
+                        if existing_case and 'ui_inferred' in str(existing_case):
+                            if self.debug:
+                                log_debug(f"[DEDUPE-LOG] Skip log-based duplicate: {item} {qty}x already captured by detail-window (id={existing_id}, ts={existing_ts})")
+                                if abs(int(price) - int(existing_price)) > 0:
+                                    log_debug(f"[DEDUPE-LOG] 🔶 Price difference detected: Detail-Window={existing_price:,}, Log-based={price:,} (preferring Detail-Window)")
+                            print(f"⚠️ Duplikat erkannt (Detail-Window hatte bereits erfasst): {str(ttype or '').upper()} - {qty}x {item}")
+                            self.seen_tx_signatures.append(sig)
+                            return False
+            except Exception as e:
+                if self.debug:
+                    log_debug(f"[DEDUPE-LOG] Check failed: {e}")
         
         # If UI-inferred, double-check database for same item+price in tolerance (ignore qty since UI deltas can drift)
         if tx.get('_ui_inferred') and price is not None and ts:
@@ -2165,6 +2195,107 @@ class MarketTracker:
         self._detail_last_metrics = None
         self._detail_confirmation_pending = False
         self._detail_confirmation_timestamp = None
+        self._detail_partial_balance_delta = 0
+        self._detail_partial_warehouse_delta = 0
+        self._detail_balance_delta_timestamp = None
+        self._detail_balance_changed_once = False
+        self._detail_warehouse_changed_once = False
+        self._detail_needs_baseline_capture = False
+        self._detail_baseline_captured = False
+        self._detail_window_entry_item = None
+
+    def _force_save_pending_transaction(self) -> bool:
+        """
+        Force-Save einer pending Balance-Only Transaction.
+        
+        DEAKTIVIERT: Ohne desired_price-Extraktion können wir Quantity nicht schätzen.
+        Stattdessen verlassen wir uns auf vollständige Balance+Warehouse Deltas.
+        Log-based parsing wird als Fallback dienen.
+        
+        Returns:
+            False (immer, Funktion ist deaktiviert)
+        """
+        if self.debug and self._detail_partial_balance_delta < 0:
+            log_debug(f"[DETAIL] 🔶 Force-Save skipped (disabled without desired_price)")
+            log_debug(f"[DETAIL] 🔶 Pending balance_delta: {self._detail_partial_balance_delta:,}")
+            log_debug(f"[DETAIL] 🔶 Relying on log-based parsing as fallback")
+        
+        return False
+
+    def _check_missing_detail_window_transactions(self, structured_entries: list, window_type: str) -> list:
+        """
+        Log-Based Fallback: Prüfe ob Transaktionen im Log stehen die vom Detail-Window-Monitor verpasst wurden.
+        
+        Wird aufgerufen NACH Detail-Window-Exit beim ersten Overview-Scan.
+        
+        Problem: Bei sehr schnellen Käufen (z.B. Preorder auto-collect) kann die Baseline zu spät gesetzt werden
+        und erste Transaktion wird verpasst.
+        
+        Lösung: Parse Transaction-Log nochmal und suche fehlende "Purchased" Einträge für das Detail-Window-Item.
+        
+        Args:
+            structured_entries: Parsed log entries from current overview
+            window_type: 'buy_overview' oder 'sell_overview'
+        
+        Returns:
+            List of missing transaction dicts (same format as tx_candidates)
+        """
+        if not self._detail_window_entry_item:
+            return []
+        
+        if window_type != 'buy_overview':
+            # Nur für Buy-Seite implementiert (Sell braucht es seltener)
+            return []
+        
+        item_name = self._detail_window_entry_item
+        item_lc = item_name.lower()
+        
+        # Suche alle "purchased" Einträge für dieses Item im Log
+        purchased_entries = [
+            e for e in structured_entries
+            if e.get('type') == 'purchased' and 
+            (e.get('item') or '').lower() == item_lc and
+            e.get('qty') and e.get('price')
+        ]
+        
+        if not purchased_entries:
+            return []
+        
+        # Prüfe welche bereits in DB sind
+        missing = []
+        for entry in purchased_entries:
+            qty = entry['qty']
+            price = entry['price']
+            ts = entry['timestamp']
+            
+            # Prüfe ob bereits gespeichert (exact match)
+            existing = transaction_exists_exact(
+                item_name=item_name,
+                quantity=qty,
+                price=price,
+                transaction_type='buy',
+                timestamp=ts
+            )
+            
+            if not existing:
+                # Nicht in DB → Wahrscheinlich vom Detail-Window verpasst
+                if self.debug:
+                    log_debug(f"[LOG-FALLBACK] Found missing purchase: {qty}x {item_name} @ {price:,} Silver")
+                
+                missing.append({
+                    'item_name': item_name,
+                    'quantity': qty,
+                    'price': price,
+                    'timestamp': ts,
+                    'transaction_type': 'buy',
+                    'case': 'buy_collect',  # Annahme: Kam aus Collect/Auto-Collect
+                    'raw_related': [entry],
+                    'occurrence_index': None,
+                    'occurrence_slot': 0,
+                    '_from_log_fallback': True  # Marker für Dedupe
+                })
+        
+        return missing
 
     def _infer_transaction_from_deltas(
         self,
@@ -2172,10 +2303,16 @@ class MarketTracker:
         balance_delta: int,
         warehouse_delta: int,
         current_metrics: dict,
-        last_metrics: dict
+        last_metrics: dict,
+        ocr_text: str = ""
     ) -> dict | None:
         """
         Leitet Transaktion aus Balance- und Warehouse-Deltas ab.
+        
+        WICHTIG: BDO updated Balance und Warehouse ASYNCHRON!
+        Daher akkumulieren wir Deltas über mehrere Scans:
+        - Scan 1: Balance -100k, Warehouse +0 → Akkumuliere
+        - Scan 2: Balance +0, Warehouse +5000 → Transaktion komplett!
         
         Regeln:
         
@@ -2201,24 +2338,74 @@ class MarketTracker:
             last_metrics: Letzte Metriken vor Änderung
         
         Returns:
-            dict mit Transaction-Daten oder None
+            dict mit Transaction-Daten oder None (None = noch nicht komplett, weiter akkumulieren)
         """
         try:
             TAX_FACTOR = 0.88725  # BDO Central Market Tax
             
+            # ========== DELTA ACCUMULATION ==========
+            # ========== SMART RESET: Neue Transaction-Erkennung ==========
+            # Wenn BEIDE Deltas sich in DIESEM Scan ändern, beginnt eine neue Transaction
+            # → Verwerfe alte partielle Akkumulation (verhindert Pig Blood 3-TX-Bug)
+            both_changed_now = (balance_delta != 0 and warehouse_delta != 0)
+            
+            had_incomplete_accumulation = (
+                (self._detail_partial_balance_delta != 0 and self._detail_partial_warehouse_delta == 0) or
+                (self._detail_partial_balance_delta == 0 and self._detail_partial_warehouse_delta != 0)
+            )
+            
+            if both_changed_now and had_incomplete_accumulation:
+                if self.debug:
+                    log_debug(f"[DETAIL] 🔄 New transaction detected (both deltas changed simultaneously)")
+                    log_debug(f"[DETAIL] ❌ Discarding incomplete accumulation: balance={self._detail_partial_balance_delta:+,}, warehouse={self._detail_partial_warehouse_delta:+,}")
+                
+                # Reset: Starte frische Akkumulation mit aktuellen Werten
+                self._detail_partial_balance_delta = 0
+                self._detail_partial_warehouse_delta = 0
+            
+            # Akkumuliere Balance-Deltas
+            if balance_delta != 0:
+                # Merke Zeitpunkt des ersten balance_delta (für Timeout)
+                if self._detail_partial_balance_delta == 0 and balance_delta < 0:
+                    self._detail_balance_delta_timestamp = datetime.datetime.now()
+                    if self.debug:
+                        log_debug(f"[DETAIL] Started balance_delta timer at {self._detail_balance_delta_timestamp}")
+                
+                self._detail_partial_balance_delta += balance_delta
+                if self.debug:
+                    log_debug(f"[DETAIL] Accumulated balance delta: {self._detail_partial_balance_delta:+,} (this scan: {balance_delta:+,})")
+            
+            # Akkumuliere Warehouse-Deltas
+            if warehouse_delta != 0:
+                self._detail_partial_warehouse_delta += warehouse_delta
+                if self.debug:
+                    log_debug(f"[DETAIL] Accumulated warehouse delta: {self._detail_partial_warehouse_delta:+,} (this scan: {warehouse_delta:+,})")
+                
+                # Reset timer wenn warehouse_delta endlich kommt
+                if self._detail_balance_delta_timestamp:
+                    elapsed = (datetime.datetime.now() - self._detail_balance_delta_timestamp).total_seconds()
+                    if self.debug:
+                        log_debug(f"[DETAIL] Warehouse delta received after {elapsed:.2f}s")
+                    self._detail_balance_delta_timestamp = None
+            
+            # ========== VALIDATION MIT AKKUMULIERTEN DELTAS ==========
             if window_type == 'sell_item':
                 # Sell: Balance steigt, Warehouse sinkt
-                if balance_delta <= 0 or warehouse_delta >= 0:
-                    if self.debug:
-                        log_debug(f"[DETAIL] Sell-Transaction rejected: balance_delta={balance_delta}, warehouse_delta={warehouse_delta}")
+                # Prüfe ob BEIDE Deltas jetzt vorhanden sind
+                if self._detail_partial_balance_delta <= 0 or self._detail_partial_warehouse_delta >= 0:
+                    # Noch nicht beide Deltas vorhanden → Weiter akkumulieren
+                    if self.debug and (balance_delta != 0 or warehouse_delta != 0):
+                        log_debug(f"[DETAIL] Sell-Transaction incomplete: balance_delta={self._detail_partial_balance_delta}, warehouse_delta={self._detail_partial_warehouse_delta} (waiting for both)")
                     return None
                 
-                # Berechne Brutto-Preis (vor Steuern)
-                gross_price = int(balance_delta / TAX_FACTOR)
-                quantity = abs(warehouse_delta)
+                # BEIDE Deltas vorhanden → Transaction erstellen
+                gross_price = int(self._detail_partial_balance_delta / TAX_FACTOR)
+                quantity = abs(self._detail_partial_warehouse_delta)
                 
                 # Plausibilitätsprüfung: Vergleiche mit set_price falls vorhanden
-                set_price = current_metrics.get('set_price') or last_metrics.get('set_price')
+                set_price = current_metrics.get('set_price')
+                if not set_price and last_metrics:
+                    set_price = last_metrics.get('set_price')
                 if set_price:
                     expected_gross = set_price * quantity
                     # Toleriere 5% Abweichung
@@ -2229,38 +2416,81 @@ class MarketTracker:
                         gross_price = expected_gross
                 
                 transaction_type = 'sell'
-                tx_case = 'sell_collect'  # Detail-Window-Verkäufe sind immer direkte Collects
+                tx_case = 'sell_collect_ui_inferred'  # Detail-Window via UI-Delta-Inferenz
                 
             elif window_type == 'buy_item':
                 # Buy: Balance sinkt, Warehouse steigt
-                if balance_delta >= 0 or warehouse_delta <= 0:
+                
+                # SPEZIALFALL: Warehouse-Only Delta (Preorder-Collect ohne Kauf)
+                # Wenn warehouse_delta > 0 ABER balance_delta = 0:
+                # → Preorder wurde collected, aber noch kein neuer Kauf
+                # → Ignoriere diesen Delta, warte auf echten Kauf (balance_delta < 0)
+                if self._detail_partial_warehouse_delta > 0 and self._detail_partial_balance_delta == 0:
                     if self.debug:
-                        log_debug(f"[DETAIL] Buy-Transaction rejected: balance_delta={balance_delta}, warehouse_delta={warehouse_delta}")
+                        log_debug(f"[DETAIL] Preorder-Collect detected: warehouse +{self._detail_partial_warehouse_delta}, balance unchanged")
+                        log_debug(f"[DETAIL] Waiting for actual purchase (balance negative) before saving transaction")
                     return None
                 
-                # Preis = Betrag den wir bezahlt haben (positiv)
-                gross_price = abs(balance_delta)
-                quantity = warehouse_delta
+                # FIX #2: "Placed order" Erkennung
+                # Wenn warehouse_delta = 0 ABER balance_delta negativ:
+                # → Möglicherweise wurde gleichzeitig gekauft UND neue Preorder gesetzt (Netto-Delta = 0)
+                # → Suche nach "Placed order" im OCR-Text um echte Menge zu ermitteln
+                if self._detail_partial_balance_delta < 0 and self._detail_partial_warehouse_delta == 0:
+                    # Versuche "Placed order" zu extrahieren aus dem übergebenen OCR-Text
+                    placed_patterns = [
+                        r'placed\s+(?:order|preorder).*?x\s*[,\s]*(\d+(?:[,\.]\d+)*)',  # "Placed order x5,000"
+                        r'placed.*?(\d+(?:[,\.]\d+)*)\s*x',  # "Placed 5,000 x"
+                    ]
+                    
+                    placed_qty = None
+                    for pattern in placed_patterns:
+                        m = re.search(pattern, ocr_text, re.IGNORECASE)
+                        if m:
+                            qty_str = m.group(1).replace(',', '').replace('.', '')
+                            try:
+                                placed_qty = int(qty_str)
+                                if 1 <= placed_qty <= 5000:
+                                    if self.debug:
+                                        log_debug(f"[DETAIL] ✅ 'Placed order' detected: {placed_qty}x (warehouse_delta was 0)")
+                                    # Setze warehouse_delta auf placed_qty
+                                    # → Eigentlicher Kauf war: balance_delta negativ, warehouse +placed_qty
+                                    self._detail_partial_warehouse_delta = placed_qty
+                                    break
+                            except ValueError:
+                                pass
+                    
+                    if placed_qty is None and self.debug:
+                        log_debug(f"[DETAIL] ⚠️ warehouse_delta=0 but balance negative - no 'Placed order' found, waiting...")
                 
-                # Plausibilitätsprüfung: Vergleiche mit desired_price falls vorhanden
-                desired_price = current_metrics.get('desired_price') or last_metrics.get('desired_price')
-                if desired_price:
-                    expected_gross = desired_price * quantity
-                    # Toleriere 5% Abweichung
-                    if abs(gross_price - expected_gross) / expected_gross > 0.05:
-                        if self.debug:
-                            log_debug(f"[DETAIL] Buy price mismatch: calculated={gross_price}, expected={expected_gross}")
-                        # Nutze desired_price wenn plausibel
-                        gross_price = expected_gross
+                # Prüfe ob BEIDE Deltas jetzt vorhanden sind
+                if self._detail_partial_balance_delta >= 0 or self._detail_partial_warehouse_delta <= 0:
+                    # BALANCE-ONLY FALLBACK DEAKTIVIERT
+                    # Ohne desired_price-Extraktion können wir Quantity nicht schätzen
+                    # → Warte IMMER auf warehouse_delta
+                    # → Log-based parsing als Fallback für verpasste Transaktionen
+                    if self.debug and (balance_delta != 0 or warehouse_delta != 0):
+                        if self._detail_balance_delta_timestamp:
+                            elapsed = (datetime.datetime.now() - self._detail_balance_delta_timestamp).total_seconds()
+                            log_debug(f"[DETAIL] Buy-Transaction incomplete: balance_delta={self._detail_partial_balance_delta}, warehouse_delta={self._detail_partial_warehouse_delta} (waiting {elapsed:.2f}s, log-based fallback active)")
+                        else:
+                            log_debug(f"[DETAIL] Buy-Transaction incomplete: balance_delta={self._detail_partial_balance_delta}, warehouse_delta={self._detail_partial_warehouse_delta} (waiting for both)")
+                    return None
                 
+                # BEIDE Deltas vorhanden → Transaction erstellen
+                gross_price = abs(self._detail_partial_balance_delta)
+                quantity = self._detail_partial_warehouse_delta
                 transaction_type = 'buy'
-                tx_case = 'buy_collect'  # Detail-Window-Käufe sind immer direkte Collects
+                tx_case = 'buy_collect_ui_inferred'  # Detail-Window via UI-Delta-Inferenz
                 
             else:
                 return None
             
             # Item-Name aus Metriken holen
-            item_name = current_metrics.get('item_name') or last_metrics.get('item_name') or self._detail_window_item
+            item_name = current_metrics.get('item_name')
+            if not item_name and last_metrics:
+                item_name = last_metrics.get('item_name')
+            if not item_name:
+                item_name = self._detail_window_item
             if not item_name:
                 if self.debug:
                     log_debug("[DETAIL] Transaction rejected: No item name available")
@@ -2276,11 +2506,20 @@ class MarketTracker:
             
             corrected_name = corrected_result[0]  # Nur den Namen extrahieren (Tuple: (name, was_corrected))
             
-            # Validiere Menge
-            if not (1 <= quantity <= 5000):
+            # Validiere Menge - erlaubt jetzt akkumulierte Käufe bis 500000
+            MAX_SINGLE_PURCHASE = 5000
+            MAX_ACCUMULATED_PURCHASE = 500000  # Akkumulierte Käufe (z.B. 100x 5000)
+            
+            if not (1 <= quantity <= MAX_ACCUMULATED_PURCHASE):
                 if self.debug:
-                    log_debug(f"[DETAIL] Transaction rejected: Invalid quantity {quantity}")
+                    log_debug(f"[DETAIL] Transaction rejected: Invalid quantity {quantity} (max {MAX_ACCUMULATED_PURCHASE})")
                 return None
+            
+            # Warnung bei großen akkumulierten Käufen
+            if quantity > MAX_SINGLE_PURCHASE:
+                estimated_purchases = quantity // MAX_SINGLE_PURCHASE
+                if self.debug:
+                    log_debug(f"[DETAIL] ⚠️ Accumulated purchase detected: {quantity}x ≈ {estimated_purchases} buys @ {MAX_SINGLE_PURCHASE}x each")
             
             # Erstelle Transaction-Dict
             transaction = {
@@ -2295,6 +2534,12 @@ class MarketTracker:
             
             if self.debug:
                 log_debug(f"[DETAIL] ✅ Inferred transaction: {transaction_type} {quantity}x {corrected_name} @ {gross_price} Silver (total)")
+                log_debug(f"[DETAIL] Transaction details: tx_case={tx_case}, from_detail_window=True, timestamp={transaction['timestamp']}")
+            
+            # Reset partial deltas nach erfolgreicher Transaktion
+            self._detail_partial_balance_delta = 0
+            self._detail_partial_warehouse_delta = 0
+            self._detail_balance_delta_timestamp = None  # Reset timer
             
             return transaction
             
@@ -2335,21 +2580,70 @@ class MarketTracker:
                     self._reset_detail_window_state()
             return
         
-        # 1. Detail-Fenster-Eintritt: Baseline setzen
+        # 1. Detail-Fenster-Eintritt: Multi-Sample Baseline Capture
         if not self._detail_window_active:
+            # MULTI-SAMPLE BASELINE CAPTURE (FIX: Birch Sap Issue)
+            # Problem: Erster OCR-Scan kommt ~150ms nach Window-Open
+            #          Game-Transaktionen passieren in 40-100ms
+            #          → Warehouse bereits kontaminiert (z.B. 10000 statt 0)
+            # Lösung: Nimm 3-5 schnelle Samples und wähle MINIMUM als Baseline
+            #         Rationale: Wenn Warehouse wächst (0→5000→10000), ist MIN=0 die echte Baseline
+            
+            balance = current_metrics.get('balance')
+            warehouse = current_metrics.get('warehouse_qty')
+            
+            # ⚡ CRITICAL FIX: Wenn warehouse=None im ERSTEN Scan nach Window-Open,
+            # ist das der PERFEKTE Moment! OCR hat die Zahl noch nicht erfasst weil
+            # das Window gerade erst öffnet. ASSUME 0 als Baseline!
+            if balance is None:
+                if self.debug:
+                    log_debug(f"[DETAIL] Waiting for Balance (balance={balance}, warehouse={warehouse})")
+                return
+            
+            if warehouse is None:
+                if self.debug:
+                    log_debug(f"[DETAIL] ⚡ Warehouse=None detected - PERFECT timing! Using 0 as baseline.")
+                warehouse = 0  # Frame-perfect: Window just opened, warehouse not yet rendered/scanned
+            
+            # � CRITICAL FIX: NO multi-sampling! It's too slow (~8s) and burst-mode expires!
+            # warehouse=None is ALREADY the perfect moment - use it immediately!
+            samples = [{'balance': balance, 'warehouse': warehouse, 'time': datetime.datetime.now()}]
+            
+            # Wähle konservativste Warehouse-Menge als Baseline:
+            # - Buy-Window: MIN (Warehouse wächst bei Käufen: 0→5k→10k → MIN=0)
+            # - Sell-Window: MAX (Warehouse sinkt bei Verkäufen: 15k→10k→5k → MAX=15k)
+            if window_type == 'buy_item':
+                baseline_warehouse = min(s['warehouse'] for s in samples)
+            else:  # sell_item
+                baseline_warehouse = max(s['warehouse'] for s in samples)
+            
+            # Balance vom ersten Sample (sollte stabil sein)
+            baseline_balance = samples[0]['balance']
+            
+            # ⚡ BASELINE SET: Nutze konservativste Warehouse-Menge
             self._detail_window_active = True
             self._detail_window_type = window_type
-            self._detail_baseline_balance = current_metrics.get('balance')
-            self._detail_baseline_warehouse = current_metrics.get('warehouse_qty')
+            self._detail_baseline_balance = baseline_balance
+            self._detail_baseline_warehouse = baseline_warehouse
             self._detail_last_metrics = current_metrics
             self._detail_window_item = current_metrics.get('item_name')
+            self._detail_window_entry_item = current_metrics.get('item_name')  # Für Log-Fallback
+            self._detail_baseline_captured = True
+            self._detail_needs_baseline_capture = False
+            
+            # Reset Delta-Akkumulation
+            self._detail_partial_balance_delta = 0
+            self._detail_partial_warehouse_delta = 0
+            self._detail_balance_delta_timestamp = None
             
             if self.debug:
                 log_debug(
-                    f"[DETAIL] Entered {window_type} window\n"
+                    f"[DETAIL] ⚡ BASELINE CAPTURED (single-sample, warehouse=None moment)\n"
+                    f"   Window: {window_type}\n"
                     f"   Item: {self._detail_window_item}\n"
-                    f"   Balance baseline: {self._detail_baseline_balance}\n"
-                    f"   Warehouse baseline: {self._detail_baseline_warehouse}"
+                    f"   Warehouse: {baseline_warehouse:,}\n"
+                    f"   Balance: {baseline_balance:,}\n"
+                    f"   🎯 Ready to detect transactions (burst-mode active for 30s @ 80ms polling)"
                 )
             return
         
@@ -2366,9 +2660,25 @@ class MarketTracker:
         current_balance = current_metrics.get('balance')
         current_warehouse = current_metrics.get('warehouse_qty')
         
-        if current_balance is None or current_warehouse is None:
-            # Unvollständige Metriken → Weiter warten
+        # FIX #2: Prüfe ob Fenster geschlossen wurde (None-Metriken)
+        # WICHTIG: Wenn baseline_warehouse=0 (warehouse=None beim Capture), toleriere warehouse=None!
+        # Dies passiert in den ersten Frames nach Window-Open wenn OCR langsam ist
+        if current_balance is None:
+            if self.debug:
+                log_debug("[DETAIL] Metrics incomplete (balance=None) - waiting for next scan")
             return
+        
+        if current_warehouse is None:
+            # Wenn Baseline=0 gesetzt wurde (warehouse=None beim Capture), ersetze None mit 0
+            if self._detail_baseline_warehouse == 0:
+                current_warehouse = 0  # Same as baseline - no change detected
+                if self.debug:
+                    log_debug("[DETAIL] Warehouse=None (same as baseline=0) - treating as 0")
+            else:
+                # Warehouse should not be None if baseline != 0 → Window likely closed
+                if self.debug:
+                    log_debug("[DETAIL] Metrics incomplete (warehouse=None, baseline!=0) - window closed?")
+                return
         
         # 4. Prüfe ob Änderung vorhanden
         balance_changed = (
@@ -2389,12 +2699,46 @@ class MarketTracker:
                 self._detail_window_item = current_metrics.get('item_name')
                 if self.debug:
                     log_debug(f"[DETAIL] Item name detected: {self._detail_window_item}")
+            
+            # 🚀 CRITICAL: Maintain burst-mode while in detail-window!
+            # We need rapid polling (80ms) to catch individual transactions
+            # Normal polling (500ms+) is too slow and causes multi-transaction batching
+            now = datetime.datetime.now()
+            if self._burst_until is None or now >= self._burst_until:
+                self._burst_until = now + datetime.timedelta(seconds=10.0)  # Keep burst active
+                if self.debug:
+                    log_debug(f"[DETAIL] 🚀 Burst-mode extended (rapid polling @ 80ms)")
+            
             return
         
         # 5. Änderung erkannt → Transaktion verarbeiten
+        
+        # Track welche Werte sich SEIT LETZTEM SCAN geändert haben (für Sync-Check)
+        # WICHTIG: Vergleiche mit last_metrics, nicht mit baseline!
+        # Grund: Balance/Warehouse könnten sich in verschiedenen Frames updaten
+        balance_changed_this_scan = False
+        warehouse_changed_this_scan = False
+        
+        if self._detail_last_metrics:
+            # Vergleiche mit letztem Scan
+            last_balance = self._detail_last_metrics.get('balance')
+            last_warehouse = self._detail_last_metrics.get('warehouse_qty')
+            balance_changed_this_scan = (last_balance is not None and current_balance != last_balance)
+            warehouse_changed_this_scan = (last_warehouse is not None and current_warehouse != last_warehouse)
+        else:
+            # Erster Scan nach Baseline: Prüfe nur ob überhaupt Änderung seit Baseline
+            balance_changed_this_scan = balance_changed
+            warehouse_changed_this_scan = warehouse_changed
+        
+        # Setze permanente Flags (bleiben True bis Transaktion abgeschlossen)
+        if balance_changed_this_scan:
+            self._detail_balance_changed_once = True
+        if warehouse_changed_this_scan:
+            self._detail_warehouse_changed_once = True
+        
         if self.debug:
-            balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance else 0
-            warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse else 0
+            balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance is not None else 0
+            warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse is not None else 0
             log_debug(
                 f"[DETAIL] Change detected in {window_type}\n"
                 f"   Balance: {self._detail_baseline_balance} → {current_balance} (Δ {balance_delta:+,})\n"
@@ -2402,8 +2746,134 @@ class MarketTracker:
             )
         
         # 6. Berechne Deltas
-        balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance else 0
-        warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse else 0
+        # CRITICAL FIX: Use `is not None` instead of truthy check!
+        # baseline=0 is VALID and must calculate delta (e.g., 10000 - 0 = +10000)
+        balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance is not None else 0
+        warehouse_delta = current_warehouse - self._detail_baseline_warehouse if self._detail_baseline_warehouse is not None else 0
+        
+        # 🔍 SYNC-CHECK: Warte bis BEIDE Werte sich geändert haben (nicht nur einer!)
+        # Problem: Balance und Warehouse updaten nicht synchron (1-4 Frames verzögert)
+        # Beispiel: Frame 1 hat Balance=-1.1M (Preorder) + Warehouse=+0 (noch nicht updated)
+        #           Frame 2 hat Balance=-1.1M (gleich)     + Warehouse=+5339 (jetzt updated)
+        # Lösung: Wenn NUR EINER sich geändert hat (nicht beide), warte auf nächsten Scan
+        #         Wenn BEIDE sich geändert haben (synchron), fahre fort
+        balance_and_warehouse_both_changed = (
+            balance_changed_this_scan and warehouse_changed_this_scan
+        )
+        only_one_value_changed = (
+            (balance_changed_this_scan and not warehouse_changed_this_scan) or
+            (warehouse_changed_this_scan and not balance_changed_this_scan)
+        )
+        
+        if only_one_value_changed:
+            if self.debug:
+                log_debug(f"[DETAIL] ⏸️ Partial update detected - only one value changed this scan")
+                log_debug(f"[DETAIL]    Balance changed: {balance_changed_this_scan}, Warehouse changed: {warehouse_changed_this_scan}")
+                log_debug(f"[DETAIL]    Waiting for both values to update before plausibility check...")
+            # Update last_metrics trotzdem (für nächsten Scan)
+            self._detail_last_metrics = current_metrics
+            return
+        
+        # 🔍 PLAUSIBILITY CHECK: Validate balance_delta vs warehouse_delta
+        # Prevent OCR errors from creating invalid transactions
+        # Example: OCR reads "169,682,222,830" instead of "169,671,122,830" (missing leading "1")
+        # This causes balance_delta = -369k instead of -11.4M for a 5002x purchase
+        if warehouse_delta != 0 and balance_delta != 0:
+            # Get item name for base price lookup
+            # CRITICAL: Use _detail_window_item (from baseline capture) instead of current_metrics
+            # Reason: OCR can corrupt item name during transaction (e.g., "Birch Sap" → "Sap Birch '43,180")
+            # _detail_window_item is captured at window entry when OCR is cleaner
+            item_name = self._detail_window_item or current_metrics.get('item_name')
+            
+            # Get base price for this item (±15% tolerance)
+            base_price = None
+            if item_name:
+                try:
+                    base_price = self._get_base_price(item_name)
+                except Exception as e:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ Failed to get base price for '{item_name}': {e}")
+            
+            # Calculate price range based on base_price ±15%
+            tolerance = 0.15
+            if base_price and base_price > 0:
+                min_price_per_item = int(base_price * (1 - tolerance))
+                max_price_per_item = int(base_price * (1 + tolerance))
+                
+                # For sell transactions, apply tax factor (net proceeds = 88.725% of sale price)
+                if window_type == 'sell_item':
+                    min_price_per_item = int(min_price_per_item * MARKET_SELL_NET_FACTOR)
+                    max_price_per_item = int(max_price_per_item * MARKET_SELL_NET_FACTOR)
+            else:
+                # Fallback: Use reasonable min/max bounds if base_price unavailable
+                min_price_per_item = 100
+                max_price_per_item = 1_000_000_000_000  # 1T per item (theoretical max)
+            
+            if window_type == 'buy_item':
+                # Buy: balance should DECREASE (negative delta)
+                # warehouse should INCREASE (positive delta)
+                if balance_delta > 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Buy with positive balance_delta={balance_delta:+,} - OCR error likely!")
+                        log_debug(f"[DETAIL] Waiting for next scan with correct balance...")
+                    return
+                if warehouse_delta < 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Buy with negative warehouse_delta={warehouse_delta:+,} - OCR error likely!")
+                        log_debug(f"[DETAIL] Waiting for next scan with correct warehouse...")
+                    return
+                
+                # Check price per item is within base_price ±15%
+                implied_price_per_item = abs(balance_delta) / abs(warehouse_delta)
+                if implied_price_per_item < min_price_per_item:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:.0f} < {min_price_per_item:,} Silver/item")
+                        if base_price:
+                            log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,} (range: {min_price_per_item:,} - {max_price_per_item:,})")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
+                    return
+                if implied_price_per_item > max_price_per_item:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:,.0f} > {max_price_per_item:,} Silver/item")
+                        if base_price:
+                            log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,} (range: {min_price_per_item:,} - {max_price_per_item:,})")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
+                    return
+            
+            elif window_type == 'sell_item':
+                # Sell: balance should INCREASE (positive delta)
+                # warehouse should DECREASE (negative delta)
+                if balance_delta < 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Sell with negative balance_delta={balance_delta:+,} - OCR error likely!")
+                        log_debug(f"[DETAIL] Waiting for next scan with correct balance...")
+                    return
+                if warehouse_delta > 0:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Sell with positive warehouse_delta={warehouse_delta:+,} - OCR error likely!")
+                        log_debug(f"[DETAIL] Waiting for next scan with correct warehouse...")
+                    return
+                
+                # Check price per item is within base_price ±15% (after tax)
+                implied_price_per_item = abs(balance_delta) / abs(warehouse_delta)
+                if implied_price_per_item < min_price_per_item:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:.0f} < {min_price_per_item:,} Silver/item (net)")
+                        if base_price:
+                            log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,}, net_range={min_price_per_item:,} - {max_price_per_item:,}")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
+                    return
+                if implied_price_per_item > max_price_per_item:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:,.0f} > {max_price_per_item:,} Silver/item (net)")
+                        if base_price:
+                            log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,}, net_range={min_price_per_item:,} - {max_price_per_item:,}")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
+                    return
         
         # 7. Bestimme Transaktionstyp und -werte
         transaction = self._infer_transaction_from_deltas(
@@ -2411,7 +2881,8 @@ class MarketTracker:
             balance_delta,
             warehouse_delta,
             current_metrics,
-            self._detail_last_metrics or {}
+            self._detail_last_metrics or {},
+            ocr_text  # Übergebe OCR-Text für "Placed order" Detection
         )
         
         if transaction:
@@ -2421,11 +2892,26 @@ class MarketTracker:
                 log_debug(f"[DETAIL] ✅ Transaction saved successfully")
             elif not success and self.debug:
                 log_debug(f"[DETAIL] ⚠️ Transaction not saved (duplicate or error)")
+            
+            # Reset Partial-Deltas für nächste Transaktion
+            # WICHTIG: pending_collect_qty wird NICHT hier resetted, nur in _infer_transaction_from_deltas
+            # wenn es tatsächlich kombiniert wurde
+            self._detail_partial_balance_delta = 0
+            self._detail_partial_warehouse_delta = 0
+            self._detail_balance_delta_timestamp = None
+            
+            # Reset Sync-Flags für nächste Transaktion
+            self._detail_balance_changed_once = False
+            self._detail_warehouse_changed_once = False
+            
+            # 9. Update Rolling Baseline AFTER successful transaction
+            # This ensures each subsequent transaction is measured from the NEW state
+            self._detail_baseline_balance = current_balance
+            self._detail_baseline_warehouse = current_warehouse
+            if self.debug:
+                log_debug(f"[DETAIL] 🔄 Rolling baseline updated: Balance={current_balance:,}, Warehouse={current_warehouse:,}")
         
-        # 9. Reset State für nächste Transaktion
-        # Update Baseline mit aktuellen Werten
-        self._detail_baseline_balance = current_balance
-        self._detail_baseline_warehouse = current_warehouse
+        # ALWAYS update last_metrics, even if transaction failed
         self._detail_last_metrics = current_metrics
         self._detail_confirmation_pending = False
 
@@ -2447,19 +2933,24 @@ class MarketTracker:
         now = datetime.datetime.now()
         
         # HYSTERESIS: Require 2 consecutive same detections before accepting transition
+        # EXCEPTION: Detail-windows (buy_item/sell_item) need IMMEDIATE transition!
+        # Reason: Transactions happen within 40-100ms, hysteresis delay (~150ms) misses them
+        is_detail_window = detected_wtype in ("buy_item", "sell_item")
+        
         self._window_detection_history.append(detected_wtype)
         if len(self._window_detection_history) > 3:
             self._window_detection_history = self._window_detection_history[-3:]
         
-        # Check if last 2 detections agree
-        if (len(self._window_detection_history) >= 2 and
+        # Check if last 2 detections agree OR if it's a detail window (immediate transition)
+        if is_detail_window or (len(self._window_detection_history) >= 2 and
             self._window_detection_history[-1] == self._window_detection_history[-2]):
-            # Stable detection - use this as the actual window type
+            # Stable detection (or detail window) - use this as the actual window type
             wtype = self._window_detection_history[-1]
             if wtype != self._stable_window:
                 # Real transition confirmed
                 if self.debug:
-                    log_debug(f"[WINDOW-HYSTERESIS] Stable transition confirmed: {self._stable_window} → {wtype}")
+                    transition_type = "IMMEDIATE" if is_detail_window else "Stable"
+                    log_debug(f"[WINDOW-HYSTERESIS] {transition_type} transition confirmed: {self._stable_window} → {wtype}")
                 self._stable_window = wtype
         else:
             # No stable detection yet - use previous stable state
@@ -2476,6 +2967,20 @@ class MarketTracker:
         if self.debug and prev_window != wtype:
             log_debug(f"[WINDOW] Transition: {prev_window} → {wtype}")
         if prev_window != wtype:
+            # ⚡ Frame-Perfect Baseline Capture: Bei Transition zu Detail-Window
+            if wtype in ("buy_item", "sell_item"):
+                # CRITICAL: Reset kompletten Detail-Window State bei neuer Transition!
+                # Sonst bleibt alte Baseline aktiv (z.B. warehouse=6870 von vorherigem Item)
+                self._reset_detail_window_state()
+                
+                self._detail_needs_baseline_capture = True
+                self._detail_baseline_captured = False
+                # 🚨 CRITICAL: Force IMMEDIATE rescan to capture baseline BEFORE first transaction
+                # Normal polling (150ms) is too slow - transactions happen within 40-100ms!
+                self._request_immediate_rescan = 3  # 3 rapid scans @ ~40ms intervals
+                if self.debug:
+                    log_debug(f"[DETAIL] ⚡ Baseline capture scheduled with IMMEDIATE rescan (3x rapid)")
+            
             # RATE-LIMITING: Only set refresh flag if enough time has passed
             # or if we're in a burst scan (which overrides rate limits)
             time_since_last_refresh = None
@@ -2514,18 +3019,23 @@ class MarketTracker:
                 # Aktiviere Detail-Window-Monitoring
                 self._monitor_detail_window(wtype, full_text)
                 
-                # Burst-Scan für schnelles Zurückspringen zum Overview
-                self._burst_until = now + datetime.timedelta(seconds=4.0)
+                # 🚀 CRITICAL FIX: Extended burst duration for detail-window monitoring
+                # Must stay active during baseline capture AND subsequent transaction monitoring
+                # User can make multiple purchases within seconds - need 80ms polling throughout
+                self._burst_until = now + datetime.timedelta(seconds=30.0)  # Was 4.0, now 30.0
                 self._burst_source = 'item_window'
                 # schedule multiple immediate fast scans
                 self._burst_fast_scans = max(self._burst_fast_scans, 5)
                 # also request immediate re-scans from single_scan (no wait)
                 self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
                 if self.debug:
-                    log_debug(f"burst scan enabled until {self._burst_until} (+{self._burst_fast_scans} fast scans) due to item window '{wtype}'")
+                    log_debug(f"[BURST] 🚀 Detail-window burst enabled until {self._burst_until} (+{self._burst_fast_scans} fast scans, 80ms polling)")
             else:
                 # Nicht in Detail-Fenster → Reset State
                 if self._detail_window_active:
+                    # 🔴 FIX #2: Force-Save BEVOR Reset!
+                    self._force_save_pending_transaction()
+                    
                     if self.debug:
                         log_debug("[DETAIL] Left detail window - resetting state")
                     self._reset_detail_window_state()
@@ -2590,6 +3100,10 @@ class MarketTracker:
             self._request_immediate_rescan = max(self._request_immediate_rescan, 5)  # Was 3, now 5
             if self.debug:
                 log_debug(f"[BURST-AGGRESSIVE] Returned from {prev_window} to {wtype} -> {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (TARGET: <1s capture)")
+            
+            # 🔍 LOG-FALLBACK: Prüfe ob Detail-Window Transaktionen verpasst hat
+            # Dies ist der EINZIGE Moment wo wir sowohl Detail-Window-State ALS AUCH Transaction-Log haben
+            # → Perfekter Zeitpunkt um fehlende Purchases zu finden
 
         # build structured entries
         structured = []
@@ -2618,6 +3132,25 @@ class MarketTracker:
         structured = sorted(structured, key=lambda x: (x['timestamp'], x['pos']))
         if self.debug:
             log_debug(f"structured_count={len(structured)}")
+        
+        # 🔍 LOG-FALLBACK: Prüfe fehlende Detail-Window Transaktionen
+        # MUSS HIER passieren, bevor structured weiter gefiltert wird
+        returning_from_item = prev_window in ("buy_item", "sell_item") and wtype in ("sell_overview", "buy_overview")
+        if returning_from_item and self._detail_window_entry_item:
+            missing_txs = self._check_missing_detail_window_transactions(structured, wtype)
+            if missing_txs:
+                if self.debug:
+                    log_debug(f"[LOG-FALLBACK] Found {len(missing_txs)} missing transaction(s) from detail window")
+                # Füge fehlende Transaktionen direkt zu tx_candidates hinzu (wird später verarbeitet)
+                # Wir merken sie uns für später (nach dem Clustering)
+                self._pending_log_fallback_txs = missing_txs
+            else:
+                self._pending_log_fallback_txs = []
+            
+            # Reset Detail-Window-State nach Fallback-Check
+            self._detail_window_entry_item = None
+        else:
+            self._pending_log_fallback_txs = []
 
         # Determine latest snapshot timestamp across all entries
         overall_max_ts = None
@@ -4188,6 +4721,13 @@ class MarketTracker:
                     })
         if self.debug:
             log_debug(f"tx_candidates={len(tx_candidates)} allowed_ts={len(allowed_ts)}")
+        
+        # 🔍 LOG-FALLBACK: Füge fehlende Detail-Window Transaktionen hinzu
+        if self._pending_log_fallback_txs:
+            if self.debug:
+                log_debug(f"[LOG-FALLBACK] Adding {len(self._pending_log_fallback_txs)} missing transaction(s) to candidates")
+            tx_candidates.extend(self._pending_log_fallback_txs)
+            self._pending_log_fallback_txs = []  # Clear after adding
 
         # Try to infer missing buy transactions directly from UI metrics when no log anchors were parsed.
         if (
