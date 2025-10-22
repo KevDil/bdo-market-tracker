@@ -7,7 +7,35 @@
 ## System Overview
 - Platform: Windows 10+ with Python 3.10–3.13. Tkinter GUI (`python gui.py`) is the primary entry point; scripts under `scripts/` cover calibration, testing, and maintenance.
 - Pipeline sequence: focus check → region capture → ROI trim (top 75%) → preprocessing → EasyOCR → parsing and clustering → dedupe → SQLite persistence → GUI updates/export.
-- Key modules at repo root: `config.py` (persistent settings), `utils.py` (capture/OCR/cache/focus), `parsing.py` (regex anchors, normalization), `tracker.py` (clustering, UI inference, dedupe coordination), `database.py` (SQLite layer), `market_json_manager.py` (name correction + RapidFuzz), `bdo_api_client.py` (price bounds + throttled retries), `gui.py` (controls, auto-track, exports).
+- Key modules at repo root: `config.py` (persistent settings), `utils.py` (capture/OCR/cache/focus), `parsing.py` (regex anchors, normalization, **Performance V6: parsing cache**), `tracker.py` (clustering, UI inference, dedupe coordination), `database.py` (SQLite layer, **Performance V6: batch-insert**), `market_json_manager.py` (name correction + RapidFuzz, **Performance V6: item-name cache**), `bdo_api_client.py` (price bounds + throttled retries), `gui.py` (controls, auto-track, exports), `preorder_manager.py` (preorder/listing lifecycle management).
+
+## Preorder & Listing Tracking (NEW)
+- **Purpose**: Track pre-placed market orders (buy-side preorders, sell-side listings) and detect auto-collection when transactions occur.
+- **Database**: Two tables (`preorders` and `listings`) store active/collected/cancelled orders with fields: `id`, `item_name`, `quantity`, `quantity_filled/quantity_sold`, `price`, `timestamp`, `status`, `collected_at`, `collected_tx_id`.
+- **Unique Constraint**: Only ONE active order per item enforced via unique index `WHERE status='active'`. Placing new order auto-collects old one.
+- **PreorderManager API** (`preorder_manager.py`):
+  - `store_preorder(item, qty, price, timestamp)` / `store_listing(...)`: Store new order, auto-collect old one if exists.
+  - `find_matching_preorder(item, warehouse_delta, balance_delta, timestamp)`: Match order for auto-collect detection.
+  - `mark_collected(preorder_id, collected_at, tx_id)` / `mark_listing_collected(...)`: Mark order as collected after transaction.
+  - `cancel_preorder(item, qty, price)` / `cancel_listing(...)`: Mark order as cancelled from log events.
+  - In-memory cache with 60s TTL for active orders.
+- **Detection Logic** (in `tracker.py`):
+  - **Placement Detection**:
+    - **Buy-Side** (`buy_item` window): `balance↓`, `warehouse=0` → Preorder placed. Extract quantity from UI metrics (`orders` field).
+    - **Sell-Side** (`sell_item` window): `balance≈0`, `warehouse↓` → Listing placed. Quantity = abs(warehouse_delta).
+  - **Collection Detection**:
+    - **Auto-Collect** (Detail-Window): Warehouse surplus detected → Query PreorderManager → Apply price correction (add preorder/listing price to transaction total).
+    - **Manual Collect** (Overview Collect Button): Transaction log shows "Transaction of [item]" → Match and mark order as collected.
+  - **Cancellation Detection**: Transaction log shows "Withdrew order of [item]" (buy-side) or "Withdrew [item] from market listing" (sell-side) → Mark order as cancelled.
+- **Price Correction**: When preorder/listing is auto-collected, transaction total = purchase/sale price + preorder/listing price. This prevents under-reporting when game collects old orders silently.
+- **Integration Points**:
+  - `_monitor_detail_window()`: Calls `_detect_preorder_placement()` / `_detect_listing_placement()` BEFORE plausibility checks.
+  - `_check_for_preorder_autocollect()`: Queries PreorderManager, calculates price correction.
+  - `process_ocr_text()`: Parses log entries for "withdrew" and "transaction" events, calls handlers.
+  - `_handle_preorder_cancellation()`: Processes "Withdrew order" log entries.
+  - `_handle_preorder_or_listing_collection()`: Processes "Transaction of" log entries from Collect button.
+- **Parsing Support** (`parsing.py`): Updated patterns to recognize both "Withdrew order of" (buy-side) and "Withdrew ... from market listing" (sell-side).
+- **No Expiration**: Preorders/listings remain active indefinitely until collected or cancelled.
 
 ## Project Layout & Assets
 - Support data: `config/` for presets, `debug/` for latest screenshots/log artefacts, `dev-screenshots/` for reproducible scenarios, `docs/` for research and historical notes, `backups/` for DB snapshots.
@@ -19,7 +47,8 @@
 - Capture: default region `(734, 371, 1823, 1070)` stored in `tracker_settings.capture_region`. Adjust using `python scripts/utils/calibrate_region.py` and verify visually.
 - ROI strategy: three specialized regions (`detect_log_roi`, `detect_window_label_roi`, `detect_metrics_roi`) for targeted OCR. Log-ROI covers transactions (0-32% height), Label-ROI identifies window type (33-65%), Metrics-ROI captures UI deltas (33-97%). Label is processed first; Log-OCR skips when detail windows detected. See `dev-screenshots/regions.png` for visual reference.
 - Polling: standard interval `POLL_INTERVAL = 0.15s`; burst scans at 0.08s for `sell_item`/`buy_item`; `GAME_FRIENDLY_MODE` pushes polling ≥0.8s when GPU is active.
-- OCR: EasyOCR only (`OCR_ENGINE = 'easyocr'`, `OCR_FALLBACK_ENABLED = False`), GPU optional with 2 GB cap and low-priority streams. CPU mode uses `canvas_size=1600` (optimized for ~1100px ROIs, ~17% faster than 2240), GPU mode uses `canvas_size=1500`. Cache MD5 of ROI with `CACHE_TTL = 5.0` seconds and `MAX_CACHE_SIZE = 20`; never disable cache. GPU-Erkennung nutzt jetzt `reader.recognizer`/`reader.detector`-Devices, Logs zeigen `[EASYOCR] … device=cuda:0` bei aktiven GPU-Läufen.
+- OCR: EasyOCR only (`OCR_ENGINE = 'easyocr'`, `OCR_FALLBACK_ENABLED = False`), GPU with RTX 4070 SUPER. **Performance V5 (2025-10-22)**: EXHAUSTIVE per-ROI optimization tested 6,240 configurations. Optimal params per ROI: warehouse_sell 15.9ms, warehouse_buy 18.0ms, balance 18.1ms, item_name 20.2ms, label 56.5ms, log 151.3ms, metrics 186.0ms. Uses ROI-specific canvas_size (400-1200), text_threshold (0.50-0.70), batch_size (4-8), contrast_ths (0.22-0.32), adjust_contrast (0.25-0.40), low_text (0.32-0.40), link_threshold (0.32-0.40). Average speedup: **-59% to -85%** vs previous configs. Cache MD5 of ROI with `CACHE_TTL = 5.0` seconds and `MAX_CACHE_SIZE = 20`; never disable cache. GPU-Erkennung nutzt `reader.recognizer`/`reader.detector`-Devices, Logs zeigen `[EASYOCR] … device=cuda:0` bei aktiven GPU-Läufen. See `docs/EASYOCR_OPTIMIZATION_2025-10-22.md` for tuning details.
+- **Performance V6 (2025-10-22)**: Parsing & Database optimizations provide 4.4x speedup on typical 5-item scans. (1) **Parsing Cache**: Content-hash-based caching in `split_text_into_log_entries()` with 30s TTL, 3.1x speedup on repeated text (60-80% hit rate). (2) **Item-Name Cache**: LRU cache (maxsize=500) in `correct_item_name()`, 1954x speedup with 98% hit rate on repeated items. (3) **Database Batch-Insert**: `store_transactions_batch()` for multi-item writes, 5-11x speedup on 5-10 item batches. Combined: 4.4x faster overall (40ms → 4.3ms per typical scan). See `docs/PERFORMANCE_V6_2025-10-22.md` for full details.
 - Vollbild-Preprocessing wird per Frame-Hash im RAM gepuffert; identische Frames überspringen die CLAHE-Runde completely (0 ms), Messwerte landen in `metrics['preprocess_cache_hit']`.
 - Detail-/Metrics-ROI wird **NUR bei echten Transaktionen** ausgelesen: nach Fensterwechseln (einmalig via `_pending_metrics_refresh`), Burst-Rescans (`_request_immediate_rescan > 0`), oder Detail-Hinweisen (`Set Price`/`Desired Price`). Der frühere 5-Sekunden-Timer wurde entfernt, da UI-Metriken nur für Delta-Inferenz bei tatsächlichen Transaktionen gebraucht werden. In aktiven Detailfenstern werden sowohl Log- als auch Metrics-ROI übersprungen – nur das Label wird ausgelesen, sodass Burst-Scans keinen dreifachen OCR-Aufwand mehr verursachen. Transaction-Parsing (`split_text_into_log_entries`) basiert ausschließlich auf dem Log-ROI und akzeptiert im Fallback nur noch Zeilen mit echten Ankern (`transaction`, `placed`, `withdrew`, `listed`, `purchased`, `sold`); UI-Text aus dem Metrics-ROI landet nicht mehr in den Structured-Eintragslisten.
 - Window categories: `sell_overview` and `buy_overview` may produce transactions. `sell_item`/`buy_item` trigger burst rescans and must not write to DB.
@@ -37,7 +66,7 @@
 ## Deduplication & Persistence
 - Runtime dedupe uses `seen_tx_signatures` (deque max 1000) and `make_content_hash` with a 20-minute tolerance. A secondary ≤5 min value check blocks near-time duplicates even when timestamps drift, so OCR re-saves (e.g., 11:23 vs. 11:26 Brutal Death Elixir) no longer persist twice.
 - `store_transaction_db` manages `_batch_content_hashes` per run; do not bypass or mutate this set from outside the function.
-- Database schema (see `database.py` migrations): table `transactions` with `item_name`, `quantity`, `price`, `transaction_type`, `timestamp`, `tx_case`, `occurrence_index`, `content_hash`. Unique index `idx_unique_tx_full` spans these fields to guard duplicates.
+- Database schema (see `database.py` migrations): table `transactions` with `item_name`, `quantity`, `price`, `transaction_type`, `timestamp`, `tx_case`, `occurrence_index`, `content_hash`. Unique index `idx_unique_tx_full` spans these fields to guard duplicates. Additional tables `preorders` and `listings` track active market orders (see Preorder & Listing Tracking section above).
 - `occurrence_index` plus `_occurrence_slot` differentiate repeated same-second events. The resolver now only reuses a stored index when the snapshot timestamp trails the latest committed event by ≥1 s (historical import) or when the baseline already contained the line; fresh same-minute transactions continue to receive new indices. Use helpers (`fetch_occurrence_indices`, `transaction_exists_exact`) instead of manual SQL.
 - `store_transaction_db` performs an additional historical guard: if an older snapshot (≤ last processed timestamp) tries to persist an item that already has matching occurrences for that minute, the insert is skipped even if the baseline cache was cleared during an auto-track toggle. This blocks the double-save seen when restarting auto-track mid-session.
 - Detailfenster-Erkennung nutzt normalisierte Schlüsselfrasen mit robuster ODER-Logik. `sell_item` wird erkannt, sobald `Set Price` sowie **mindestens eines** der Skalenfelder `MAX` oder `MIN` (inklusive OCR-Varianten wie `M4X`, `rnax`, `M1N`, `MLN`) im Text stehen; `Register Quantity` ist optional. `buy_item` setzt analog auf `Desired Price` + (`MAX` **ODER** `MIN`), `Desired Amount` ist optional. Dies ermöglicht robuste Erkennung auch bei Layout-Varianten oder partiellen OCR-Fehlern. Legacy-Heuristiken (Base/Min/Max) bleiben als Fallback aktiv.

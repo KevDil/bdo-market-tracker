@@ -27,6 +27,7 @@ from database import (
     get_preset_by_name,
     save_preset,
     delete_preset,
+    get_cursor,
 )
 
 
@@ -293,6 +294,495 @@ def start_gui():
         preset_combo['values'] = preset_names
         if preset_names:
             preset_combo.current(0)
+    
+    def open_orders_manager():
+        """Open Orders Management window"""
+        orders_window = tk.Toplevel(root)
+        orders_window.title("Preorder/Listing Verwaltung")
+        orders_window.geometry("1000x600")
+        try:
+            orders_window.iconbitmap('config/icon.ico')
+        except tk.TclError:
+            pass
+        
+        # Main container
+        main_frame = tk.Frame(orders_window, padx=16, pady=16)
+        main_frame.pack(fill="both", expand=True)
+        
+        # Header
+        header_frame = tk.Frame(main_frame)
+        header_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(header_frame, text="Aktive Orders", style="Header.TLabel").pack(side="left")
+        
+        # Filter controls
+        filter_frame = tk.Frame(main_frame)
+        filter_frame.pack(fill="x", pady=(0, 12))
+        
+        tk.Label(filter_frame, text="Status:").pack(side="left", padx=(0, 4))
+        status_filter_var = tk.StringVar(value="active")
+        status_filter = ttk.Combobox(
+            filter_frame,
+            textvariable=status_filter_var,
+            values=["Alle", "active", "collected", "cancelled"],
+            state="readonly",
+            width=12
+        )
+        status_filter.pack(side="left", padx=(0, 12))
+        status_filter.current(1)  # Default: active
+        
+        tk.Label(filter_frame, text="Type:").pack(side="left", padx=(12, 4))
+        type_filter_var = tk.StringVar(value="Alle")
+        type_filter = ttk.Combobox(
+            filter_frame,
+            textvariable=type_filter_var,
+            values=["Alle", "Preorder", "Listing"],
+            state="readonly",
+            width=12
+        )
+        type_filter.pack(side="left", padx=(0, 12))
+        type_filter.current(0)
+        
+        # Buttons
+        button_frame = tk.Frame(filter_frame)
+        button_frame.pack(side="right")
+        
+        # Treeview for orders
+        tree_frame = tk.Frame(main_frame)
+        tree_frame.pack(fill="both", expand=True)
+        
+        # Scrollbars
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical")
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal")
+        
+        # Treeview columns
+        columns = ("ID", "Type", "Item", "Quantity", "Filled/Sold", "Price", "Status", "Timestamp")
+        orders_tree = ttk.Treeview(
+            tree_frame,
+            columns=columns,
+            show="headings",
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
+            height=20
+        )
+        
+        vsb.config(command=orders_tree.yview)
+        hsb.config(command=orders_tree.xview)
+        
+        # Column configurations
+        orders_tree.heading("ID", text="ID")
+        orders_tree.heading("Type", text="Type")
+        orders_tree.heading("Item", text="Item")
+        orders_tree.heading("Quantity", text="Menge")
+        orders_tree.heading("Filled/Sold", text="Gefüllt/Verkauft")
+        orders_tree.heading("Price", text="Preis")
+        orders_tree.heading("Status", text="Status")
+        orders_tree.heading("Timestamp", text="Zeitstempel")
+        
+        orders_tree.column("ID", width=50, anchor="center")
+        orders_tree.column("Type", width=80, anchor="center")
+        orders_tree.column("Item", width=200, anchor="w")
+        orders_tree.column("Quantity", width=80, anchor="e")
+        orders_tree.column("Filled/Sold", width=100, anchor="e")
+        orders_tree.column("Price", width=120, anchor="e")
+        orders_tree.column("Status", width=80, anchor="center")
+        orders_tree.column("Timestamp", width=150, anchor="center")
+        
+        # Pack tree and scrollbars
+        orders_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+        
+        def load_orders():
+            """Load orders from database based on filters"""
+            # Clear existing items
+            for item in orders_tree.get_children():
+                orders_tree.delete(item)
+            
+            try:
+                # Build query based on filters
+                status_filter_val = status_filter_var.get()
+                type_filter_val = type_filter_var.get()
+                
+                # Fetch preorders
+                if type_filter_val in ("Alle", "Preorder"):
+                    query = "SELECT id, item_name, quantity, quantity_filled, price, status, timestamp FROM preorders"
+                    params = []
+                    
+                    if status_filter_val != "Alle":
+                        query += " WHERE status = ?"
+                        params.append(status_filter_val)
+                    
+                    query += " ORDER BY timestamp DESC"
+                    
+                    cur = get_cursor()
+                    cur.execute(query, params)
+                    preorders = cur.fetchall()
+                    
+                    for row in preorders:
+                        order_id, item_name, quantity, quantity_filled, price, status, timestamp = row
+                        orders_tree.insert("", "end", values=(
+                            order_id,
+                            "Preorder",
+                            item_name,
+                            f"{quantity:,}",
+                            f"{quantity_filled:,}" if quantity_filled else "0",
+                            f"{int(price):,}",
+                            status,
+                            timestamp
+                        ), tags=(status,))
+                
+                # Fetch listings
+                if type_filter_val in ("Alle", "Listing"):
+                    query = "SELECT id, item_name, quantity, quantity_sold, price, status, timestamp FROM listings"
+                    params = []
+                    
+                    if status_filter_val != "Alle":
+                        query += " WHERE status = ?"
+                        params.append(status_filter_val)
+                    
+                    query += " ORDER BY timestamp DESC"
+                    
+                    cur = get_cursor()
+                    cur.execute(query, params)
+                    listings = cur.fetchall()
+                    
+                    for row in listings:
+                        order_id, item_name, quantity, quantity_sold, price, status, timestamp = row
+                        orders_tree.insert("", "end", values=(
+                            order_id,
+                            "Listing",
+                            item_name,
+                            f"{quantity:,}",
+                            f"{quantity_sold:,}" if quantity_sold else "0",
+                            f"{int(price):,}",
+                            status,
+                            timestamp
+                        ), tags=(status,))
+                
+                # Configure tag colors
+                orders_tree.tag_configure("active", foreground="green")
+                orders_tree.tag_configure("collected", foreground="blue")
+                orders_tree.tag_configure("cancelled", foreground="red")
+                
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Fehler beim Laden der Orders: {e}")
+        
+        def refresh_orders():
+            """Refresh orders list"""
+            load_orders()
+        
+        def mark_order_collected():
+            """Mark selected order as collected"""
+            selected = orders_tree.selection()
+            if not selected:
+                messagebox.showwarning("Auswahl", "Bitte wählen Sie eine Order aus.")
+                return
+            
+            item_values = orders_tree.item(selected[0])['values']
+            order_id = item_values[0]
+            order_type = item_values[1]
+            order_status = item_values[6]
+            
+            if order_status != "active":
+                messagebox.showwarning("Status", "Nur aktive Orders können als collected markiert werden.")
+                return
+            
+            confirm = messagebox.askyesno(
+                "Bestätigung",
+                f"Order ID {order_id} ({order_type}) als collected markieren?"
+            )
+            if not confirm:
+                return
+            
+            try:
+                cur = get_cursor()
+                table_name = "preorders" if order_type == "Preorder" else "listings"
+                cur.execute(
+                    f"UPDATE {table_name} SET status = 'collected', collected_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (order_id,)
+                )
+                get_connection().commit()
+                messagebox.showinfo("Erfolg", f"Order ID {order_id} wurde als collected markiert.")
+                load_orders()
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Fehler beim Markieren: {e}")
+        
+        def cancel_order():
+            """Cancel selected order"""
+            selected = orders_tree.selection()
+            if not selected:
+                messagebox.showwarning("Auswahl", "Bitte wählen Sie eine Order aus.")
+                return
+            
+            item_values = orders_tree.item(selected[0])['values']
+            order_id = item_values[0]
+            order_type = item_values[1]
+            order_status = item_values[6]
+            
+            if order_status != "active":
+                messagebox.showwarning("Status", "Nur aktive Orders können cancelt werden.")
+                return
+            
+            confirm = messagebox.askyesno(
+                "Bestätigung",
+                f"Order ID {order_id} ({order_type}) wirklich canceln?"
+            )
+            if not confirm:
+                return
+            
+            try:
+                cur = get_cursor()
+                table_name = "preorders" if order_type == "Preorder" else "listings"
+                cur.execute(
+                    f"UPDATE {table_name} SET status = 'cancelled' WHERE id = ?",
+                    (order_id,)
+                )
+                get_connection().commit()
+                messagebox.showinfo("Erfolg", f"Order ID {order_id} wurde gecancelt.")
+                load_orders()
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Fehler beim Canceln: {e}")
+        
+        def delete_order():
+            """Delete selected order"""
+            selected = orders_tree.selection()
+            if not selected:
+                messagebox.showwarning("Auswahl", "Bitte wählen Sie eine Order aus.")
+                return
+            
+            item_values = orders_tree.item(selected[0])['values']
+            order_id = item_values[0]
+            order_type = item_values[1]
+            
+            confirm = messagebox.askyesno(
+                "Bestätigung",
+                f"Order ID {order_id} ({order_type}) wirklich löschen?\nDiese Aktion kann nicht rückgängig gemacht werden!"
+            )
+            if not confirm:
+                return
+            
+            try:
+                cur = get_cursor()
+                table_name = "preorders" if order_type == "Preorder" else "listings"
+                cur.execute(f"DELETE FROM {table_name} WHERE id = ?", (order_id,))
+                get_connection().commit()
+                messagebox.showinfo("Erfolg", f"Order ID {order_id} wurde gelöscht.")
+                load_orders()
+            except Exception as e:
+                messagebox.showerror("Fehler", f"Fehler beim Löschen: {e}")
+        
+        def add_order_manually():
+            """Open dialog to manually add a preorder or listing"""
+            add_dialog = tk.Toplevel(orders_window)
+            add_dialog.title("Order manuell hinzufügen")
+            add_dialog.geometry("500x400")
+            try:
+                add_dialog.iconbitmap('config/icon.ico')
+            except tk.TclError:
+                pass
+            add_dialog.transient(orders_window)
+            add_dialog.grab_set()
+            
+            # Main frame
+            dialog_frame = tk.Frame(add_dialog, padx=20, pady=20)
+            dialog_frame.pack(fill="both", expand=True)
+            
+            # Title
+            tk.Label(dialog_frame, text="Neue Order erstellen", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 16))
+            
+            # Order Type
+            type_frame = tk.Frame(dialog_frame)
+            type_frame.pack(fill="x", pady=8)
+            tk.Label(type_frame, text="Order-Typ:", width=15, anchor="w").pack(side="left")
+            order_type_var = tk.StringVar(value="Preorder")
+            order_type_combo = ttk.Combobox(
+                type_frame,
+                textvariable=order_type_var,
+                values=["Preorder", "Listing"],
+                state="readonly",
+                width=20
+            )
+            order_type_combo.pack(side="left", fill="x", expand=True)
+            
+            # Item Name
+            item_frame = tk.Frame(dialog_frame)
+            item_frame.pack(fill="x", pady=8)
+            tk.Label(item_frame, text="Item-Name:", width=15, anchor="w").pack(side="left")
+            item_entry = tk.Entry(item_frame)
+            item_entry.pack(side="left", fill="x", expand=True)
+            
+            # Quantity
+            qty_frame = tk.Frame(dialog_frame)
+            qty_frame.pack(fill="x", pady=8)
+            tk.Label(qty_frame, text="Menge:", width=15, anchor="w").pack(side="left")
+            qty_entry = tk.Entry(qty_frame)
+            qty_entry.pack(side="left", fill="x", expand=True)
+            qty_entry.insert(0, "1000")
+            
+            # Price
+            price_frame = tk.Frame(dialog_frame)
+            price_frame.pack(fill="x", pady=8)
+            tk.Label(price_frame, text="Preis (Total):", width=15, anchor="w").pack(side="left")
+            price_entry = tk.Entry(price_frame)
+            price_entry.pack(side="left", fill="x", expand=True)
+            price_entry.insert(0, "1000000")
+            
+            # Timestamp
+            ts_frame = tk.Frame(dialog_frame)
+            ts_frame.pack(fill="x", pady=8)
+            tk.Label(ts_frame, text="Zeitstempel:", width=15, anchor="w").pack(side="left")
+            ts_entry = tk.Entry(ts_frame)
+            ts_entry.pack(side="left", fill="x", expand=True)
+            current_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ts_entry.insert(0, current_ts)
+            tk.Label(ts_frame, text="(YYYY-MM-DD HH:MM:SS)", font=("Segoe UI", 8), fg="gray").pack(side="left", padx=(4, 0))
+            
+            # Info label
+            info_label = tk.Label(
+                dialog_frame,
+                text="Hinweis: Diese Order wird manuell zur Datenbank hinzugefügt.\nSie wird NICHT automatisch mit dem Spiel synchronisiert!",
+                font=("Segoe UI", 9, "italic"),
+                fg="#666",
+                justify="left"
+            )
+            info_label.pack(anchor="w", pady=(16, 16))
+            
+            def save_order():
+                """Validate and save the order"""
+                # Validate inputs
+                order_type = order_type_var.get()
+                item_name = item_entry.get().strip()
+                quantity_str = qty_entry.get().strip()
+                price_str = price_entry.get().strip()
+                timestamp_str = ts_entry.get().strip()
+                
+                if not item_name:
+                    messagebox.showwarning("Validierung", "Bitte geben Sie einen Item-Namen ein.")
+                    return
+                
+                try:
+                    quantity = int(quantity_str)
+                    if quantity <= 0 or quantity > 1000000:
+                        raise ValueError("Menge muss zwischen 1 und 1.000.000 liegen.")
+                except ValueError as e:
+                    messagebox.showwarning("Validierung", f"Ungültige Menge: {e}")
+                    return
+                
+                try:
+                    price = float(price_str)
+                    if price <= 0:
+                        raise ValueError("Preis muss größer als 0 sein.")
+                except ValueError as e:
+                    messagebox.showwarning("Validierung", f"Ungültiger Preis: {e}")
+                    return
+                
+                try:
+                    timestamp = datetime.datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    messagebox.showwarning("Validierung", "Ungültiges Zeitstempel-Format. Bitte verwenden Sie: YYYY-MM-DD HH:MM:SS")
+                    return
+                
+                # Save to database
+                try:
+                    cur = get_cursor()
+                    
+                    if order_type == "Preorder":
+                        # Check for existing active preorder
+                        cur.execute(
+                            "SELECT id FROM preorders WHERE item_name = ? AND status = 'active'",
+                            (item_name,)
+                        )
+                        existing = cur.fetchone()
+                        
+                        if existing:
+                            confirm = messagebox.askyesno(
+                                "Bestehende Order",
+                                f"Es existiert bereits eine aktive Preorder für '{item_name}'.\n"
+                                "Die alte Order wird als 'collected' markiert. Fortfahren?"
+                            )
+                            if not confirm:
+                                return
+                            
+                            # Mark old as collected
+                            cur.execute(
+                                "UPDATE preorders SET status = 'collected', collected_at = ? WHERE id = ?",
+                                (timestamp, existing[0])
+                            )
+                        
+                        # Insert new preorder
+                        cur.execute(
+                            """INSERT INTO preorders 
+                            (item_name, quantity, quantity_filled, price, timestamp, status, created_at)
+                            VALUES (?, ?, 0, ?, ?, 'active', CURRENT_TIMESTAMP)""",
+                            (item_name, quantity, price, timestamp)
+                        )
+                    else:  # Listing
+                        # Check for existing active listing
+                        cur.execute(
+                            "SELECT id FROM listings WHERE item_name = ? AND status = 'active'",
+                            (item_name,)
+                        )
+                        existing = cur.fetchone()
+                        
+                        if existing:
+                            confirm = messagebox.askyesno(
+                                "Bestehende Order",
+                                f"Es existiert bereits eine aktive Listing für '{item_name}'.\n"
+                                "Die alte Order wird als 'collected' markiert. Fortfahren?"
+                            )
+                            if not confirm:
+                                return
+                            
+                            # Mark old as collected
+                            cur.execute(
+                                "UPDATE listings SET status = 'collected', collected_at = ? WHERE id = ?",
+                                (timestamp, existing[0])
+                            )
+                        
+                        # Insert new listing
+                        cur.execute(
+                            """INSERT INTO listings 
+                            (item_name, quantity, quantity_sold, price, timestamp, status, created_at)
+                            VALUES (?, ?, 0, ?, ?, 'active', CURRENT_TIMESTAMP)""",
+                            (item_name, quantity, price, timestamp)
+                        )
+                    
+                    get_connection().commit()
+                    messagebox.showinfo("Erfolg", f"{order_type} für '{item_name}' wurde erfolgreich hinzugefügt!")
+                    load_orders()
+                    add_dialog.destroy()
+                    
+                except Exception as e:
+                    messagebox.showerror("Fehler", f"Fehler beim Speichern: {e}")
+            
+            # Buttons
+            button_frame = tk.Frame(dialog_frame)
+            button_frame.pack(fill="x", pady=(16, 0))
+            ttk.Button(button_frame, text="Speichern", style="Accent.TButton", command=save_order).pack(side="left")
+            ttk.Button(button_frame, text="Abbrechen", command=add_dialog.destroy).pack(side="left", padx=8)
+        
+        # Action buttons
+        ttk.Button(button_frame, text="➕ Hinzufügen", command=add_order_manually, style="Accent.TButton").pack(side="left", padx=2)
+        ttk.Button(button_frame, text="🔄 Aktualisieren", command=refresh_orders).pack(side="left", padx=2)
+        ttk.Button(button_frame, text="✅ Collected", command=mark_order_collected).pack(side="left", padx=2)
+        ttk.Button(button_frame, text="❌ Cancel", command=cancel_order).pack(side="left", padx=2)
+        ttk.Button(button_frame, text="🗑️ Löschen", command=delete_order).pack(side="left", padx=2)
+        
+        # Bind filter changes to reload
+        status_filter.bind("<<ComboboxSelected>>", lambda e: load_orders())
+        type_filter.bind("<<ComboboxSelected>>", lambda e: load_orders())
+        
+        # Auto-refresh every 3 seconds if auto-track is running
+        def auto_refresh():
+            if tracker.running:
+                load_orders()
+            orders_window.after(3000, auto_refresh)
+        
+        # Initial load
+        load_orders()
+        auto_refresh()
     
     def on_filter_mode_change(event=None):
         """Show/hide filter controls based on selected mode"""
@@ -766,6 +1256,7 @@ def start_gui():
     ttk.Button(buttons_row, text="Export CSV", command=export_csv).pack(side="left", padx=6)
     ttk.Button(buttons_row, text="Export JSON", command=export_json).pack(side="left")
     ttk.Button(buttons_row, text="Fenster-Historie", command=show_history).pack(side="left", padx=6)
+    ttk.Button(buttons_row, text="Orders verwalten", command=open_orders_manager).pack(side="left", padx=6)
     ttk.Button(buttons_row, text="Presets verwalten", command=manage_presets).pack(side="right")
 
     def on_close():

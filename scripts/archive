@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""
+PaddleOCR Optimization Benchmark - Systematischer Test verschiedener Modelle & Parameter
+
+Testet:
+1. Verschiedene Modelle (mobile vs. server, v3 vs. v4)
+2. Detection-Parameter (thresh, box_thresh, unclip_ratio)
+3. Recognition-Parameter (batch_num)
+4. GPU vs. CPU
+5. Mit/Ohne Detection (nur Recognizer auf festen ROIs)
+
+Vergleicht gegen: EasyOCR baseline (400-700ms)
+
+Setup:
+    pip install paddlepaddle-gpu  # oder paddlepaddle für CPU
+    pip install paddleocr>=2.7.0
+"""
+
+import sys
+import os
+import time
+import cv2
+import numpy as np
+from typing import Dict, List, Tuple, Any
+from dataclasses import dataclass, field
+from statistics import mean, median, stdev
+
+# Add project root to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
+from config import get_use_gpu
+from ocr_engines import init_easyocr, ocr_with_easyocr
+
+
+@dataclass
+class BenchmarkConfig:
+    """Konfiguration für einen Benchmark-Run"""
+    name: str
+    model_type: str  # 'mobile', 'server'
+    version: str  # 'v3', 'v4'
+    use_gpu: bool
+    det_db_thresh: float = 0.3
+    det_db_box_thresh: float = 0.5
+    det_db_unclip_ratio: float = 1.6
+    rec_batch_num: int = 1  # Für single ROI: 1 ist optimal
+    use_angle_cls: bool = False
+    # Nur Recognition (skip Detection für feste ROIs)
+    recognition_only: bool = False
+    # Custom model paths (optional)
+    det_model_dir: str = None
+    rec_model_dir: str = None
+    cls_model_dir: str = None
+
+
+@dataclass
+class BenchmarkResult:
+    """Ergebnis eines Benchmark-Runs"""
+    config: BenchmarkConfig
+    times_ms: List[float] = field(default_factory=list)
+    accuracies: List[float] = field(default_factory=list)
+    detected_texts: List[str] = field(default_factory=list)
+    error: str = None
+    
+    @property
+    def mean_time(self) -> float:
+        return mean(self.times_ms) if self.times_ms else 0.0
+    
+    @property
+    def median_time(self) -> float:
+        return median(self.times_ms) if self.times_ms else 0.0
+    
+    @property
+    def stdev_time(self) -> float:
+        return stdev(self.times_ms) if len(self.times_ms) > 1 else 0.0
+    
+    @property
+    def mean_accuracy(self) -> float:
+        return mean(self.accuracies) if self.accuracies else 0.0
+
+
+# ==============================================
+# Test-Bilder (BDO-typische ROIs)
+# ==============================================
+
+def create_test_images() -> Dict[str, np.ndarray]:
+    """
+    Erstellt synthetische Test-Bilder die BDO-UI simulieren.
+    In der Praxis: Screenshots aus dem Spiel nutzen!
+    """
+    test_images = {}
+    
+    # 1. Balance ROI (~200x50px, weiße Zahlen auf dunkel)
+    img_balance = np.zeros((50, 200, 3), dtype=np.uint8)
+    cv2.putText(img_balance, "1,234,567,890", (10, 35), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    test_images['balance'] = img_balance
+    
+    # 2. Warehouse ROI (~100x40px, graue Zahlen auf dunkel)
+    img_warehouse = np.zeros((40, 100, 3), dtype=np.uint8)
+    cv2.putText(img_warehouse, "4486", (10, 28), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 1)
+    test_images['warehouse'] = img_warehouse
+    
+    # 3. Item Name ROI (~300x60px, weiße Text auf dunkel)
+    img_item = np.zeros((60, 300, 3), dtype=np.uint8)
+    cv2.putText(img_item, "Pure Powder Reagent", (10, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    test_images['item_name'] = img_item
+    
+    # 4. Price ROI (~150x40px, gelbe Zahlen)
+    img_price = np.zeros((40, 150, 3), dtype=np.uint8)
+    cv2.putText(img_price, "125,000", (10, 28), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    test_images['price'] = img_price
+    
+    return test_images
+
+
+def load_real_test_images() -> Dict[str, np.ndarray]:
+    """
+    Lädt echte Screenshots aus dem Projekt (falls vorhanden).
+    """
+    test_images = {}
+    
+    # Versuche debug_proc.png zu laden
+    debug_img_path = os.path.join(os.path.dirname(__file__), "../..", "debug_proc.png")
+    if os.path.exists(debug_img_path):
+        img = cv2.imread(debug_img_path)
+        if img is not None:
+            test_images['debug_proc'] = img
+            print(f"✅ Loaded real test image: debug_proc.png ({img.shape})")
+    
+    # Versuche dev-screenshots zu laden
+    dev_screenshots_dir = os.path.join(os.path.dirname(__file__), "../..", "dev-screenshots")
+    if os.path.exists(dev_screenshots_dir):
+        for root, dirs, files in os.walk(dev_screenshots_dir):
+            for file in files:
+                if file.endswith(('.png', '.jpg', '.jpeg')):
+                    img_path = os.path.join(root, file)
+                    img = cv2.imread(img_path)
+                    if img is not None:
+                        # Nur kleine bis mittelgroße Bilder (ROI-ähnlich)
+                        if img.shape[0] < 500 and img.shape[1] < 800:
+                            key = file.replace('.png', '').replace('.jpg', '')
+                            test_images[key] = img
+                            print(f"✅ Loaded real test image: {file} ({img.shape})")
+    
+    return test_images
+
+
+# ==============================================
+# PaddleOCR Benchmark-Runner
+# ==============================================
+
+def init_paddle_with_config(config: BenchmarkConfig) -> Any:
+    """
+    Initialisiert PaddleOCR mit spezifischer Konfiguration.
+    
+    NOTE: PaddleOCR 3.x API Changes:
+    - use_gpu → removed (auto-detects GPU via paddle.is_compiled_with_cuda())
+    - use_angle_cls → use_textline_orientation
+    - det_db_thresh → text_det_thresh
+    - det_db_box_thresh → text_det_box_thresh
+    - det_db_unclip_ratio → text_det_unclip_ratio
+    - rec_batch_num → text_recognition_batch_size
+    """
+    try:
+        from paddleocr import PaddleOCR
+        import paddle
+        
+        # Check GPU availability
+        gpu_available = paddle.is_compiled_with_cuda() and config.use_gpu
+        
+        # Base parameters (NEW API - PaddleOCR 3.x)
+        # NOTE: show_log parameter also removed in 3.x!
+        kwargs = {
+            'lang': 'en',
+            'use_textline_orientation': config.use_angle_cls,  # NEW: replaces use_angle_cls
+            # Detection parameters (NEW names)
+            'text_det_thresh': config.det_db_thresh,  # NEW: replaces det_db_thresh
+            'text_det_box_thresh': config.det_db_box_thresh,  # NEW: replaces det_db_box_thresh
+            'text_det_unclip_ratio': config.det_db_unclip_ratio,  # NEW: replaces det_db_unclip_ratio
+            # Recognition parameters (NEW names)
+            'text_recognition_batch_size': config.rec_batch_num,  # NEW: replaces rec_batch_num
+        }
+        
+        # GPU wird automatisch erkannt - kein use_gpu Parameter mehr!
+        # Falls GPU nicht verfügbar, läuft automatisch auf CPU
+        
+        # Custom model paths (falls angegeben)
+        if config.det_model_dir:
+            kwargs['det_model_dir'] = config.det_model_dir
+        if config.rec_model_dir:
+            kwargs['rec_model_dir'] = config.rec_model_dir
+        if config.cls_model_dir:
+            kwargs['cls_model_dir'] = config.cls_model_dir
+        
+        # Model selection for v4 (v3 is default)
+        # NOTE: In PaddleOCR 3.x, model selection via ocr_version parameter
+        if config.version == 'v4':
+            kwargs['ocr_version'] = 'PP-OCRv4'
+        else:
+            kwargs['ocr_version'] = 'PP-OCRv3'
+        
+        # Model type (mobile vs server)
+        # NOTE: det/rec parameters also removed in 3.x - model type controlled via ocr_version only
+        
+        reader = PaddleOCR(**kwargs)
+        
+        # Print actual device being used
+        device = "GPU (CUDA)" if gpu_available else "CPU"
+        print(f"   Device: {device}")
+        
+        return reader
+        
+    except Exception as e:
+        print(f"❌ PaddleOCR initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def benchmark_paddle_config(config: BenchmarkConfig, 
+                           test_images: Dict[str, np.ndarray],
+                           num_iterations: int = 5) -> BenchmarkResult:
+    """
+    Führt Benchmark für eine spezifische PaddleOCR-Konfiguration durch.
+    """
+    result = BenchmarkResult(config=config)
+    
+    print(f"\n{'='*80}")
+    print(f"Testing: {config.name}")
+    print(f"Model: {config.version} {config.model_type}, GPU: {config.use_gpu}")
+    print(f"Detection: thresh={config.det_db_thresh}, box_thresh={config.det_db_box_thresh}")
+    print(f"Recognition: batch_num={config.rec_batch_num}")
+    print(f"{'='*80}")
+    
+    # Initialize PaddleOCR
+    reader = init_paddle_with_config(config)
+    if reader is None:
+        result.error = "Initialization failed"
+        return result
+    
+    # Warmup run
+    print("Warmup...")
+    for img_name, img in list(test_images.items())[:1]:
+        try:
+            # NOTE: In PaddleOCR 3.x, cls parameter removed (use use_textline_orientation in init)
+            _ = reader.ocr(img)
+        except Exception as e:
+            result.error = f"Warmup failed: {e}"
+            import traceback
+            traceback.print_exc()
+            return result
+    
+    # Benchmark iterations
+    print(f"Running {num_iterations} iterations...")
+    for iteration in range(num_iterations):
+        iter_times = []
+        iter_texts = []
+        
+        for img_name, img in test_images.items():
+            try:
+                # Ensure RGB format
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                elif img.shape[2] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+                elif img.shape[2] == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                
+                # Run OCR with timing
+                start = time.perf_counter()
+                ocr_result = reader.ocr(img)  # cls parameter removed in PaddleOCR 3.x
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                
+                iter_times.append(elapsed_ms)
+                
+                # Extract text
+                if ocr_result and ocr_result[0]:
+                    texts = [line[1][0] for line in ocr_result[0] if len(line) == 2]
+                    combined_text = ' '.join(texts)
+                    iter_texts.append(combined_text)
+                    
+                    # Track confidence (accuracy proxy)
+                    confidences = [line[1][1] for line in ocr_result[0] if len(line) == 2]
+                    if confidences:
+                        result.accuracies.append(mean(confidences))
+                else:
+                    iter_texts.append("")
+                    result.accuracies.append(0.0)
+                
+                print(f"  {img_name}: {elapsed_ms:.1f}ms - '{iter_texts[-1][:50]}'")
+                
+            except Exception as e:
+                print(f"  ❌ {img_name}: Error - {e}")
+                result.error = str(e)
+                return result
+        
+        # Store iteration results
+        result.times_ms.extend(iter_times)
+        result.detected_texts.extend(iter_texts)
+        
+        print(f"Iteration {iteration+1}/{num_iterations}: Avg {mean(iter_times):.1f}ms")
+    
+    return result
+
+
+# ==============================================
+# EasyOCR Baseline
+# ==============================================
+
+def benchmark_easyocr_baseline(test_images: Dict[str, np.ndarray],
+                              num_iterations: int = 5,
+                              use_gpu: bool = True) -> BenchmarkResult:
+    """
+    EasyOCR Baseline für Vergleich.
+    """
+    config = BenchmarkConfig(
+        name="EasyOCR Baseline",
+        model_type="standard",
+        version="latest",
+        use_gpu=use_gpu
+    )
+    result = BenchmarkResult(config=config)
+    
+    print(f"\n{'='*80}")
+    print(f"EasyOCR Baseline (GPU: {use_gpu})")
+    print(f"{'='*80}")
+    
+    # Initialize EasyOCR
+    if not init_easyocr(use_gpu=use_gpu):
+        result.error = "EasyOCR initialization failed"
+        return result
+    
+    # Warmup
+    print("Warmup...")
+    for img_name, img in list(test_images.items())[:1]:
+        _ = ocr_with_easyocr(img)
+    
+    # Benchmark
+    print(f"Running {num_iterations} iterations...")
+    for iteration in range(num_iterations):
+        iter_times = []
+        
+        for img_name, img in test_images.items():
+            try:
+                start = time.perf_counter()
+                ocr_result = ocr_with_easyocr(img)
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                
+                iter_times.append(elapsed_ms)
+                
+                # Extract text
+                if ocr_result:
+                    combined_text = ' '.join([text for text, conf in ocr_result])
+                    result.detected_texts.append(combined_text)
+                    confidences = [conf for text, conf in ocr_result]
+                    result.accuracies.append(mean(confidences) if confidences else 0.0)
+                else:
+                    result.detected_texts.append("")
+                    result.accuracies.append(0.0)
+                
+                print(f"  {img_name}: {elapsed_ms:.1f}ms - '{result.detected_texts[-1][:50]}'")
+                
+            except Exception as e:
+                print(f"  ❌ {img_name}: Error - {e}")
+                result.error = str(e)
+                return result
+        
+        result.times_ms.extend(iter_times)
+        print(f"Iteration {iteration+1}/{num_iterations}: Avg {mean(iter_times):.1f}ms")
+    
+    return result
+
+
+# ==============================================
+# Test Configurations
+# ==============================================
+
+def get_test_configs(use_gpu: bool) -> List[BenchmarkConfig]:
+    """
+    Definiert Test-Konfigurationen für systematischen Vergleich.
+    """
+    configs = []
+    
+    # 1. Baseline: Default PP-OCRv3 (wie aktuell in ocr_engines.py)
+    configs.append(BenchmarkConfig(
+        name="PP-OCRv3 Default (Baseline)",
+        model_type="mobile",
+        version="v3",
+        use_gpu=use_gpu,
+        det_db_thresh=0.3,
+        det_db_box_thresh=0.5,
+        det_db_unclip_ratio=1.6,
+        rec_batch_num=6
+    ))
+    
+    # 2. Optimized: rec_batch_num=1 (kein Batching für single ROI)
+    configs.append(BenchmarkConfig(
+        name="PP-OCRv3 Mobile (batch=1)",
+        model_type="mobile",
+        version="v3",
+        use_gpu=use_gpu,
+        det_db_thresh=0.3,
+        det_db_box_thresh=0.5,
+        det_db_unclip_ratio=1.6,
+        rec_batch_num=1  # Optimal für single-ROI
+    ))
+    
+    # 3. Aggressive Detection Params (schnellere Detection)
+    configs.append(BenchmarkConfig(
+        name="PP-OCRv3 Mobile (fast-det)",
+        model_type="mobile",
+        version="v3",
+        use_gpu=use_gpu,
+        det_db_thresh=0.5,  # Höher = weniger Detections, schneller
+        det_db_box_thresh=0.7,  # Höher = strengere Filterung
+        det_db_unclip_ratio=1.3,  # Niedriger = kleinere Boxen
+        rec_batch_num=1
+    ))
+    
+    # 4. PP-OCRv4 Mobile (latest)
+    configs.append(BenchmarkConfig(
+        name="PP-OCRv4 Mobile",
+        model_type="mobile",
+        version="v4",
+        use_gpu=use_gpu,
+        det_db_thresh=0.3,
+        det_db_box_thresh=0.5,
+        det_db_unclip_ratio=1.6,
+        rec_batch_num=1
+    ))
+    
+    # 5. Server Model (höhere Accuracy, langsamer)
+    configs.append(BenchmarkConfig(
+        name="PP-OCRv3 Server",
+        model_type="server",
+        version="v3",
+        use_gpu=use_gpu,
+        det_db_thresh=0.3,
+        det_db_box_thresh=0.5,
+        det_db_unclip_ratio=1.6,
+        rec_batch_num=1
+    ))
+    
+    return configs
+
+
+# ==============================================
+# Results Analysis
+# ==============================================
+
+def print_results_summary(results: List[BenchmarkResult], baseline: BenchmarkResult):
+    """
+    Druckt übersichtliche Zusammenfassung aller Ergebnisse.
+    """
+    print("\n" + "="*100)
+    print("BENCHMARK RESULTS SUMMARY")
+    print("="*100)
+    
+    print(f"\n{'Configuration':<40} {'Mean (ms)':<12} {'Median (ms)':<12} {'StdDev':<10} {'vs Baseline':<12} {'Accuracy':<10}")
+    print("-"*100)
+    
+    # EasyOCR Baseline
+    print(f"{'EasyOCR Baseline':<40} {baseline.mean_time:>10.1f}ms {baseline.median_time:>10.1f}ms "
+          f"{baseline.stdev_time:>8.1f}ms {'  ---':<12} {baseline.mean_accuracy:>8.1%}")
+    
+    print("-"*100)
+    
+    # PaddleOCR Configs
+    for result in results:
+        if result.error:
+            print(f"{result.config.name:<40} {'ERROR':<12} {result.error}")
+            continue
+        
+        # Vergleich zu Baseline
+        speedup = baseline.mean_time / result.mean_time if result.mean_time > 0 else 0
+        if speedup > 1:
+            comparison = f"🟢 {speedup:.2f}x faster"
+        else:
+            comparison = f"🔴 {1/speedup:.2f}x slower"
+        
+        print(f"{result.config.name:<40} {result.mean_time:>10.1f}ms {result.median_time:>10.1f}ms "
+              f"{result.stdev_time:>8.1f}ms {comparison:<12} {result.mean_accuracy:>8.1%}")
+    
+    print("="*100)
+    
+    # Winner
+    valid_results = [r for r in results if not r.error and r.times_ms]
+    if valid_results:
+        fastest = min(valid_results, key=lambda r: r.mean_time)
+        print(f"\n🏆 FASTEST: {fastest.config.name} @ {fastest.mean_time:.1f}ms")
+        
+        if fastest.mean_time < baseline.mean_time:
+            speedup = baseline.mean_time / fastest.mean_time
+            print(f"   → {speedup:.2f}x faster than EasyOCR!")
+        else:
+            slowdown = fastest.mean_time / baseline.mean_time
+            print(f"   → {slowdown:.2f}x slower than EasyOCR :(")
+    
+    print()
+
+
+def save_results_to_file(results: List[BenchmarkResult], baseline: BenchmarkResult, filename: str):
+    """
+    Speichert detaillierte Ergebnisse in Datei.
+    """
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write("PADDLEOCR OPTIMIZATION BENCHMARK RESULTS\n")
+        f.write("="*100 + "\n\n")
+        f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total Configurations Tested: {len(results) + 1}\n\n")
+        
+        # Baseline
+        f.write("BASELINE (EasyOCR):\n")
+        f.write(f"  Mean:   {baseline.mean_time:.2f}ms\n")
+        f.write(f"  Median: {baseline.median_time:.2f}ms\n")
+        f.write(f"  StdDev: {baseline.stdev_time:.2f}ms\n")
+        f.write(f"  Accuracy: {baseline.mean_accuracy:.1%}\n\n")
+        
+        # PaddleOCR Results
+        for i, result in enumerate(results, 1):
+            f.write(f"\nCONFIG #{i}: {result.config.name}\n")
+            f.write("-"*80 + "\n")
+            
+            if result.error:
+                f.write(f"  ERROR: {result.error}\n")
+                continue
+            
+            f.write(f"  Model: {result.config.version} {result.config.model_type}\n")
+            f.write(f"  GPU: {result.config.use_gpu}\n")
+            f.write(f"  Detection: thresh={result.config.det_db_thresh}, "
+                   f"box_thresh={result.config.det_db_box_thresh}, "
+                   f"unclip_ratio={result.config.det_db_unclip_ratio}\n")
+            f.write(f"  Recognition: batch_num={result.config.rec_batch_num}\n\n")
+            
+            f.write(f"  Mean Time:   {result.mean_time:.2f}ms\n")
+            f.write(f"  Median Time: {result.median_time:.2f}ms\n")
+            f.write(f"  StdDev:      {result.stdev_time:.2f}ms\n")
+            f.write(f"  Accuracy:    {result.mean_accuracy:.1%}\n")
+            
+            speedup = baseline.mean_time / result.mean_time if result.mean_time > 0 else 0
+            if speedup > 1:
+                f.write(f"  vs Baseline: {speedup:.2f}x FASTER ✅\n")
+            else:
+                f.write(f"  vs Baseline: {1/speedup:.2f}x slower ❌\n")
+            
+            f.write(f"\n  Sample Texts:\n")
+            for text in result.detected_texts[:5]:
+                f.write(f"    - {text[:80]}\n")
+    
+    print(f"✅ Detailed results saved to: {filename}")
+
+
+# ==============================================
+# Main Benchmark
+# ==============================================
+
+def main():
+    print("="*100)
+    print("PADDLEOCR OPTIMIZATION BENCHMARK")
+    print("Testing verschiedene Modelle & Parameter gegen EasyOCR Baseline")
+    print("="*100)
+    
+    # GPU detection
+    use_gpu = get_use_gpu(default=True)
+    print(f"\n🖥️  GPU Mode: {use_gpu}")
+    
+    # Load test images
+    print("\n📷 Loading test images...")
+    test_images = load_real_test_images()
+    
+    if not test_images:
+        print("⚠️  No real images found, creating synthetic test images...")
+        test_images = create_test_images()
+    
+    print(f"✅ Loaded {len(test_images)} test images: {list(test_images.keys())}")
+    
+    # Run EasyOCR Baseline
+    print("\n" + "="*100)
+    print("STEP 1: EasyOCR Baseline")
+    print("="*100)
+    baseline_result = benchmark_easyocr_baseline(test_images, num_iterations=5, use_gpu=use_gpu)
+    
+    if baseline_result.error:
+        print(f"❌ EasyOCR baseline failed: {baseline_result.error}")
+        return
+    
+    print(f"\n✅ EasyOCR Baseline: {baseline_result.mean_time:.1f}ms (median: {baseline_result.median_time:.1f}ms)")
+    
+    # Run PaddleOCR Configs
+    print("\n" + "="*100)
+    print("STEP 2: PaddleOCR Configurations")
+    print("="*100)
+    
+    configs = get_test_configs(use_gpu=use_gpu)
+    results = []
+    
+    for i, config in enumerate(configs, 1):
+        print(f"\n[{i}/{len(configs)}]")
+        result = benchmark_paddle_config(config, test_images, num_iterations=5)
+        results.append(result)
+        
+        if not result.error:
+            print(f"✅ {config.name}: {result.mean_time:.1f}ms")
+        else:
+            print(f"❌ {config.name}: {result.error}")
+    
+    # Print Summary
+    print_results_summary(results, baseline_result)
+    
+    # Save to file
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_file = f"paddle_benchmark_results_{timestamp}.txt"
+    save_results_to_file(results, baseline_result, output_file)
+    
+    print("\n" + "="*100)
+    print("BENCHMARK COMPLETE")
+    print("="*100)
+    
+    # Recommendation
+    valid_results = [r for r in results if not r.error and r.times_ms]
+    if valid_results:
+        fastest = min(valid_results, key=lambda r: r.mean_time)
+        
+        if fastest.mean_time < baseline_result.mean_time:
+            speedup = baseline_result.mean_time / fastest.mean_time
+            print(f"\n🎯 EMPFEHLUNG: {fastest.config.name}")
+            print(f"   Performance: {fastest.mean_time:.1f}ms ({speedup:.2f}x faster than EasyOCR)")
+            print(f"   Accuracy: {fastest.mean_accuracy:.1%}")
+            print(f"\n   → PaddleOCR kann schneller sein! Migration empfohlen.")
+        else:
+            slowdown = fastest.mean_time / baseline_result.mean_time
+            print(f"\n📊 ERGEBNIS: Beste PaddleOCR Config: {fastest.config.name}")
+            print(f"   Performance: {fastest.mean_time:.1f}ms ({slowdown:.2f}x slower than EasyOCR)")
+            print(f"   Accuracy: {fastest.mean_accuracy:.1%}")
+            print(f"\n   → EasyOCR bleibt schneller. Keine Migration empfohlen.")
+
+
+if __name__ == "__main__":
+    main()

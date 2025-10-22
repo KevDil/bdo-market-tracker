@@ -11,6 +11,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from functools import lru_cache
+from typing import Optional, Dict, Tuple
 
 from config import (
     DEFAULT_REGION,
@@ -39,6 +40,10 @@ from utils import (
     detect_log_roi,
     detect_window_label_roi,
     detect_metrics_roi,
+    detect_detail_item_name_roi,
+    detect_detail_balance_roi,
+    detect_detail_warehouse_roi,
+    detect_detail_preorder_input_roi,
     easyocr_uses_gpu,
     get_easyocr_device_name,
     check_price_plausibility,
@@ -72,10 +77,12 @@ from database import (
 from parsing import (
     split_text_into_log_entries,
     extract_details_from_entry,
-    parse_timestamp_text
+    parse_timestamp_text,
+    normalize_numeric_str
 )
 from bdo_api_client import get_item_price_range_by_name
 from market_json_manager import get_base_price_from_cache
+from preorder_manager import PreorderManager
 
 # -----------------------
 # Performance: Precompiled Regex Patterns
@@ -227,6 +234,10 @@ class MarketTracker:
         self._detail_window_active = False  # True wenn in Detail-Fenster (buy_item/sell_item)
         self._detail_window_type = None  # 'sell_item' oder 'buy_item'
         self._detail_window_item = None  # Item-Name aus Detail-Fenster
+        
+        # Preorder Manager (Phase 3: Auto-Collect Detection)
+        self._preorder_manager = PreorderManager(debug=self.debug)
+        
         self._detail_baseline_balance = None  # Baseline Balance beim Fenster-Eintritt
         self._detail_baseline_warehouse = None  # Baseline Warehouse beim Fenster-Eintritt
         self._detail_last_metrics = None  # Letzte bekannte Metriken (dict)
@@ -246,6 +257,11 @@ class MarketTracker:
         self._detail_needs_baseline_capture = False  # True direkt nach Window-Transition
         self._detail_baseline_captured = False  # True nachdem erste Baseline gesetzt wurde
         self._detail_window_entry_item = None  # Item-Name beim Window-Entry (für Log-Fallback)
+        
+        # Rolling Baseline + Preorder Detection (Phase 1 & 2)
+        self._detail_await_preorder_check = False  # True nach Transaction-Save (wartet auf Preorder-Platzierung)
+        self._detail_preorder_check_baseline = None  # Baseline für Preorder-Check (dict: balance, warehouse, timestamp)
+        self._detail_last_transaction_saved = None  # Timestamp der letzten gespeicherten Transaction
         
         # Async pipeline controller placeholder
         self._async_controller = None
@@ -278,6 +294,9 @@ class MarketTracker:
         
         # Log-Fallback für fehlende Detail-Window Transaktionen
         self._pending_log_fallback_txs = []
+        
+        # Preorder Tracking (NEW)
+        self._preorder_manager = PreorderManager(debug=self.debug)
 
         if self.debug:
             log_debug(f"[INIT] Baseline initialized: {self._baseline_initialized}, Poll interval: {self.poll_interval}s")
@@ -317,6 +336,10 @@ class MarketTracker:
         perf_prefix = f"[PERF-{context.upper()}]"
         total_start = time.perf_counter()
 
+        # Store current frame for use in detail-window monitoring
+        self._current_frame = img
+        self._current_frame_proc = None  # Will be set after preprocessing
+
         try:
             use_fast_preprocess = self._use_fast_preprocess and self._fast_preprocess_cooldown <= 0
             if not use_fast_preprocess and self._fast_preprocess_cooldown > 0:
@@ -351,6 +374,10 @@ class MarketTracker:
                     set_preprocessed_frame(frame_hash, proc)
                 if self.debug:
                     log_debug(f"{perf_prefix} Preprocess: {preprocess_time:.1f}ms (balanced mode)")
+            
+            # Store preprocessed frame for detail-window monitoring
+            self._current_frame_proc = proc
+            
             if metrics is not None:
                 metrics["preprocess_ms"] = preprocess_time
                 metrics["preprocess_fast_mode"] = use_fast_preprocess
@@ -491,6 +518,7 @@ class MarketTracker:
                         use_roi=True,
                         preprocessed=proc,
                         fast_mode=True,
+                        roi_label="log",
                     )
                     ocr_elapsed = time.perf_counter() - ocr_start
                     ocr_time = ocr_elapsed * 1000
@@ -657,20 +685,29 @@ class MarketTracker:
                     # Import Detail-ROI-Funktionen
                     from utils import detect_detail_item_name_roi, detect_detail_balance_roi, detect_detail_warehouse_roi
                     
-                    # Extrahiere Item-Name-ROI
-                    item_name_roi = detect_detail_item_name_roi(proc, detected_detail_type)
+                    # ⚡ PERFORMANCE FIX: Cache Item Name across scans
+                    # Item name NEVER changes during Detail-Window session
+                    # Skip OCR if we already have it from previous scan
                     item_name_text = ""
-                    if item_name_roi:
-                        item_name_text, _, _ = ocr_image_cached(
-                            img,
-                            method='auto',
-                            use_roi=True,
-                            preprocessed=proc,
-                            fast_mode=use_fast_preprocess,
-                            roi=item_name_roi,
-                            roi_label="detail_item_name",
-                            cache_tag="detail_item_name",
-                        )
+                    if self._detail_window_active and self._detail_window_item:
+                        # Reuse cached item name (saves ~400ms OCR!)
+                        item_name_text = self._detail_window_item
+                        if self.debug:
+                            log_debug(f"[DETAIL-PERF] ⚡ Reusing cached item name: {item_name_text}")
+                    else:
+                        # First scan or no cache → Extract Item-Name-ROI
+                        item_name_roi = detect_detail_item_name_roi(proc, detected_detail_type)
+                        if item_name_roi:
+                            item_name_text, _, _ = ocr_image_cached(
+                                img,
+                                method='auto',
+                                use_roi=True,
+                                preprocessed=proc,
+                                fast_mode=use_fast_preprocess,
+                                roi=item_name_roi,
+                                roi_label="detail_item_name",
+                                cache_tag="detail_item_name",
+                            )
                     
                     # Extrahiere Balance-ROI
                     balance_roi = detect_detail_balance_roi(proc, detected_detail_type)
@@ -834,14 +871,51 @@ class MarketTracker:
             _save_image(roi_bgr, debug_dir / f"debug_{tag}_orig.png", color=True)
             if roi_proc is not None and roi_proc.size > 0:
                 _save_image(roi_proc, debug_dir / f"debug_{tag}_proc.png", color=False)
+        
+        def _save_roi_images_with_window_type(tag: str, detector, window_type: str):
+            """Save ROI images for detectors that need window_type parameter."""
+            try:
+                roi = detector(original_bgr, window_type)
+            except Exception:
+                roi = None
+            if not roi:
+                return
+            x, y, w, h = roi
+            if w <= 0 or h <= 0:
+                return
+            roi_bgr = original_bgr[y:y+h, x:x+w]
+            roi_proc = None
+            try:
+                roi_proc = processed_img[y:y+h, x:x+w]
+            except Exception:
+                roi_proc = None
+            _save_image(roi_bgr, debug_dir / f"debug_{tag}_{window_type}_orig.png", color=True)
+            if roi_proc is not None and roi_proc.size > 0:
+                _save_image(roi_proc, debug_dir / f"debug_{tag}_{window_type}_proc.png", color=False)
 
         with self._debug_image_lock:
             try:
                 _save_image(original_bgr, latest_orig, color=True)
                 _save_image(processed_img, latest_proc, color=False)
-                _save_roi_images("log", detect_log_roi)
+                
+                # Check current window type
+                detail_window_type = self._detail_window_type
+                is_detail_window = detail_window_type in ['buy_item', 'sell_item']
+                
+                # Label ROI: Always save (needed for window detection)
                 _save_roi_images("label", detect_window_label_roi)
-                _save_roi_images("metrics", detect_metrics_roi)
+                
+                if is_detail_window:
+                    # Detail-Window: Save detail-specific ROIs only
+                    _save_roi_images_with_window_type("item_name", detect_detail_item_name_roi, detail_window_type)
+                    _save_roi_images_with_window_type("balance", detect_detail_balance_roi, detail_window_type)
+                    _save_roi_images_with_window_type("warehouse", detect_detail_warehouse_roi, detail_window_type)
+                    # NEW: Preorder Input Fields ROI (for relist detection)
+                    _save_roi_images_with_window_type("preorder_input", detect_detail_preorder_input_roi, detail_window_type)
+                else:
+                    # Overview-Window: Save transaction log and UI metrics
+                    _save_roi_images("log", detect_log_roi)
+                    _save_roi_images("metrics", detect_metrics_roi)
             except Exception as save_err:
                 log_debug(f"[DEBUG] Failed to write debug images: {save_err}")
 
@@ -908,6 +982,436 @@ class MarketTracker:
                 if cand:
                     self._base_price_cache[cand.lower()] = base_price
         return base_price
+    
+    def _calculate_expected_qty(
+        self,
+        balance_delta: float,
+        item_name: str
+    ) -> int:
+        """
+        Calculate expected purchase quantity from balance delta.
+        
+        This is used for auto-collect detection: if warehouse_delta > expected_qty,
+        the surplus might be from a preorder auto-collect.
+        
+        Algorithm:
+        1. Get base price from BDO API
+        2. Estimate unit price as 92.5% of base (middle of 85%-100% range)
+        3. Calculate quantity = balance_delta / estimated_unit_price
+        4. Round to nearest 1000 (most purchases are in 1k increments)
+        5. If < 1000, round to nearest 100
+        
+        Args:
+            balance_delta: Balance decrease (positive value!)
+            item_name: Item name for base price lookup
+            
+        Returns:
+            Estimated purchase quantity (0 if cannot determine)
+        """
+        if balance_delta <= 0:
+            return 0
+        
+        base_price = self._get_base_price(item_name)
+        if base_price is None or base_price <= 0:
+            return 0
+        
+        # Use middle of price range (92.5% of base price)
+        # Price range is 85%-100% for purchases
+        estimated_unit_price = base_price * 0.925
+        
+        # Calculate raw quantity
+        estimated_qty = balance_delta / estimated_unit_price
+        
+        # Round to nearest 1000 (most purchases are 1k, 2k, 5k, etc.)
+        if estimated_qty >= 500:
+            estimated_qty_rounded = round(estimated_qty / 1000) * 1000
+        # If < 1000, round to nearest 100
+        elif estimated_qty >= 50:
+            estimated_qty_rounded = round(estimated_qty / 100) * 100
+        # If < 100, use raw value
+        else:
+            estimated_qty_rounded = int(estimated_qty)
+        
+        return max(1, estimated_qty_rounded)
+
+    def _extract_preorder_input_fields(
+        self,
+        img,
+        proc_img,
+        window_type: str
+    ) -> Optional[Dict]:
+        """
+        Extrahiert Preorder-Eingabewerte aus Detail-Fenster Input-ROI.
+        
+        CRITICAL: Wird für Relist-Detection verwendet!
+        Diese Methode liest die tatsächlich eingegebenen Werte aus den Input-Feldern.
+        
+        Buy-Item Felder:
+        - "Desired Price": Stückpreis (z.B. 154,000)
+        - "Desired Amount": Anzahl (z.B. 5000)
+        
+        Sell-Item Felder:
+        - "Set Price": Stückpreis
+        - "Register Quantity": Anzahl
+        
+        Args:
+            img: Original BGR image
+            proc_img: Preprocessed image
+            window_type: 'buy_item' oder 'sell_item'
+            
+        Returns:
+            Dict mit {'price': int, 'quantity': int} oder None
+        """
+        try:
+            # Get preorder input ROI
+            roi = detect_detail_preorder_input_roi(proc_img, window_type)
+            if not roi:
+                if self.debug:
+                    log_debug("[PREORDER-INPUT] ROI detection failed")
+                return None
+            
+            # OCR des Input-Bereichs
+            ocr_start = time.perf_counter()
+            input_text, was_cached, cache_stats = ocr_image_cached(
+                img,
+                method='auto',
+                use_roi=True,
+                preprocessed=proc_img,
+                fast_mode=False,  # Verwende hohe Qualität!
+                roi=roi,
+                roi_label="preorder_input",
+                cache_tag="preorder_input",
+            )
+            ocr_time = (time.perf_counter() - ocr_start) * 1000
+            
+            if not input_text or len(input_text) < 3:
+                if self.debug:
+                    log_debug(f"[PREORDER-INPUT] OCR empty ({ocr_time:.1f}ms)")
+                return None
+            
+            if self.debug:
+                log_debug(f"[PREORDER-INPUT] OCR ({ocr_time:.1f}ms): {input_text[:200]}")
+            
+            result = {}
+            
+            # Extrahiere Preis
+            if window_type == 'buy_item':
+                price_label = 'Desired Price'
+            else:
+                price_label = 'Set Price'
+            
+            # Price patterns - sehr flexibel!
+            price_patterns = [
+                rf'{price_label}[:\s]*([0-9,\.]+)',
+                r'Price[:\s]*([0-9,\.]+)',
+                # Fallback: Finde große Zahlen (>10000)
+                r'([0-9,\.]{6,})',  # Mindestens 6 Ziffern (100,000+)
+            ]
+            
+            for pattern in price_patterns:
+                match = re.search(pattern, input_text, re.IGNORECASE)
+                if match:
+                    price = normalize_numeric_str(match.group(1))
+                    if price and price >= 1000:  # Mindestpreis
+                        result['price'] = int(price)
+                        if self.debug:
+                            log_debug(f"[PREORDER-INPUT] Extracted price: {price:,} (pattern: {pattern})")
+                        break
+            
+            # Extrahiere Menge
+            if window_type == 'buy_item':
+                qty_label = 'Desired Amount'
+            else:
+                qty_label = 'Register Quantity'
+            
+            # Quantity patterns
+            qty_patterns = [
+                rf'{qty_label}[:\s]*([0-9,\.]+)',
+                r'Amount[:\s]*([0-9,\.]+)',
+                r'Quantity[:\s]*([0-9,\.]+)',
+                # Fallback: Finde kleinere Zahlen (1-5000 range)
+                r'\b([1-5][0-9]{3})\b',  # 1000-5999
+                r'\b([1-9][0-9]{2})\b',  # 100-999
+            ]
+            
+            for pattern in qty_patterns:
+                match = re.search(pattern, input_text, re.IGNORECASE)
+                if match:
+                    qty = normalize_numeric_str(match.group(1))
+                    if qty and 1 <= qty <= 5000:  # Plausible range
+                        result['quantity'] = int(qty)
+                        if self.debug:
+                            log_debug(f"[PREORDER-INPUT] Extracted quantity: {qty:,} (pattern: {pattern})")
+                        break
+            
+            # Validierung: Beide Werte müssen vorhanden sein
+            if 'price' not in result or 'quantity' not in result:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-INPUT] Incomplete extraction: "
+                        f"price={'price' in result}, quantity={'quantity' in result}"
+                    )
+                return None
+            
+            # Plausibility check: Gesamtpreis sollte sinnvoll sein
+            total_price = result['price'] * result['quantity']
+            if total_price < 1000 or total_price > 1_000_000_000_000:  # 1k - 1T Silver
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-INPUT] Implausible total: "
+                        f"{result['quantity']}x @ {result['price']:,} = {total_price:,}"
+                    )
+                return None
+            
+            if self.debug:
+                log_debug(
+                    f"[PREORDER-INPUT] ✅ SUCCESS: {result['quantity']:,}x @ {result['price']:,} "
+                    f"(total: {total_price:,})"
+                )
+            
+            return result
+            
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER-INPUT] ERROR: {e}")
+            return None
+
+    def _check_for_preorder_autocollect(
+        self,
+        item_name: str,
+        warehouse_delta: int,
+        balance_delta: float,
+        timestamp: datetime.datetime
+    ) -> Optional[Dict]:
+        """
+        Check if warehouse increase indicates preorder auto-collect.
+        
+        Auto-collect detection logic:
+        1. warehouse_delta > expected purchase quantity
+        2. Matching active preorder exists for this item
+        3. Quantity alignment: warehouse_delta ≈ purchase_qty + preorder_qty
+        
+        Args:
+            item_name: Item being purchased (from baseline)
+            warehouse_delta: Warehouse increase
+            balance_delta: Balance decrease (negative)
+            timestamp: Current transaction timestamp
+            
+        Returns:
+            Dict with preorder data if match found:
+                {'id': int, 'quantity': int, 'price': float, 'quantity_filled': int}
+            None if no preorder auto-collect detected
+        """
+        try:
+            # Sanity check: warehouse_delta must be positive
+            if warehouse_delta <= 0:
+                return None
+            
+            # Get base price for estimation
+            base_price = self._get_base_price(item_name)
+            if base_price is None:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-CHECK] Cannot estimate purchase qty: "
+                        f"no base_price for '{item_name}'"
+                    )
+                return None
+            
+            # Estimate purchase quantity from balance change
+            # balance_delta is negative, so abs() it
+            estimated_purchase_qty = abs(balance_delta) / base_price
+            
+            # Check if warehouse increase is significantly larger than purchase
+            # Allow 10% tolerance for price variations
+            if warehouse_delta <= estimated_purchase_qty * 1.1:
+                # Warehouse increase matches purchase - no auto-collect
+                return None
+            
+            if self.debug:
+                log_debug(
+                    f"[PREORDER-CHECK] Potential auto-collect: warehouse_delta={warehouse_delta}, "
+                    f"estimated_purchase_qty={estimated_purchase_qty:.1f} "
+                    f"(base_price={base_price:,.0f})"
+                )
+            
+            # Query PreorderManager for matching preorder
+            matching_preorder = self._preorder_manager.find_matching_preorder(
+                item_name=item_name,
+                warehouse_delta=warehouse_delta,
+                balance_delta=balance_delta,
+                timestamp=timestamp
+            )
+            
+            return matching_preorder
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER-CHECK] ERROR: {e}")
+            return None
+
+    def _reconstruct_missing_preorder_from_log(
+        self,
+        item_name: str,
+        withdrew_qty: int,
+        withdrew_price: float,
+        transaction_qty: int,
+        timestamp: datetime.datetime
+    ) -> Optional[Dict]:
+        """
+        FIX 1: Reconstruct missing preorder from transaction log entries.
+        
+        When a preorder is relisted, the transaction log shows:
+        - "Withdrew order of Item x2812 for 98,420,000 silver" (unfilled portion)
+        - "Transaction of Item x2188 for 76,580,000 Silver" (filled portion)
+        - "Placed order of Item x5000 for 175,500,000 Silver" (new preorder)
+        
+        This function reconstructs the original preorder details:
+        - Original quantity = withdrew_qty + transaction_qty
+        - Filled quantity = transaction_qty
+        - Unit price estimation from withdrawn amount
+        
+        Args:
+            item_name: Item name
+            withdrew_qty: Quantity withdrawn (unfilled portion)
+            withdrew_price: Price refunded for withdrawn orders
+            transaction_qty: Quantity collected (filled portion)
+            timestamp: Transaction timestamp
+            
+        Returns:
+            Dict with reconstructed preorder data:
+                {'quantity': int, 'quantity_filled': int, 'price': float, 'unit_price': float}
+            None if reconstruction fails
+        """
+        try:
+            # Calculate original preorder quantity
+            original_qty = withdrew_qty + transaction_qty
+            
+            if original_qty <= 0:
+                return None
+            
+            # Estimate unit price from withdrawn amount
+            # withdrew_price is the refund for unfilled orders
+            # So: unit_price ≈ withdrew_price / withdrew_qty
+            if withdrew_qty > 0 and withdrew_price > 0:
+                unit_price_estimate = withdrew_price / withdrew_qty
+            else:
+                # Fallback: try to estimate from transaction price
+                # But transaction price might be COLLECTED price (different from preorder price)
+                # Better to use base price as last resort
+                base_price = self._get_base_price(item_name)
+                unit_price_estimate = base_price if base_price else None
+            
+            if unit_price_estimate is None or unit_price_estimate <= 0:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-RECONSTRUCT] Failed: cannot estimate unit price for {item_name}"
+                    )
+                return None
+            
+            # Reconstruct original preorder total
+            original_preorder_total = unit_price_estimate * original_qty
+            
+            reconstructed = {
+                'quantity': original_qty,
+                'quantity_filled': transaction_qty,
+                'price': original_preorder_total,
+                'unit_price': unit_price_estimate,
+                'timestamp': timestamp,
+                '_reconstructed': True  # Flag to indicate this is synthetic
+            }
+            
+            if self.debug:
+                log_debug(
+                    f"[PREORDER-RECONSTRUCT] ✅ Reconstructed preorder for {item_name}:\n"
+                    f"   Original: {original_qty:,}x (filled={transaction_qty:,})\n"
+                    f"   Withdrew: {withdrew_qty:,}x @ {withdrew_price:,.0f}\n"
+                    f"   Unit price estimate: {unit_price_estimate:,.0f}\n"
+                    f"   Total: {original_preorder_total:,.0f}"
+                )
+            
+            return reconstructed
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER-RECONSTRUCT] ERROR: {e}")
+            return None
+
+    def _check_for_auto_preorder_creation(
+        self,
+        item_name: str,
+        warehouse_delta: int,
+        balance_delta: float,
+        timestamp: datetime.datetime
+    ) -> Optional[Tuple[int, float, int, float]]:
+        """
+        Check if insufficient stock caused auto-preorder creation.
+        
+        Detection logic:
+        1. balance_delta (price paid) suggests quantity X
+        2. warehouse_delta (received) shows quantity Y < X
+        3. Difference (X - Y) = auto-preorder quantity
+        
+        Example:
+            Attempt to buy 5000x @ 40M
+            Only 2000x available
+            Game buys 2k and creates 3k preorder
+        
+        Args:
+            item_name: Item name
+            warehouse_delta: Actual warehouse increase (2000)
+            balance_delta: Total price paid (-40M)
+            timestamp: Transaction timestamp
+            
+        Returns:
+            Tuple (purchase_qty, purchase_price, preorder_qty, preorder_price)
+            or None if no auto-preorder detected
+        """
+        try:
+            # Sanity checks
+            if warehouse_delta <= 0 or balance_delta >= 0:
+                return None
+            
+            # Get base price for estimation
+            base_price = self._get_base_price(item_name)
+            if base_price is None:
+                return None
+            
+            # Estimate total quantity user attempted to buy
+            total_price = abs(balance_delta)
+            estimated_total_qty = total_price / base_price
+            
+            # Check if warehouse received LESS than expected
+            # Allow 5% tolerance for rounding
+            if warehouse_delta >= estimated_total_qty * 0.95:
+                # Received full amount - no auto-preorder
+                return None
+            
+            # Calculate quantities
+            purchase_qty = warehouse_delta
+            preorder_qty = int(round(estimated_total_qty - purchase_qty))
+            
+            # Sanity check: preorder must be significant (at least 10% of total)
+            if preorder_qty < estimated_total_qty * 0.1:
+                return None
+            
+            # Split price proportionally
+            purchase_price = total_price * (purchase_qty / estimated_total_qty)
+            preorder_price = total_price * (preorder_qty / estimated_total_qty)
+            
+            if self.debug:
+                log_debug(
+                    f"[AUTO-PREORDER] Detected: {item_name} "
+                    f"(attempted={estimated_total_qty:.0f}, received={purchase_qty}, "
+                    f"preorder={preorder_qty}) "
+                    f"purchase_price={purchase_price:,.0f}, preorder_price={preorder_price:,.0f}"
+                )
+            
+            return (purchase_qty, purchase_price, preorder_qty, preorder_price)
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[AUTO-PREORDER] ERROR: {e}")
+            return None
 
     def _restore_total_with_base_price(self, item_name: str, quantity: int | None, observed_total: int | None) -> int | None:
         if not item_name or not quantity or quantity <= 0 or not observed_total or observed_total <= 0:
@@ -1391,6 +1895,55 @@ class MarketTracker:
         )
         return re.compile(pattern_str, re.IGNORECASE | re.DOTALL)
 
+    def _is_value_duplicate_with_time_tolerance(self, item_name, quantity, price, timestamp, tolerance_minutes=2):
+        """
+        FIX 2: Timestamp-Toleranz gegen OCR-Duplikate
+        
+        Prüft ob eine Transaktion mit gleichen Werten (Item, Menge, Preis) aber leicht 
+        unterschiedlichem Timestamp bereits in der DB existiert.
+        
+        Problem: OCR kann Timestamps inkonsistent lesen (10:30 vs 10:31), was zu Duplikaten führt.
+        Lösung: Prüfe ob eine Transaktion mit ±tolerance_minutes existiert.
+        
+        Args:
+            item_name: Item-Name
+            quantity: Menge
+            price: Preis
+            timestamp: Timestamp (datetime oder string)
+            tolerance_minutes: Zeittoleranz in Minuten (default: 2)
+        
+        Returns:
+            True wenn Duplikat gefunden, False sonst
+        """
+        try:
+            # Parse timestamp if string
+            if isinstance(timestamp, str):
+                ts_obj = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            elif isinstance(timestamp, datetime.datetime):
+                ts_obj = timestamp
+            else:
+                return False
+            
+            ts_min = (ts_obj - datetime.timedelta(minutes=tolerance_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+            ts_max = (ts_obj + datetime.timedelta(minutes=tolerance_minutes)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Query DB for matching transaction within time window
+            with get_cursor() as cursor:
+                cursor.execute('''
+                    SELECT COUNT(*) FROM transactions
+                    WHERE item_name = ?
+                      AND quantity = ?
+                      AND ABS(price - ?) < 1000
+                      AND timestamp BETWEEN ? AND ?
+                ''', (item_name, int(quantity), int(price), ts_min, ts_max))
+                
+                count = cursor.fetchone()[0]
+                return count > 0
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[TIMESTAMP-TOLERANCE] Check failed: {e}")
+            return False
+
     def _consume_immediate_rescan_request(self):
         if self._request_immediate_rescan > 0:
             self._request_immediate_rescan -= 1
@@ -1563,23 +2116,38 @@ class MarketTracker:
                     metrics['balance'] = balance_val
             
             # 2. Warehouse Quantity extrahieren
-            # Zwei Formate möglich:
-            # - Overview: "Warehouse Quantity: 50" oder "WH: 50"
-            # - Detail-ROI: "10,000 Warehouse Quantity" (Zahl ZUERST)
+            # Vier Formate möglich:
+            # - Overview Buy: "Warehouse Quantity: 50" (mit Doppelpunkt)
+            # - Detail Buy: "Warehouse Quantity 2" (OHNE Doppelpunkt, Zahl NACHHER)
+            # - Detail Sell: "In Stock\n1260" (Zahl auf neuer Zeile)
+            # - Alt-Detail: "10,000 Warehouse Quantity" (Zahl ZUERST - seltener)
             
-            # Versuche zuerst Overview-Format (Warehouse ZUERST)
-            warehouse_pattern_overview = re.compile(
-                r'(?:Warehouse\s*(?:Quantity)?|WH)\s*[:;]?\s*([0-9,\.]+)',
+            # Pattern 1: "In Stock" (Sell-Detail-ROI)
+            # ⚡ FIX: Sell-Side nutzt "In Stock" statt "Warehouse Quantity"!
+            in_stock_pattern = re.compile(
+                r'In\s+Stock\s*[:;]?\s*([0-9,\.]+)',
                 re.IGNORECASE
             )
-            m = warehouse_pattern_overview.search(s)
+            m = in_stock_pattern.search(s)
             if m:
                 wh_val = normalize_numeric_str(m.group(1))
                 if wh_val is not None:
                     metrics['warehouse_qty'] = wh_val
-            else:
-                # Fallback: Detail-ROI-Format (Zahl ZUERST)
-                # Aber nur wenn "Warehouse Quantity" DIREKT nach der Zahl kommt (gleiche Zeile)
+            
+            # Pattern 2: "Warehouse Quantity" (Buy-Overview + Buy-Detail)
+            if 'warehouse_qty' not in metrics:
+                warehouse_pattern_overview = re.compile(
+                    r'(?:Warehouse\s*(?:Quantity)?|WH)\s*[:;]?\s*([0-9,\.]+)',
+                    re.IGNORECASE
+                )
+                m = warehouse_pattern_overview.search(s)
+                if m:
+                    wh_val = normalize_numeric_str(m.group(1))
+                    if wh_val is not None:
+                        metrics['warehouse_qty'] = wh_val
+            
+            # Pattern 3: Alt-Detail-ROI-Format (Zahl ZUERST)
+            if 'warehouse_qty' not in metrics:
                 warehouse_pattern_detail = re.compile(
                     r'([0-9,\.]+)\s+Warehouse\s+Quantity',
                     re.IGNORECASE
@@ -2203,6 +2771,519 @@ class MarketTracker:
         self._detail_needs_baseline_capture = False
         self._detail_baseline_captured = False
         self._detail_window_entry_item = None
+        
+        # NEW (Phase 2): Reset preorder check state
+        self._detail_await_preorder_check = False
+        self._detail_preorder_check_baseline = None
+        self._detail_last_transaction_saved = None
+
+    def _detect_preorder_placement(
+        self,
+        item_name: str,
+        balance_delta: float,
+        current_metrics: dict,
+        timestamp: datetime.datetime,
+        img=None,
+        proc_img=None
+    ) -> bool:
+        """
+        Detect when user places a preorder in detail-window.
+        
+        CRITICAL NEW LOGIC (Strategy 1 - Detail-Window Input Fields):
+        1. Extract ACTUAL preorder values from input field ROI
+        2. Use OCR on "Desired Price" + "Desired Amount" fields
+        3. Only fallback to balance_delta calculation if ROI extraction fails
+        
+        Detection Logic:
+        1. balance_delta < 0 (silver spent)
+        2. warehouse_delta == 0 OR > 0 (no items yet, or auto-collect happened)
+        3. PRIMARY: Extract quantity/price from input fields (RELIST-safe!)
+        4. FALLBACK: Calculate quantity from balance_delta / base_price (OLD buggy method)
+        
+        CRITICAL: This must NOT interfere with existing delta logic!
+        We return True after storing preorder and updating baseline.
+        
+        Args:
+            item_name: Item name (from baseline)
+            balance_delta: Balance decrease (negative)
+            current_metrics: Current UI metrics dict
+            timestamp: Current timestamp
+            img: Original BGR image (for ROI extraction)
+            proc_img: Preprocessed image (for ROI extraction)
+            
+        Returns:
+            True if preorder detected and stored, False otherwise
+        """
+        try:
+            preorder_qty = None
+            preorder_price = None
+            extraction_method = "unknown"
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 0 (PRIORITY): Use cached input fields from baseline
+            # ═══════════════════════════════════════════════════════════════
+            # These were extracted proactively at baseline-capture.
+            # This is CRITICAL for relist where the window might close too fast!
+            
+            if hasattr(self, '_detail_cached_input_fields') and self._detail_cached_input_fields:
+                # Check if cache is still fresh (< 5 seconds old)
+                if hasattr(self, '_detail_cached_input_timestamp') and self._detail_cached_input_timestamp:
+                    cache_age = (timestamp - self._detail_cached_input_timestamp).total_seconds()
+                    
+                    if cache_age < 5.0:
+                        preorder_qty = self._detail_cached_input_fields['quantity']
+                        preorder_price = self._detail_cached_input_fields['price']
+                        extraction_method = "cached_input_fields"
+                        
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER-DETECT] ✅ Using CACHED input fields: "
+                                f"{preorder_qty:,}x @ {preorder_price:,} "
+                                f"(cache age: {cache_age:.1f}s, method: {extraction_method})"
+                            )
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 1 (PRIMARY): Extract from Detail-Window Input Fields
+            # ═══════════════════════════════════════════════════════════════
+            # This is the ONLY reliable method for RELIST scenarios!
+            # In relist: balance_delta = auto-collect amount (NOT new preorder!)
+            # Example Trace of Nature:
+            #   - Old preorder: 5000x @ 770M (filled: 219x)
+            #   - Click "Relist" → Auto-collect: 219x @ 33.7M
+            #   - balance_delta = -33,726,000 (auto-collect!)
+            #   - Input fields show: 5000x @ 154,000 (NEW preorder!)
+            #   - OLD BUGGY CALC: 33.7M / 153,819 ≈ 219 → rounds to 200x ❌
+            #   - NEW ROI EXTRACT: Reads "5000" from field → CORRECT! ✅
+            
+            if (preorder_qty is None or preorder_price is None) and img is not None and proc_img is not None:
+                input_fields = self._extract_preorder_input_fields(
+                    img=img,
+                    proc_img=proc_img,
+                    window_type='buy_item'
+                )
+                
+                if input_fields and 'price' in input_fields and 'quantity' in input_fields:
+                    preorder_qty = input_fields['quantity']
+                    preorder_price = input_fields['price']
+                    extraction_method = "input_fields_roi"
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-DETECT] ✅ ROI Extraction SUCCESS: "
+                            f"{preorder_qty:,}x @ {preorder_price:,} "
+                            f"(method: {extraction_method})"
+                        )
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 2 (FALLBACK): Calculate from balance_delta
+            # ═══════════════════════════════════════════════════════════════
+            # WARNING: This is UNRELIABLE for relist scenarios!
+            # Only use if ROI extraction failed
+            
+            if preorder_qty is None or preorder_price is None:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-DETECT] ⚠️ ROI extraction failed, "
+                        f"falling back to balance_delta calculation"
+                    )
+                
+                # Calculate preorder price from balance_delta
+                preorder_price = abs(balance_delta)
+                
+                # Get base price for quantity calculation
+                base_price = self._get_base_price(item_name)
+                
+                if base_price is None or base_price <= 0:
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-DETECT] Cannot get base price for '{item_name}'"
+                        )
+                    return False
+                
+                # Calculate quantity using _calculate_expected_qty helper
+                # This rounds to 1000/100/1 based on magnitude
+                preorder_qty = self._calculate_expected_qty(preorder_price, item_name)
+                extraction_method = "balance_delta_calculation"
+                
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-DETECT] Calculated: {preorder_qty:,}x @ {preorder_price:,} "
+                        f"(method: {extraction_method})"
+                    )
+            
+            # ═══════════════════════════════════════════════════════════════
+            # Validation & Storage
+            # ═══════════════════════════════════════════════════════════════
+            
+            if preorder_qty <= 0 or preorder_qty > 5000:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-DETECT] Quantity {preorder_qty} out of range (1-5000)"
+                    )
+                return False
+            
+            if preorder_price <= 0:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-DETECT] Price {preorder_price} invalid"
+                    )
+                return False
+            
+            # Sanity check: implied unit price must be plausible
+            implied_unit_price = preorder_price / preorder_qty
+            base_price = self._get_base_price(item_name)
+            
+            if base_price and base_price > 0:
+                min_price = base_price * 0.85
+                max_price = base_price * 1.15
+                
+                if not (min_price <= implied_unit_price <= max_price):
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-DETECT] Price implausible: "
+                            f"{implied_unit_price:,.0f} not in range "
+                            f"[{min_price:,.0f}, {max_price:,.0f}]"
+                        )
+                    # Don't fail for ROI extraction - it's authoritative!
+                    if extraction_method != "input_fields_roi":
+                        return False
+            
+            # Store preorder
+            corrected_name = correct_item_name(item_name)
+            
+            preorder_id = self._preorder_manager.store_preorder(
+                item_name=corrected_name,
+                quantity=preorder_qty,
+                price=preorder_price,
+                timestamp=timestamp
+            )
+            
+            if preorder_id > 0:
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-PLACED] ✅ Detected: {corrected_name} "
+                        f"x{preorder_qty:,} @ {preorder_price:,.0f} Silver "
+                        f"(unit: {implied_unit_price:,.0f}, method: {extraction_method}, ID: {preorder_id})"
+                    )
+                return True
+            else:
+                return False
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER-DETECT] ERROR: {e}")
+            return False
+
+    def _detect_listing_placement(
+        self,
+        item_name: str,
+        warehouse_delta: int,
+        current_metrics: dict,
+        timestamp: datetime.datetime,
+        img=None,
+        proc_img=None
+    ) -> bool:
+        """
+        Detect when user places a listing (sell order) in detail-window.
+        
+        CRITICAL NEW LOGIC (Strategy 1 - Detail-Window Input Fields):
+        1. Extract ACTUAL listing values from input field ROI
+        2. Use OCR on "Set Price" + "Register Quantity" fields
+        3. Only fallback to warehouse_delta calculation if ROI extraction fails
+        
+        Detection Logic (Sell-Side analog to preorder):
+        1. warehouse_delta < 0 (items moved TO market)
+        2. balance_delta ≈ 0 (no silver received yet)
+        3. PRIMARY: Extract quantity/price from input fields (RELIST-safe!)
+        4. FALLBACK: Quantity = abs(warehouse_delta), price = base_price * qty
+        
+        CRITICAL: This must NOT interfere with existing delta logic!
+        We return True after storing listing and updating baseline.
+        
+        Args:
+            item_name: Item name (from baseline)
+            warehouse_delta: Warehouse decrease (negative)
+            current_metrics: Current UI metrics dict
+            timestamp: Current timestamp
+            img: Original BGR image (for ROI extraction)
+            proc_img: Preprocessed image (for ROI extraction)
+            
+        Returns:
+            True if listing detected and stored, False otherwise
+        """
+        try:
+            listing_qty = None
+            listing_price = None
+            extraction_method = "unknown"
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 1 (PRIMARY): Extract from Detail-Window Input Fields
+            # ═══════════════════════════════════════════════════════════════
+            
+            if img is not None and proc_img is not None:
+                input_fields = self._extract_preorder_input_fields(
+                    img=img,
+                    proc_img=proc_img,
+                    window_type='sell_item'
+                )
+                
+                if input_fields and 'price' in input_fields and 'quantity' in input_fields:
+                    listing_qty = input_fields['quantity']
+                    # For listings, price is UNIT price, not total
+                    unit_price = input_fields['price']
+                    listing_price = unit_price * listing_qty
+                    extraction_method = "input_fields_roi"
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[LISTING-DETECT] ✅ ROI Extraction SUCCESS: "
+                            f"{listing_qty:,}x @ {unit_price:,}/ea "
+                            f"(total: {listing_price:,}, method: {extraction_method})"
+                        )
+            
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 2 (FALLBACK): Calculate from warehouse_delta
+            # ═══════════════════════════════════════════════════════════════
+            
+            if listing_qty is None or listing_price is None:
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-DETECT] ⚠️ ROI extraction failed, "
+                        f"falling back to warehouse_delta calculation"
+                    )
+                
+                # Quantity = items moved to market
+                listing_qty = abs(warehouse_delta)
+                
+                # Get base price
+                base_price = self._get_base_price(item_name)
+                
+                if base_price is None:
+                    if self.debug:
+                        log_debug(
+                            f"[LISTING-DETECT] Cannot determine base price for '{item_name}'"
+                        )
+                    return False
+                
+                # Calculate listing price (GROSS before tax)
+                listing_price = base_price * listing_qty
+                extraction_method = "warehouse_delta_calculation"
+                
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-DETECT] Calculated: {listing_qty:,}x @ {base_price:,}/ea "
+                        f"(total: {listing_price:,}, method: {extraction_method})"
+                    )
+            
+            # ═══════════════════════════════════════════════════════════════
+            # Validation & Storage
+            # ═══════════════════════════════════════════════════════════════
+            
+            if listing_qty <= 0 or listing_qty > 5000:
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-DETECT] Quantity {listing_qty} out of range (1-5000)"
+                    )
+                return False
+            
+            if listing_price <= 0:
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-DETECT] Price {listing_price} invalid"
+                    )
+                return False
+            
+            # Store listing
+            corrected_name = correct_item_name(item_name)
+            
+            listing_id = self._preorder_manager.store_listing(
+                item_name=corrected_name,
+                quantity=listing_qty,
+                price=listing_price,
+                timestamp=timestamp
+            )
+            
+            if listing_id > 0:
+                unit_price = listing_price / listing_qty
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-PLACED] ✅ Detected: {corrected_name} "
+                        f"x{listing_qty:,} @ {listing_price:,.0f} Silver "
+                        f"(unit: {unit_price:,.0f}, method: {extraction_method}, ID: {listing_id})"
+                    )
+                return True
+            else:
+                return False
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[LISTING-DETECT] ERROR: {e}")
+            return False
+
+    def _handle_preorder_cancellation(
+        self,
+        item_name: str,
+        quantity: int,
+        price: float
+    ):
+        """
+        Handle detection of preorder cancellation from transaction log.
+        
+        Called when transaction log shows "Withdrew order" event.
+        Marks matching active preorder as cancelled.
+        
+        Args:
+            item_name: Item name (raw from OCR)
+            quantity: Order quantity
+            price: Total price
+        """
+        try:
+            # Correct item name using market_json_manager
+            corrected_name = correct_item_name(item_name)
+            
+            # Cancel preorder
+            cancelled = self._preorder_manager.cancel_preorder(
+                item_name=corrected_name,
+                quantity=quantity,
+                price=price
+            )
+            
+            if cancelled and self.debug:
+                log_debug(
+                    f"[PREORDER-CANCELLED] Detected: {corrected_name} x{quantity} "
+                    f"@ {price:,.0f} Silver"
+                )
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER-CANCELLED] ERROR: {e}")
+
+    def _handle_preorder_or_listing_collection(
+        self,
+        item_name: str,
+        quantity: int,
+        price: float,
+        timestamp: datetime.datetime,
+        window_type: str
+    ):
+        """
+        Handle detection of preorder/listing collection from transaction log.
+        
+        Called when transaction log shows "Transaction of Item x5000" event.
+        This happens when user clicks Collect button in Overview window.
+        
+        CRITICAL: Must work for BOTH buy and sell side:
+        - Buy-side: "Transaction of" = Preorder collection
+        - Sell-side: "Transaction of" = Listing collection (sold items)
+        
+        Logic:
+        1. Determine side based on window_type and active orders
+        2. Check for matching active preorder (buy-side) or listing (sell-side)
+        3. Mark as collected
+        
+        Args:
+            item_name: Item name (raw from OCR)
+            quantity: Transaction quantity
+            price: Transaction price (net for sell, gross for buy)
+            timestamp: Transaction timestamp
+            window_type: 'buy_overview' or 'sell_overview' (helps determine side)
+        """
+        try:
+            # Correct item name
+            corrected_name = correct_item_name(item_name)
+            
+            # Try buy-side first (preorders)
+            active_preorders = self._preorder_manager.get_active_preorders(item_name=corrected_name)
+            
+            if active_preorders:
+                # Found active preorder(s) - try to match
+                for preorder in active_preorders:
+                    preorder_id = preorder['id']
+                    preorder_qty = preorder['quantity']
+                    preorder_qty_filled = preorder.get('quantity_filled', 0)
+                    preorder_price = preorder['price']
+                    preorder_unit_price = preorder_price / preorder_qty if preorder_qty > 0 else 0
+                    
+                    # Calculate expected price for this quantity
+                    # This handles PARTIAL COLLECTS where quantity < preorder_qty
+                    expected_total = preorder_unit_price * quantity
+                    
+                    # Match by quantity and price (with tolerance)
+                    # Allow ±5% tolerance for price (OCR errors, rounding)
+                    price_tolerance = 0.05
+                    price_min = expected_total * (1 - price_tolerance)
+                    price_max = expected_total * (1 + price_tolerance)
+                    
+                    # Match conditions:
+                    # 1. FULL COLLECT: quantity == preorder_qty (whole order collected)
+                    # 2. PARTIAL COLLECT: quantity == quantity_filled (filled amount collected)
+                    # 3. Price matches expected total for this quantity
+                    is_full_collect = (quantity == preorder_qty)
+                    is_partial_collect = (quantity == preorder_qty_filled and preorder_qty_filled > 0)
+                    is_price_match = (price_min <= price <= price_max)
+                    
+                    if (is_full_collect or is_partial_collect) and is_price_match:
+                        # Match found - mark as collected
+                        self._preorder_manager.mark_collected(
+                            preorder_id=preorder_id,
+                            collected_at=timestamp,
+                            transaction_id=None
+                        )
+                        
+                        if self.debug:
+                            collect_type = "FULL" if is_full_collect else "PARTIAL"
+                            log_debug(
+                                f"[PREORDER-COLLECTED-LOG] {collect_type} collect - Marked preorder ID={preorder_id} as collected: "
+                                f"{corrected_name} x{quantity} @ {price:,.0f} Silver "
+                                f"(preorder: {preorder_qty}x total, {preorder_qty_filled}x filled)"
+                            )
+                        return  # Successfully handled
+            
+            # Try sell-side (listings)
+            active_listings = self._preorder_manager.get_active_listings(item_name=corrected_name)
+            
+            if active_listings:
+                # Found active listing(s) - mark as collected
+                for listing in active_listings:
+                    listing_id = listing['id']
+                    listing_qty = listing['quantity']
+                    listing_price = listing['price']
+                    
+                    # For sell-side: price in log is NET (after tax), but listing price is GROSS (before tax)
+                    # Convert listing price to net for comparison
+                    from utils import MARKET_SELL_NET_FACTOR
+                    listing_price_net = listing_price * MARKET_SELL_NET_FACTOR
+                    
+                    # Match by quantity and net price (with tolerance)
+                    price_tolerance = 0.05
+                    price_min = listing_price_net * (1 - price_tolerance)
+                    price_max = listing_price_net * (1 + price_tolerance)
+                    
+                    if (listing_qty == quantity and price_min <= price <= price_max):
+                        # Perfect match - mark as collected
+                        self._preorder_manager.mark_listing_collected(
+                            listing_id=listing_id,
+                            collected_at=timestamp,
+                            transaction_id=None
+                        )
+                        
+                        if self.debug:
+                            log_debug(
+                                f"[LISTING-COLLECTED-LOG] Marked listing ID={listing_id} as collected: "
+                                f"{corrected_name} x{quantity} @ {price:,.0f} Silver (net)"
+                            )
+                        return  # Successfully handled
+            
+            # No matching order found - might be a direct collect without prior tracking
+            if self.debug:
+                log_debug(
+                    f"[ORDER-COLLECTED] No matching preorder/listing found for: "
+                    f"{corrected_name} x{quantity} @ {price:,.0f} Silver (window={window_type})"
+                )
+        
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[PREORDER/LISTING-COLLECTION] ERROR: {e}")
 
     def _force_save_pending_transaction(self) -> bool:
         """
@@ -2304,7 +3385,8 @@ class MarketTracker:
         warehouse_delta: int,
         current_metrics: dict,
         last_metrics: dict,
-        ocr_text: str = ""
+        ocr_text: str = "",
+        preorder_correction: Optional[Dict] = None  # NEW parameter
     ) -> dict | None:
         """
         Leitet Transaktion aus Balance- und Warehouse-Deltas ab.
@@ -2479,6 +3561,27 @@ class MarketTracker:
                 # BEIDE Deltas vorhanden → Transaction erstellen
                 gross_price = abs(self._detail_partial_balance_delta)
                 quantity = self._detail_partial_warehouse_delta
+                
+                # NEW: Apply preorder correction if provided
+                if preorder_correction:
+                    preorder_price = preorder_correction['price']
+                    preorder_qty = preorder_correction.get('quantity_filled', preorder_correction['quantity'])
+                    
+                    # Calculate proportional preorder contribution
+                    preorder_total_qty = preorder_correction['quantity']
+                    preorder_contribution = preorder_price * (preorder_qty / preorder_total_qty)
+                    
+                    # Add preorder price to calculated price
+                    gross_price_original = gross_price
+                    gross_price = gross_price + preorder_contribution
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-CORRECTION] Price adjusted: "
+                            f"{gross_price_original:,.0f} (balance) + {preorder_contribution:,.0f} (preorder) "
+                            f"= {gross_price:,.0f} Silver"
+                        )
+                
                 transaction_type = 'buy'
                 tx_case = 'buy_collect_ui_inferred'  # Detail-Window via UI-Delta-Inferenz
                 
@@ -2567,18 +3670,35 @@ class MarketTracker:
         """
         now = datetime.datetime.now()
         
+        # Get current frame for preorder input extraction
+        img = getattr(self, '_current_frame', None)
+        proc_img = getattr(self, '_current_frame_proc', None)
+        
         # Extrahiere aktuelle Metriken
         current_metrics = self._extract_detail_window_metrics(ocr_text, window_type)
         
         if not current_metrics:
-            # Keine gültigen Metriken → Prüfe Timeout
-            if self._detail_confirmation_pending and self._detail_confirmation_timestamp:
-                elapsed = (now - self._detail_confirmation_timestamp).total_seconds()
-                if elapsed > self._detail_confirmation_timeout:
-                    if self.debug:
-                        log_debug(f"[DETAIL] Timeout after {elapsed:.1f}s - resetting state")
-                    self._reset_detail_window_state()
-            return
+            # ⚡ CRITICAL FIX: If metrics extraction fails BUT we have baseline,
+            # use LAST KNOWN metrics to allow delta detection with incomplete data
+            if self._detail_window_active and hasattr(self, '_detail_last_metrics') and self._detail_last_metrics:
+                # OCR failed but we're monitoring → Keep using last known state
+                # This allows us to detect changes even if one OCR scan fails
+                current_metrics = self._detail_last_metrics.copy()
+                
+                if self.debug:
+                    log_debug(
+                        f"[DETAIL] ⚠️ Metrics extraction failed → Using last known state "
+                        f"(Balance={current_metrics.get('balance')}, Warehouse={current_metrics.get('warehouse_qty')})"
+                    )
+            else:
+                # No baseline yet OR no last metrics → Can't proceed
+                if self._detail_confirmation_pending and self._detail_confirmation_timestamp:
+                    elapsed = (now - self._detail_confirmation_timestamp).total_seconds()
+                    if elapsed > self._detail_confirmation_timeout:
+                        if self.debug:
+                            log_debug(f"[DETAIL] Timeout after {elapsed:.1f}s - resetting state")
+                        self._reset_detail_window_state()
+                return
         
         # 1. Detail-Fenster-Eintritt: Multi-Sample Baseline Capture
         if not self._detail_window_active:
@@ -2636,9 +3756,46 @@ class MarketTracker:
             self._detail_partial_warehouse_delta = 0
             self._detail_balance_delta_timestamp = None
             
+            # ✅ CRITICAL FIX: Proaktive Input-Field-Extraktion
+            # Extract input fields IMMEDIATELY at baseline capture!
+            # This is CRITICAL for Relist detection where balance_delta won't help us.
+            # The input fields show the NEW preorder values even before any transaction happens.
+            self._detail_cached_input_fields = None
+            self._detail_cached_input_timestamp = None
+            
+            if window_type == 'buy_item' and img is not None and proc_img is not None:
+                if self.debug:
+                    log_debug(f"[DETAIL] 🔍 Extracting preorder input fields from baseline frame...")
+                
+                try:
+                    input_fields = self._extract_preorder_input_fields(
+                        img=img,
+                        proc_img=proc_img,
+                        window_type=window_type
+                    )
+                    
+                    if input_fields and 'quantity' in input_fields and 'price' in input_fields:
+                        # Cache for later use (valid for 5 seconds)
+                        self._detail_cached_input_fields = input_fields
+                        self._detail_cached_input_timestamp = now
+                        
+                        total = input_fields['price'] * input_fields['quantity']
+                        if self.debug:
+                            log_debug(
+                                f"[DETAIL] ✅ Input fields cached: "
+                                f"{input_fields['quantity']:,}x @ {input_fields['price']:,} "
+                                f"(total: {total:,})"
+                            )
+                    else:
+                        if self.debug:
+                            log_debug(f"[DETAIL] ⚠️ Input field extraction failed (incomplete data)")
+                except Exception as e:
+                    if self.debug:
+                        log_debug(f"[DETAIL] ⚠️ Input field extraction error: {e}")
+            
             if self.debug:
                 log_debug(
-                    f"[DETAIL] ⚡ BASELINE CAPTURED (single-sample, warehouse=None moment)\n"
+                    f"[DETAIL] ⚡ BASELINE CAPTURED\n"
                     f"   Window: {window_type}\n"
                     f"   Item: {self._detail_window_item}\n"
                     f"   Warehouse: {baseline_warehouse:,}\n"
@@ -2655,6 +3812,83 @@ class MarketTracker:
             # Rekursiv aufrufen um neue Baseline zu setzen
             self._monitor_detail_window(window_type, ocr_text)
             return
+        
+        # NEW (Phase 2): Post-Transaction Preorder Check
+        # Check if we're waiting for a preorder placement after a successful transaction
+        # This handles the case where user buys items, THEN places a new preorder
+        if self._detail_await_preorder_check and window_type == 'buy_item':
+            check_baseline = self._detail_preorder_check_baseline
+            now = datetime.datetime.now()
+            time_elapsed = (now - check_baseline['timestamp']).total_seconds()
+            
+            # Wait at least 0.5s for UI to settle after transaction
+            if time_elapsed >= 0.5:
+                # Get current metrics
+                current_balance = current_metrics.get('balance')
+                current_warehouse = current_metrics.get('warehouse_qty')
+                
+                # Check if both metrics are available
+                if current_balance is not None and current_warehouse is not None:
+                    # Calculate delta RELATIVE to post-transaction baseline
+                    balance_delta_new = current_balance - check_baseline['balance']
+                    warehouse_delta_new = current_warehouse - check_baseline['warehouse']
+                    
+                    # CRITICAL FIX: Accept BOTH patterns:
+                    # Pattern 1: balance↓, warehouse=0 → Simple Preorder
+                    # Pattern 2: balance↓, warehouse↑ → Preorder + Auto-Collect (Relist case!)
+                    if balance_delta_new < 0:
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER-CHECK] ✅ Pattern match: balance {balance_delta_new:+,}, "
+                                f"warehouse {warehouse_delta_new:+} → Preorder detected!"
+                            )
+                        
+                        # If warehouse increased, it's likely auto-collect from OLD preorder
+                        if warehouse_delta_new > 0:
+                            if self.debug:
+                                log_debug(
+                                    f"[PREORDER-CHECK] Warehouse surplus: +{warehouse_delta_new}x "
+                                    "(likely auto-collect from previous preorder)"
+                                )
+                        
+                        # Detect and store preorder
+                        preorder_detected = self._detect_preorder_placement(
+                            item_name=self._detail_window_item,
+                            balance_delta=balance_delta_new,
+                            current_metrics=current_metrics,
+                            timestamp=now,
+                            img=img,
+                            proc_img=proc_img
+                        )
+                        
+                        if preorder_detected:
+                            # Reset check
+                            self._detail_await_preorder_check = False
+                            self._detail_preorder_check_baseline = None
+                            
+                            # Update baseline AGAIN (preorder consumed balance, auto-collect added warehouse)
+                            self._detail_baseline_balance = current_balance
+                            self._detail_baseline_warehouse = current_warehouse
+                            self._detail_last_metrics = current_metrics.copy()
+                            
+                            if self.debug:
+                                log_debug(
+                                    f"[PREORDER-CHECK] Baseline updated after preorder: "
+                                    f"Balance={current_balance:,}, Warehouse={current_warehouse:,}"
+                                )
+                            
+                            # Return early - preorder handled
+                            return
+                    
+                    # Timeout after 3 seconds (no preorder placed)
+                    if time_elapsed > 3.0:
+                        self._detail_await_preorder_check = False
+                        self._detail_preorder_check_baseline = None
+                        
+                        if self.debug:
+                            log_debug(
+                                "[PREORDER-CHECK] Timeout (3s) - no preorder placement detected"
+                            )
         
         # 3. Vergleiche Balance und Warehouse mit Baseline
         current_balance = current_metrics.get('balance')
@@ -2774,6 +4008,289 @@ class MarketTracker:
             self._detail_last_metrics = current_metrics
             return
         
+        # ===== NEW: PREORDER PLACEMENT DETECTION =====
+        # CRITICAL: Detect preorder when balance↓
+        # This MUST happen BEFORE plausibility check to avoid false rejections
+        # 
+        # Two scenarios:
+        # 1. Simple Preorder: balance↓, warehouse=0 (no items yet)
+        # 2. Relist + Auto-Collect: balance↓, warehouse↑ (old preorder collected during relist)
+        if balance_delta < 0 and window_type == 'buy_item':
+            # Check if this is a preorder scenario
+            # Heuristic: If warehouse increased, it's likely auto-collect from old preorder
+            # In this case, the new preorder quantity should be in UI metrics
+            is_simple_preorder = (warehouse_delta == 0)
+            is_relist_with_autocollect = (warehouse_delta > 0)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # RELIST PATTERN DETECTION (Phase 2 Fix)
+            # ═══════════════════════════════════════════════════════════════
+            # Pattern: balance↓ (new preorder placed) + warehouse↑ (auto-collect from old preorder)
+            # This happens when user clicks "Relist" on a partially-filled preorder
+            # 
+            # Expected behavior:
+            # 1. Save auto-collect transaction (warehouse_delta items @ collected price)
+            # 2. Mark old preorder as 'collected'
+            # 3. Create new preorder with values from cached input fields
+            
+            if is_relist_with_autocollect:
+                if self.debug:
+                    log_debug(
+                        f"[RELIST-DETECT] ✅ Pattern matched: "
+                        f"balance {balance_delta:+,} (new preorder), "
+                        f"warehouse {warehouse_delta:+} (auto-collect + possible instant buy)"
+                    )
+                
+                # ═══════════════════════════════════════════════════════════════
+                # CRITICAL: Transaction-Log is ONLY visible in Overview!
+                # Cannot rely on fallback - must save everything NOW in Detail-Window!
+                # ═══════════════════════════════════════════════════════════════
+                
+                # 1. Find matching old preorder
+                matching_preorder = self._preorder_manager.find_matching_preorder(
+                    item_name=self._detail_window_item,
+                    warehouse_delta=warehouse_delta,
+                    balance_delta=balance_delta,
+                    timestamp=now
+                )
+                
+                if not matching_preorder:
+                    if self.debug:
+                        log_debug(f"[RELIST] ❌ No matching preorder found - cannot proceed")
+                    return
+                
+                # Expected auto-collect quantity from old preorder
+                expected_autocollect_qty = matching_preorder['quantity']
+                actual_warehouse_delta = warehouse_delta
+                
+                # 2. Detect Instant Buy: warehouse_delta > expected_autocollect
+                instant_buy_qty = 0
+                if actual_warehouse_delta > expected_autocollect_qty:
+                    instant_buy_qty = actual_warehouse_delta - expected_autocollect_qty
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[RELIST] Instant buy detected: {instant_buy_qty:,}x "
+                            f"(warehouse {actual_warehouse_delta:,} > expected {expected_autocollect_qty:,})"
+                        )
+                
+                # 3. Calculate auto-collect transaction
+                # Use preorder's unit price (most accurate)
+                preorder_unit_price = matching_preorder['price'] / matching_preorder['quantity']
+                autocollect_total = preorder_unit_price * expected_autocollect_qty
+                
+                if self.debug:
+                    log_debug(
+                        f"[RELIST] Auto-collect: {expected_autocollect_qty:,}x @ {preorder_unit_price:,.0f} "
+                        f"= {autocollect_total:,.0f} Silver"
+                    )
+                
+                # 4. Save auto-collect transaction
+                try:
+                    corrected_name = correct_item_name(self._detail_window_item)
+                    
+                    from database import store_transaction_db
+                    store_transaction_db(
+                        item_name=corrected_name,
+                        quantity=expected_autocollect_qty,
+                        price=autocollect_total,
+                        transaction_type='buy',
+                        tx_case='buy_collect',
+                        timestamp=now,
+                        occurrence_index=0
+                    )
+                    
+                    if self.debug:
+                        log_debug(f"[RELIST] ✅ Auto-collect saved: {expected_autocollect_qty:,}x @ {autocollect_total:,.0f}")
+                    
+                    # Mark old preorder as collected
+                    self._preorder_manager.mark_collected(
+                        preorder_id=matching_preorder['id'],
+                        collected_at=now,
+                        tx_id=None
+                    )
+                    
+                    if self.debug:
+                        log_debug(f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected")
+                
+                except Exception as e:
+                    if self.debug:
+                        log_debug(f"[RELIST] ❌ Failed to save auto-collect: {e}")
+                
+                # 5. Calculate and save NEW preorder (moved from step 6)
+                # ⚠️ CRITICAL FIX: Cached Input Fields are captured TOO EARLY!
+                # When Detail-Window opens, UI auto-fills with default values (e.g., 1x @ 14,100).
+                # Baseline captures THOSE values BEFORE user changes them.
+                # 
+                # ✅ SOLUTION: Use Balance-Delta as source of truth!
+                # Balance-Delta = new_preorder_total (user's actual input)
+                # Warehouse-Delta = auto-collect qty + instant buy qty
+                
+                # Calculate new preorder from balance delta
+                total_balance_decrease = abs(balance_delta)
+                new_preorder_total = total_balance_decrease
+                
+                # If instant buy occurred, subtract its cost
+                if instant_buy_qty > 0:
+                    # Instant buy uses current market price
+                    # We need to reverse-calculate instant buy cost
+                    # Problem: We don't know instant buy price yet
+                    # 
+                    # Heuristic: Assume instant buy price ≈ auto-collect price (same item)
+                    instant_buy_total = preorder_unit_price * instant_buy_qty
+                    new_preorder_total = total_balance_decrease - instant_buy_total
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[RELIST] Instant buy cost estimated: {instant_buy_qty:,}x @ "
+                            f"{preorder_unit_price:,.0f} = {instant_buy_total:,.0f}"
+                        )
+                
+                # Calculate new preorder quantity
+                # Expected: warehouse_delta = auto-collect + instant buy
+                # So: new_preorder_qty = original qty (same as auto-collected qty if no instant buy)
+                new_preorder_qty = expected_autocollect_qty - instant_buy_qty
+                
+                if new_preorder_qty <= 0:
+                    if self.debug:
+                        log_debug(f"[RELIST] No new preorder needed (instant buy filled everything)")
+                else:
+                    # Verify new_preorder_total is reasonable
+                    if new_preorder_total > 0:
+                        try:
+                            self._preorder_manager.store_preorder(
+                                item_name=corrected_name,
+                                quantity=new_preorder_qty,
+                                price=new_preorder_total,
+                                timestamp=now
+                            )
+                            
+                            new_preorder_unit_price = new_preorder_total / new_preorder_qty if new_preorder_qty > 0 else 0
+                            
+                            if self.debug:
+                                log_debug(
+                                    f"[RELIST] ✅ New preorder saved: {new_preorder_qty:,}x @ "
+                                    f"{new_preorder_unit_price:,.0f} = {new_preorder_total:,.0f}"
+                                )
+                        
+                        except Exception as e:
+                            if self.debug:
+                                log_debug(f"[RELIST] ❌ Failed to save new preorder: {e}")
+                    else:
+                        if self.debug:
+                            log_debug(f"[RELIST] ❌ Invalid new preorder total: {new_preorder_total:,}")
+                
+                # Save instant buy transaction (if any)
+                if instant_buy_qty > 0 and new_preorder_total > 0:
+                    instant_buy_total = total_balance_decrease - new_preorder_total
+                    
+                    if instant_buy_total > 0:
+                        try:
+                            store_transaction_db(
+                                item_name=corrected_name,
+                                quantity=instant_buy_qty,
+                                price=instant_buy_total,
+                                transaction_type='buy',
+                                tx_case='buy_collect',
+                                timestamp=now,
+                                occurrence_index=0
+                            )
+                            
+                            instant_buy_unit_price = instant_buy_total / instant_buy_qty if instant_buy_qty > 0 else 0
+                            
+                            if self.debug:
+                                log_debug(
+                                    f"[RELIST] ✅ Instant buy saved: {instant_buy_qty:,}x @ "
+                                    f"{instant_buy_unit_price:,.0f} = {instant_buy_total:,.0f}"
+                                )
+                        
+                        except Exception as e:
+                            if self.debug:
+                                log_debug(f"[RELIST] ❌ Failed to save instant buy: {e}")
+                
+                # ✅ Update last metrics to prevent duplicate detection
+                self._detail_last_metrics = current_metrics.copy()
+                
+                # All done - return to avoid duplicate processing
+                return
+            
+            if is_simple_preorder or is_relist_with_autocollect:
+                if self.debug and is_relist_with_autocollect:
+                    log_debug(
+                        f"[PREORDER-CHECK] Possible relist with auto-collect: "
+                        f"balance {balance_delta:+,}, warehouse {warehouse_delta:+}"
+                    )
+                
+                # Attempt preorder detection
+                preorder_detected = self._detect_preorder_placement(
+                    item_name=self._detail_window_item,
+                    balance_delta=balance_delta,
+                    current_metrics=current_metrics,
+                    timestamp=now,
+                    img=img,
+                    proc_img=proc_img
+                )
+                
+                if preorder_detected:
+                    # IMPORTANT: Update rolling baseline for next transaction
+                    self._detail_baseline_balance = current_metrics.get('balance')
+                    self._detail_baseline_warehouse = current_metrics.get('warehouse_qty')
+                    self._detail_last_metrics = current_metrics.copy()
+                    
+                    # Reset delta accumulators
+                    self._detail_partial_balance_delta = 0
+                    self._detail_partial_warehouse_delta = 0
+                    self._detail_balance_changed_once = False
+                    self._detail_warehouse_changed_once = False
+                    
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-PLACED] Rolling baseline updated after preorder placement "
+                            f"(balance={current_metrics.get('balance'):,.0f}, "
+                            f"warehouse={current_metrics.get('warehouse_qty'):,})"
+                        )
+                    
+                    # CRITICAL: Return early - no transaction to infer yet
+                    return
+        # ===== END PREORDER PLACEMENT DETECTION =====
+        
+        # ===== NEW: LISTING PLACEMENT DETECTION =====
+        # CRITICAL: Detect listing when balance unchanged (balance_delta ≈ 0) but warehouse↓
+        # This MUST happen BEFORE plausibility check to avoid false rejections
+        # Sell-side analog to preorder placement: items moved TO market, no silver received yet
+        if abs(balance_delta) < 1000 and warehouse_delta < 0 and window_type == 'sell_item':
+            # Listing placement detected!
+            listing_detected = self._detect_listing_placement(
+                item_name=self._detail_window_item,
+                warehouse_delta=warehouse_delta,
+                current_metrics=current_metrics,
+                timestamp=now,
+                img=img,
+                proc_img=proc_img
+            )
+            
+            if listing_detected:
+                # IMPORTANT: Update rolling baseline for next transaction
+                self._detail_baseline_balance = current_metrics.get('balance')
+                self._detail_baseline_warehouse = current_metrics.get('warehouse_qty')
+                self._detail_last_metrics = current_metrics.copy()
+                
+                # Reset delta accumulators
+                self._detail_partial_balance_delta = 0
+                self._detail_partial_warehouse_delta = 0
+                self._detail_balance_changed_once = False
+                self._detail_warehouse_changed_once = False
+                
+                if self.debug:
+                    log_debug(
+                        f"[LISTING-PLACED] Rolling baseline updated after listing placement "
+                        f"(warehouse={current_metrics.get('warehouse_qty'):,})"
+                    )
+                
+                # CRITICAL: Return early - no transaction to infer yet
+                return
+        # ===== END LISTING PLACEMENT DETECTION =====
+        
         # 🔍 PLAUSIBILITY CHECK: Validate balance_delta vs warehouse_delta
         # Prevent OCR errors from creating invalid transactions
         # Example: OCR reads "169,682,222,830" instead of "169,671,122,830" (missing leading "1")
@@ -2823,14 +4340,62 @@ class MarketTracker:
                         log_debug(f"[DETAIL] Waiting for next scan with correct warehouse...")
                     return
                 
+                # NEW (Phase 3): Check for warehouse surplus BEFORE price check
+                # If warehouse increased MORE than expected from balance, it might be preorder auto-collect
+                expected_qty = self._calculate_expected_qty(abs(balance_delta), item_name)
+                warehouse_surplus = warehouse_delta - expected_qty
+                
+                # CRITICAL FIX: Always use expected_qty for plausibility check when surplus detected
+                # The surplus is likely from preorder auto-collect, which shouldn't affect price validation
+                if warehouse_surplus > 0 and expected_qty > 0:
+                    # Use expected_qty (purchase amount) for price check, NOT total warehouse_delta
+                    effective_qty_for_price_check = expected_qty
+                    
+                    # Try to find matching preorder for the surplus
+                    preorder = self._preorder_manager.find_matching_preorder(
+                        item_name=item_name,
+                        warehouse_delta=warehouse_surplus,
+                        balance_delta=abs(balance_delta),
+                        timestamp=datetime.datetime.now()
+                    )
+                    
+                    if preorder:
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER-AUTOCOLLECT] Warehouse surplus detected: "
+                                f"{warehouse_surplus}x (expected {expected_qty}x, actual {warehouse_delta}x)"
+                            )
+                            log_debug(
+                                f"[PREORDER-AUTOCOLLECT] Matched preorder ID={preorder['id']}: "
+                                f"{preorder['quantity']}x @ {preorder['price']:,.0f} Silver"
+                            )
+                            log_debug(
+                                f"[PREORDER-AUTOCOLLECT] Adjusting plausibility check: "
+                                f"effective_qty={effective_qty_for_price_check}x (purchase only)"
+                            )
+                    else:
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER-AUTOCOLLECT] Warehouse surplus detected: "
+                                f"{warehouse_surplus}x (expected {expected_qty}x from balance, actual {warehouse_delta}x)"
+                            )
+                            log_debug(
+                                f"[PREORDER-AUTOCOLLECT] No matching preorder found, but using expected_qty "
+                                f"for price check (surplus likely from auto-collect)"
+                            )
+                else:
+                    # No surplus - normal purchase
+                    effective_qty_for_price_check = warehouse_delta
+                
                 # Check price per item is within base_price ±15%
-                implied_price_per_item = abs(balance_delta) / abs(warehouse_delta)
+                # Use effective_qty (which might be adjusted for preorder surplus)
+                implied_price_per_item = abs(balance_delta) / abs(effective_qty_for_price_check)
                 if implied_price_per_item < min_price_per_item:
                     if self.debug:
                         log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:.0f} < {min_price_per_item:,} Silver/item")
                         if base_price:
                             log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,} (range: {min_price_per_item:,} - {max_price_per_item:,})")
-                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}, effective_qty={effective_qty_for_price_check}")
                         log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
                     return
                 if implied_price_per_item > max_price_per_item:
@@ -2838,7 +4403,7 @@ class MarketTracker:
                         log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:,.0f} > {max_price_per_item:,} Silver/item")
                         if base_price:
                             log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,} (range: {min_price_per_item:,} - {max_price_per_item:,})")
-                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}, effective_qty={effective_qty_for_price_check}")
                         log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
                     return
             
@@ -2875,6 +4440,23 @@ class MarketTracker:
                         log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
                     return
         
+        # NEW: Check for preorder auto-collect scenario (BEFORE transaction inference)
+        preorder_correction = None
+        if window_type == 'buy_item' and warehouse_delta > 0 and balance_delta < 0:
+            preorder_correction = self._check_for_preorder_autocollect(
+                item_name=self._detail_window_item or current_metrics.get('item_name'),
+                warehouse_delta=warehouse_delta,
+                balance_delta=balance_delta,
+                timestamp=now
+            )
+            
+            if preorder_correction and self.debug:
+                log_debug(
+                    f"[PREORDER-AUTOCOLLECT] Detected: {self._detail_window_item} "
+                    f"x{preorder_correction.get('quantity_filled', preorder_correction['quantity'])} "
+                    f"@ {preorder_correction['price']:,.0f} Silver"
+                )
+        
         # 7. Bestimme Transaktionstyp und -werte
         transaction = self._infer_transaction_from_deltas(
             window_type,
@@ -2882,7 +4464,8 @@ class MarketTracker:
             warehouse_delta,
             current_metrics,
             self._detail_last_metrics or {},
-            ocr_text  # Übergebe OCR-Text für "Placed order" Detection
+            ocr_text,  # Übergebe OCR-Text für "Placed order" Detection
+            preorder_correction=preorder_correction  # NEW: Pass preorder data
         )
         
         if transaction:
@@ -2892,6 +4475,20 @@ class MarketTracker:
                 log_debug(f"[DETAIL] ✅ Transaction saved successfully")
             elif not success and self.debug:
                 log_debug(f"[DETAIL] ⚠️ Transaction not saved (duplicate or error)")
+            
+            # NEW: Mark preorder as collected if this transaction included preorder auto-collect
+            if success and preorder_correction:
+                self._preorder_manager.mark_collected(
+                    preorder_id=preorder_correction['id'],
+                    collected_at=datetime.datetime.now(),
+                    transaction_id=None  # TODO: Get transaction ID from store_transaction_db
+                )
+                
+                if self.debug:
+                    log_debug(
+                        f"[PREORDER-COLLECTED] Marked preorder ID={preorder_correction['id']} "
+                        "as collected"
+                    )
             
             # Reset Partial-Deltas für nächste Transaktion
             # WICHTIG: pending_collect_qty wird NICHT hier resetted, nur in _infer_transaction_from_deltas
@@ -2910,6 +4507,24 @@ class MarketTracker:
             self._detail_baseline_warehouse = current_warehouse
             if self.debug:
                 log_debug(f"[DETAIL] 🔄 Rolling baseline updated: Balance={current_balance:,}, Warehouse={current_warehouse:,}")
+            
+            # NEW (Phase 2): Setup Preorder Check after successful transaction
+            # Wait 0.5s, then check if balance decreased again WITHOUT warehouse change
+            # This detects new preorder placements that happen AFTER a purchase
+            if window_type == 'buy_item':
+                self._detail_await_preorder_check = True
+                self._detail_preorder_check_baseline = {
+                    'balance': current_balance,
+                    'warehouse': current_warehouse,
+                    'timestamp': datetime.datetime.now()
+                }
+                self._detail_last_transaction_saved = datetime.datetime.now()
+                
+                if self.debug:
+                    log_debug(
+                        "[PREORDER-CHECK] Waiting for possible preorder placement "
+                        "(will check in 0.5s if balance decreased without warehouse change)"
+                    )
         
         # ALWAYS update last_metrics, even if transaction failed
         self._detail_last_metrics = current_metrics
@@ -3033,6 +4648,95 @@ class MarketTracker:
             else:
                 # Nicht in Detail-Fenster → Reset State
                 if self._detail_window_active:
+                    # ═══════════════════════════════════════════════════════════════
+                    # REMOVED: RELIST DETECTION AT WINDOW EXIT
+                    # ═══════════════════════════════════════════════════════════════
+                    # This block was DISABLED because:
+                    # 1. Cached Input Fields captured TOO EARLY (at window open with auto-fill values)
+                    # 2. Caused duplicate preorder creation with WRONG prices
+                    # 3. Relist detection now handled CORRECTLY in Detail-Window delta block (L3856-4093)
+                    #    using Balance-Delta as source of truth instead of cached fields
+                    
+                    # OLD LOGIC (DISABLED):
+                    # if (hasattr(self, '_detail_cached_input_fields') and 
+                    #     self._detail_cached_input_fields and 
+                    #     self._detail_window_type == 'buy_item'):
+                    #     ... create preorder from cached fields ...
+                    
+                    # ═══════════════════════════════════════════════════════════════
+                    # PHASE 3: Transaction-Log Fallback (BACKUP ONLY)
+                    # ═══════════════════════════════════════════════════════════════
+                    # This is a FALLBACK for cases where Detail-Window closed too fast
+                    # Primary detection happens in Detail-Window (relist block above)
+                    # Only parse overview log if it's still visible
+                    
+                    if hasattr(self, '_detail_window_entry_item') and self._detail_window_entry_item and wtype in ('buy_overview', 'sell_overview'):
+                        item_escaped = re.escape(self._detail_window_entry_item)
+                        corrected_name = correct_item_name(self._detail_window_entry_item)
+                        
+                        # Check for "Transaction of" (auto-collect) - only if not already saved
+                        pattern_transaction = rf"Transaction\s+of\s+{item_escaped}\s+[xX]?(\d[\d,]+)\s+.*?(\d[\d,\.\s]+)\s+[Ss]ilver"
+                        matches_transaction = re.finditer(pattern_transaction, full_text, re.IGNORECASE)
+                        
+                        for match in matches_transaction:
+                            try:
+                                autocollect_qty_str = match.group(1).replace(',', '')
+                                autocollect_price_str = match.group(2)
+                                
+                                autocollect_qty = int(autocollect_qty_str)
+                                autocollect_price = normalize_numeric_str(autocollect_price_str)
+                                
+                                if autocollect_price and autocollect_price > 0:
+                                    # Check if already saved
+                                    from database import get_connection, store_transaction_db
+                                    conn = get_connection()
+                                    cur = conn.cursor()
+                                    
+                                    cur.execute('''
+                                        SELECT COUNT(*) FROM transactions
+                                        WHERE item_name = ?
+                                        AND quantity = ?
+                                        AND ABS(price - ?) < 1000
+                                        AND timestamp >= datetime('now', '-30 seconds')
+                                    ''', (corrected_name, autocollect_qty, autocollect_price))
+                                    
+                                    if cur.fetchone()[0] == 0:
+                                        store_transaction_db(
+                                            item_name=corrected_name,
+                                            quantity=autocollect_qty,
+                                            price=autocollect_price,
+                                            transaction_type='buy',
+                                            tx_case='buy_collect',
+                                            timestamp=now,
+                                            occurrence_index=0
+                                        )
+                                        
+                                        if self.debug:
+                                            log_debug(
+                                                f"[DETAIL-FALLBACK] ✅ Auto-collect saved: "
+                                                f"{corrected_name} x{autocollect_qty} @ {autocollect_price:,}"
+                                            )
+                                        
+                                        # Mark old preorder as collected
+                                        matching_preorder = self._preorder_manager.find_matching_preorder(
+                                            item_name=corrected_name,
+                                            warehouse_delta=autocollect_qty,
+                                            balance_delta=-autocollect_price,
+                                            timestamp=now
+                                        )
+                                        if matching_preorder:
+                                            self._preorder_manager.mark_collected(
+                                                preorder_id=matching_preorder['id'],
+                                                collected_at=now,
+                                                tx_id=None
+                                            )
+                                            if self.debug:
+                                                log_debug(f"[DETAIL-FALLBACK] ✅ Marked preorder ID={matching_preorder['id']} as collected")
+                            
+                            except Exception as e:
+                                if self.debug:
+                                    log_debug(f"[DETAIL-FALLBACK] Error processing auto-collect: {e}")
+                    
                     # 🔴 FIX #2: Force-Save BEVOR Reset!
                     self._force_save_pending_transaction()
                     
@@ -3090,16 +4794,18 @@ class MarketTracker:
         # CRITICAL PERFORMANCE FIX: Immediate burst scanning when returning from item window
         # Transaction lines appear instantly or within ~200-500ms after returning to overview
         # Old approach: wait 1-3 seconds with slow scans = missed transactions
-        # New approach: IMMEDIATE burst of 10-15 fast scans at 80ms intervals = capture within 1-2s
+        # New approach: IMMEDIATE burst of 5-8 fast scans at 80ms intervals = capture within 1s
+        # FIX 3: Reduced from 15+5=20 scans to 5+3=8 scans
+        # Reason: Too many scans increase timestamp-variation risk (OCR reads 10:30 vs 10:31)
         if prev_window in ("buy_item", "sell_item") and wtype in ("sell_overview", "buy_overview"):
-            # AGGRESSIVE: More scans, longer burst window
-            self._burst_fast_scans = max(self._burst_fast_scans, 15)  # Was 8, now 15 (1.2s of fast scans)
-            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=3.0))  # Was 4.5s, now 3s
+            # REDUCED: Fewer scans to minimize timestamp OCR variations
+            self._burst_fast_scans = max(self._burst_fast_scans, 5)  # Was 15, now 5 (400ms of fast scans)
+            self._burst_until = max(self._burst_until or now, now + datetime.timedelta(seconds=2.0))  # Was 3s, now 2s
             self._burst_source = 'item_window'
             # Immediate re-scans (no sleep between scans)
-            self._request_immediate_rescan = max(self._request_immediate_rescan, 5)  # Was 3, now 5
+            self._request_immediate_rescan = max(self._request_immediate_rescan, 3)  # Was 5, now 3
             if self.debug:
-                log_debug(f"[BURST-AGGRESSIVE] Returned from {prev_window} to {wtype} -> {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (TARGET: <1s capture)")
+                log_debug(f"[BURST-OPTIMIZED] Returned from {prev_window} to {wtype} -> {self._burst_fast_scans} fast scans + {self._request_immediate_rescan} immediate rescans (8 scans total, optimized for timestamp consistency)")
             
             # 🔍 LOG-FALLBACK: Prüfe ob Detail-Window Transaktionen verpasst hat
             # Dies ist der EINZIGE Moment wo wir sowohl Detail-Window-State ALS AUCH Transaction-Log haben
@@ -3132,6 +4838,28 @@ class MarketTracker:
         structured = sorted(structured, key=lambda x: (x['timestamp'], x['pos']))
         if self.debug:
             log_debug(f"structured_count={len(structured)}")
+        
+        # NEW: Detect and handle preorder/listing events from transaction log
+        for s in structured:
+            # Preorder cancellation (Buy-side: "Withdrew order")
+            if s.get('type') == 'withdrew' and s.get('item') and s.get('qty') and s.get('price'):
+                self._handle_preorder_cancellation(
+                    item_name=s['item'],
+                    quantity=s['qty'],
+                    price=s['price']
+                )
+            
+            # Preorder/Listing collection (Both sides: "Transaction of")
+            # When user clicks Collect button, transaction log shows "Transaction of Item x5000"
+            # We need to mark the corresponding preorder (buy-side) or listing (sell-side) as collected
+            if s.get('type') == 'transaction' and s.get('item') and s.get('qty') and s.get('price'):
+                self._handle_preorder_or_listing_collection(
+                    item_name=s['item'],
+                    quantity=s['qty'],
+                    price=s['price'],
+                    timestamp=s.get('timestamp') or datetime.datetime.now(),
+                    window_type=wtype  # Pass window type to determine buy vs sell
+                )
         
         # 🔍 LOG-FALLBACK: Prüfe fehlende Detail-Window Transaktionen
         # MUSS HIER passieren, bevor structured weiter gefiltert wird
@@ -3664,22 +5392,79 @@ class MarketTracker:
             else:
                 ent = cluster_entries[0]
             
-            # On sell overview, skip listed-only clusters UNLESS UI metrics show completed sales
-            if wtype == 'sell_overview' and not transaction_entry and listed_entry and ent['type'] == 'listed':
-                # Check if UI metrics show salesCompleted > 0 for this item (fast collect scenario)
-                has_sell_ui_evidence = False
-                item_lc_check = (ent.get('item') or '').lower()
-                if item_lc_check in ui_sell:
-                    sc = ui_sell[item_lc_check].get('salesCompleted', 0) or 0
-                    if sc > 0:
-                        has_sell_ui_evidence = True
-                        if self.debug:
-                            log_debug(f"[UI-EVIDENCE] Item '{ent.get('item')}' has salesCompleted={sc} - allowing sell without transaction line (fast collect scenario)")
+            # ⚡ FIX: RELIST-PATTERN DETECTION
+            # Detect relist pattern: transaction + listed/placed at same timestamp
+            # This happens when user clicks "Relist" - old order auto-collected, new order created
+            is_relist_cluster = False
+            placed_entry = next((r for r in related if r['type'] == 'placed'), None)
+            
+            if transaction_entry and (listed_entry or placed_entry):
+                tx_ts = transaction_entry.get('timestamp')
+                new_order_entry = listed_entry if listed_entry else placed_entry
+                new_order_ts = new_order_entry.get('timestamp') if new_order_entry else None
                 
-                if not has_sell_ui_evidence:
+                if tx_ts and new_order_ts and tx_ts == new_order_ts:
+                    is_relist_cluster = True
                     if self.debug:
-                        log_debug(f"[CLUSTER] Skip 'listed'-only for '{ent.get('item')}' on sell_overview (no transaction)")
-                    continue
+                        log_debug(f"[RELIST] Detected relist pattern for '{ent.get('item')}': transaction + {'listed' if listed_entry else 'placed'} at {tx_ts}")
+                    
+                    # FIX 1: Log-based Preorder Reconstruction
+                    # Check if we have withdrew + transaction (indicating missing preorder in DB)
+                    withdrew_entry = next((r for r in related if r['type'] == 'withdrew'), None)
+                    
+                    if withdrew_entry and transaction_entry:
+                        # We have all pieces to reconstruct the original preorder
+                        withdrew_qty = withdrew_entry.get('qty', 0)
+                        withdrew_price = withdrew_entry.get('price', 0)
+                        transaction_qty = transaction_entry.get('qty', 0)
+                        
+                        if withdrew_qty > 0 and transaction_qty > 0 and withdrew_price > 0:
+                            # Try to reconstruct missing preorder
+                            reconstructed = self._reconstruct_missing_preorder_from_log(
+                                item_name=ent.get('item', ''),
+                                withdrew_qty=withdrew_qty,
+                                withdrew_price=withdrew_price,
+                                transaction_qty=transaction_qty,
+                                timestamp=tx_ts
+                            )
+                            
+                            if reconstructed:
+                                # Store reconstructed preorder in transaction_entry metadata
+                                # This will be used later for price correction
+                                transaction_entry['_reconstructed_preorder'] = reconstructed
+                                if self.debug:
+                                    log_debug(
+                                        f"[RELIST] ✅ Attached reconstructed preorder to transaction: "
+                                        f"{transaction_qty:,}x @ {reconstructed['unit_price']:,.0f}"
+                                    )
+            
+            # On sell overview, skip listed-only clusters UNLESS UI metrics show completed sales OR it's a relist
+            if wtype == 'sell_overview' and not transaction_entry and listed_entry and ent['type'] == 'listed':
+                # Check if this is part of a relist cluster (don't skip new listing in relist!)
+                is_part_of_relist = any(
+                    r['type'] == 'transaction' and r.get('timestamp') == ent.get('timestamp')
+                    for r in related
+                )
+                
+                if is_part_of_relist:
+                    # This is the NEW listing in a relist - DON'T skip!
+                    if self.debug:
+                        log_debug(f"[RELIST] Keeping listed entry for '{ent.get('item')}' - part of relist cluster")
+                else:
+                    # Check if UI metrics show salesCompleted > 0 for this item (fast collect scenario)
+                    has_sell_ui_evidence = False
+                    item_lc_check = (ent.get('item') or '').lower()
+                    if item_lc_check in ui_sell:
+                        sc = ui_sell[item_lc_check].get('salesCompleted', 0) or 0
+                        if sc > 0:
+                            has_sell_ui_evidence = True
+                            if self.debug:
+                                log_debug(f"[UI-EVIDENCE] Item '{ent.get('item')}' has salesCompleted={sc} - allowing sell without transaction line (fast collect scenario)")
+                    
+                    if not has_sell_ui_evidence:
+                        if self.debug:
+                            log_debug(f"[CLUSTER] Skip 'listed'-only for '{ent.get('item')}' on sell_overview (no transaction)")
+                        continue
             # determine case from related types (keep placed/listed separate) and window type
             types_present = {r['type'] for r in related}
             # Do not infer additional types from raw; rely on structured related entries only
@@ -4593,8 +6378,31 @@ class MarketTracker:
                 'case': f"{final_type}_{case}",
                 'raw_related': related,
                 'occurrence_index': None,
-                'occurrence_slot': occurrence_slot
+                'occurrence_slot': occurrence_slot,
+                '_is_relist': is_relist_cluster,  # Store relist flag for later processing
+                '_listed_entry': listed_entry,     # Store listed entry for relist handling
+                '_placed_entry': placed_entry      # Store placed entry for relist handling
             }
+            
+            # FIX 1: Apply reconstructed preorder price correction
+            # If transaction_entry has _reconstructed_preorder metadata, use it for price correction
+            if transaction_entry and transaction_entry.get('_reconstructed_preorder'):
+                reconstructed = transaction_entry['_reconstructed_preorder']
+                
+                # Calculate corrected price: transaction price = collected price (not preorder price)
+                # Use reconstructed unit_price for accuracy
+                corrected_price = reconstructed['unit_price'] * quantity
+                
+                if self.debug:
+                    log_debug(
+                        f"[RELIST] Applying reconstructed preorder price correction:\n"
+                        f"   Original price: {price:,.0f}\n"
+                        f"   Reconstructed unit price: {reconstructed['unit_price']:,.0f}\n"
+                        f"   Corrected price: {corrected_price:,.0f}"
+                    )
+                
+                tx['price'] = corrected_price
+                tx['_price_corrected_by_reconstruction'] = True
             # If this is buy-side and both purchased and transaction exist with different values, emit a second candidate for the other values.
             if final_type == 'buy' and pur_rel is not None and tx_rel_same is not None:
                 alt_qty = tx_rel_same.get('qty') or quantity
@@ -4682,6 +6490,57 @@ class MarketTracker:
                 continue
             created_clusters.add(cluster_key)
             tx_candidates.append(tx)
+            
+            # ⚡ RELIST HANDLING: Process relist pattern (transaction + listed/placed at same timestamp)
+            if tx.get('_is_relist'):
+                from preorder_manager import PreorderManager
+                pm = PreorderManager()
+                
+                # Extract transaction details
+                tx_item = tx['item_name']
+                tx_qty = tx['quantity']
+                tx_price = tx['price']
+                tx_ts = tx['timestamp']
+                tx_type = tx['transaction_type']
+                
+                # Get stored entries
+                listed_entry_stored = tx.get('_listed_entry')
+                placed_entry_stored = tx.get('_placed_entry')
+                
+                # Process based on side
+                if tx_type == 'sell' and listed_entry_stored:
+                    new_order_qty = listed_entry_stored.get('qty')
+                    new_order_price = listed_entry_stored.get('price')
+                    
+                    if new_order_qty and new_order_price and new_order_qty > 0 and new_order_price > 0:
+                        # Find and mark old listing as collected
+                        old_listing = pm.find_matching_listing(tx_item, tx_qty, tx_price, tx_ts)
+                        if old_listing:
+                            pm.mark_listing_collected(old_listing['id'], tx_ts, transaction_id=None)
+                            if self.debug:
+                                log_debug(f"[RELIST] Marked old listing ID={old_listing['id']} as collected")
+                        
+                        # Create NEW listing
+                        pm.store_listing(tx_item, new_order_qty, new_order_price, tx_ts)
+                        if self.debug:
+                            log_debug(f"[RELIST] Created new listing: {new_order_qty}x {tx_item} @ {new_order_price:,}")
+                
+                elif tx_type == 'buy' and placed_entry_stored:
+                    new_order_qty = placed_entry_stored.get('qty')
+                    new_order_price = placed_entry_stored.get('price')
+                    
+                    if new_order_qty and new_order_price and new_order_qty > 0 and new_order_price > 0:
+                        # Find and mark old preorder as collected
+                        old_preorder = pm.find_matching_preorder(tx_item, tx_qty, tx_price, tx_ts)
+                        if old_preorder:
+                            pm.mark_collected(old_preorder['id'], tx_ts, transaction_id=None)
+                            if self.debug:
+                                log_debug(f"[RELIST] Marked old preorder ID={old_preorder['id']} as collected")
+                        
+                        # Create NEW preorder
+                        pm.store_preorder(tx_item, new_order_qty, new_order_price, tx_ts)
+                        if self.debug:
+                            log_debug(f"[RELIST] Created new preorder: {new_order_qty}x {tx_item} @ {new_order_price:,}")
 
             if final_type in ('sell', 'buy') and len(transaction_entries_sorted) > 1:
                 for extra_entry in transaction_entries_sorted[1:]:
@@ -5174,6 +7033,42 @@ class MarketTracker:
                     if self.debug:
                         log_debug(f"[DELTA] Value-based duplicate check failed: {exc}")
             
+            # FIX 2: Timestamp-Toleranz-basierte Duplikatserkennung
+            # Check if this transaction exists with slightly different timestamp (±2min)
+            # This catches OCR-induced timestamp variations (e.g., 10:30 vs 10:31)
+            # 
+            # CRITICAL SAFEGUARDS to prevent blocking real new transactions:
+            # 1. Only check if NOT newer than baseline (old/historical transactions)
+            # 2. Only check if already in baseline text (seen before)
+            # 3. Skip for truly new transactions (not in baseline, timestamp > prev_max_ts)
+            timestamp_duplicate = False
+            
+            # SAFEGUARD: Never check timestamp tolerance for NEW transactions
+            # New transactions should use their actual log timestamp
+            should_check_timestamp_tolerance = (
+                isinstance(tx['timestamp'], datetime.datetime)
+                and already_seen_in_prev  # CRITICAL: Only if seen in previous baseline
+                and not is_newer_than_prev  # CRITICAL: Not for new transactions
+            )
+            
+            if should_check_timestamp_tolerance:
+                try:
+                    timestamp_duplicate = self._is_value_duplicate_with_time_tolerance(
+                        tx['item_name'],
+                        tx['quantity'],
+                        int(tx['price'] or 0),
+                        tx['timestamp'],
+                        tolerance_minutes=2
+                    )
+                    if timestamp_duplicate and self.debug:
+                        log_debug(
+                            f"[DELTA] Timestamp-tolerance duplicate: {tx['item_name']} {tx['quantity']}x @ {tx['price']} "
+                            f"ts={tx['timestamp']} (±2min match found) - SAFE: is_newer={is_newer_than_prev}, seen_prev={already_seen_in_prev}"
+                        )
+                except Exception as e:
+                    if self.debug:
+                        log_debug(f"[DELTA] Timestamp-tolerance check failed: {e}")
+            
             # DISABLED: Value-based deduplication is unreliable
             # Problem: Cannot distinguish between:
             #   1. OCR duplicate (same transaction, wrong timestamp)
@@ -5187,7 +7082,18 @@ class MarketTracker:
             
             # Check baseline text (less strict - only for additional filtering)
             if self.debug:
-                log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}, near_time={already_in_db_by_values}")
+                log_debug(f"[DELTA] Checking {tx['item_name']} @ {tx['timestamp']}: newer={is_newer_than_prev}, seen_in_text={already_seen_in_prev}, in_db={already_in_db}, near_time={already_in_db_by_values}, ts_dup={timestamp_duplicate}")
+            
+            # FIX 2: Skip if timestamp-tolerance duplicate detected
+            # NOTE: timestamp_duplicate is ONLY True for old transactions that were seen before
+            # New transactions (is_newer_than_prev=True OR not already_seen_in_prev) are NEVER blocked
+            if timestamp_duplicate:
+                if self.debug:
+                    log_debug(
+                        f"[DELTA] SKIP (timestamp-duplicate): {tx['item_name']} {tx['quantity']}x @ {tx['price']} "
+                        f"ts={tx['timestamp']} - OCR timestamp variation detected (±2min) - OLD transaction rescanned"
+                    )
+                continue
             
             # Skip if time-aware deduplication matched (same item/qty/price within short window)
             if already_in_db_by_values:
@@ -5503,13 +7409,30 @@ class MarketTracker:
 
         self._process_image(img, context='sync', allow_debug=True)
 
+        # CRITICAL: Rapid-Scans for Detail-Window transactions
+        # These must execute IMMEDIATELY after baseline capture to catch fast transactions
         while self._request_immediate_rescan > 0 and self.running:
+            if self.debug:
+                log_debug(f"[RAPID-SCAN] Starting rapid scan #{4 - self._request_immediate_rescan} (remaining={self._request_immediate_rescan})")
+            
             time.sleep(0.05)
+            
             img2 = self._capture_frame()
-            if img2 is None or not self.running:
+            if img2 is None:
+                if self.debug:
+                    log_debug(f"[RAPID-SCAN] ❌ Capture failed (img=None)")
                 break
+            
+            if not self.running:
+                if self.debug:
+                    log_debug(f"[RAPID-SCAN] ❌ Stopped (running=False)")
+                break
+            
             self._process_image(img2, context='quick', allow_debug=False)
             self._request_immediate_rescan -= 1
+            
+            if self.debug:
+                log_debug(f"[RAPID-SCAN] ✅ Completed scan #{3 - self._request_immediate_rescan}, remaining={self._request_immediate_rescan}")
 
     def auto_track(self):
         if USE_ASYNC_PIPELINE:

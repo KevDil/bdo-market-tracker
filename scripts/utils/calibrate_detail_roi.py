@@ -148,6 +148,58 @@ def detect_detail_warehouse_roi(img, window_type: str):
         return None
 
 
+def detect_detail_preorder_input_roi(img, window_type: str):
+    """
+    ROI für Preorder-Eingabefelder im Detail-Fenster.
+    
+    Position: Rechte Seite des Detail-Fensters
+    
+    Buy-Item enthält:
+    - "Desired Price" Input-Feld (Preis pro Einheit)
+    - "Desired Amount" Input-Feld (Anzahl)
+    
+    Sell-Item enthält:
+    - "Set Price" Input-Feld (Preis pro Einheit)
+    - "Register Quantity" Input-Feld (Anzahl)
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        
+        if window_type == 'sell_item':
+            # Sell-Item: Rechte Hälfte, mittlerer Bereich
+            # Enthält: "Set Price" und "Register Quantity"
+            # Geschätzte Position: 50-95% Breite, 30-70% Höhe
+            x_start = int(w * 0.43)
+            x_end = int(w * 0.67)
+            y_start = int(h * 0.49)
+            y_end = int(h * 0.73)
+        elif window_type == 'buy_item':
+            # Buy-Item: Rechte Hälfte, mittlerer Bereich
+            # Enthält: "Desired Price" und "Desired Amount"
+            # Geschätzte Position: 50-95% Breite, 35-75% Höhe
+            x_start = int(w * 0.43)
+            x_end = int(w * 0.67)
+            y_start = int(h * 0.49)
+            y_end = int(h * 0.73)
+        else:
+            print(f"Invalid window type: {window_type}")
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception as e:
+        print(f"Error detecting preorder input ROI: {e}")
+        return None
+
+
 def visualize_roi(image_path: str, window_type: str):
     """
     Visualisiert ROI-Positionen auf Screenshot.
@@ -179,11 +231,13 @@ def visualize_roi(image_path: str, window_type: str):
     item_name_roi = detect_detail_item_name_roi(proc, window_type)
     balance_roi = detect_detail_balance_roi(proc, window_type)
     warehouse_roi = detect_detail_warehouse_roi(proc, window_type)
+    preorder_input_roi = detect_detail_preorder_input_roi(proc, window_type)
     
     # Draw ROIs on original image
     output = img.copy()
     
     roi_count = 0
+    total_rois = 4
     
     if item_name_roi:
         x, y, w, h = item_name_roi
@@ -215,6 +269,25 @@ def visualize_roi(image_path: str, window_type: str):
     else:
         print(f"   ❌ Warehouse ROI: Not detected")
     
+    if preorder_input_roi:
+        x, y, w, h = preorder_input_roi
+        cv2.rectangle(output, (x, y), (x + w, y + h), (255, 128, 0), 3)  # Orange
+        # Unterschiedlicher Text je nach Window-Type
+        if window_type == 'buy_item':
+            label_text = "Preorder Input ROI (Desired Price/Amount)"
+        else:
+            label_text = "Preorder Input ROI (Set Price/Register Qty)"
+        cv2.putText(output, label_text, (x, y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
+        print(f"   ✅ Preorder Input ROI: x={x}, y={y}, w={w}, h={h}")
+        if window_type == 'buy_item':
+            print(f"      Expected fields: 'Desired Price' and 'Desired Amount'")
+        else:
+            print(f"      Expected fields: 'Set Price' and 'Register Quantity'")
+        roi_count += 1
+    else:
+        print(f"   ❌ Preorder Input ROI: Not detected")
+    
     # Save output
     output_dir = Path("debug")
     output_dir.mkdir(exist_ok=True)
@@ -224,26 +297,40 @@ def visualize_roi(image_path: str, window_type: str):
     
     print(f"\n{'='*60}")
     print(f"✅ ROI visualization saved to: {output_path}")
-    print(f"   ROIs detected: {roi_count}/3")
+    print(f"   ROIs detected: {roi_count}/{total_rois}")
     print(f"{'='*60}\n")
     
-    if roi_count < 3:
+    if roi_count < total_rois:
         print("⚠️  WARNING: Not all ROIs were detected!")
-        print("   Please adjust ROI coordinates in utils.py")
+        print("   Please adjust ROI coordinates in this script and utils.py")
         print("   See docs/DETAIL_WINDOW_ROI_REFERENCE.md for details")
     else:
         print("✅ All ROIs detected successfully!")
         print("   Please verify the ROI positions visually")
         print(f"   Open: {output_path}")
     
+    print("\n📋 Expected UI Elements per Window Type:")
+    if window_type == 'buy_item':
+        print("   BUY-ITEM Window:")
+        print("   - Preorder Input ROI should contain:")
+        print("     • 'Desired Price' field (unit price)")
+        print("     • 'Desired Amount' field (quantity)")
+        print("     • Input values (e.g., '154,000' and '5000')")
+    else:
+        print("   SELL-ITEM Window:")
+        print("   - Preorder Input ROI should contain:")
+        print("     • 'Set Price' field (unit price)")
+        print("     • 'Register Quantity' field (quantity)")
+        print("     • Input values")
+    
     print("\nNext steps:")
     print("1. Open the generated image to verify ROI positions")
-    print("2. If positions are incorrect, adjust coordinates in utils.py:")
-    print("   - detect_detail_item_name_roi()")
-    print("   - detect_detail_balance_roi()")
-    print("   - detect_detail_warehouse_roi()")
+    print("2. If Preorder Input ROI is INCORRECT, adjust coordinates:")
+    print("   - In this script: detect_detail_preorder_input_roi()")
+    print("   - In utils.py: Copy the function once calibrated")
     print("3. Run this script again to verify changes")
-    print("4. Proceed with implementation Phase 1")
+    print("4. The ROI must capture BOTH field labels AND input values!")
+    print("5. Once calibrated, implement Phase 1: Preorder Input Extraction")
 
 
 def main():
@@ -259,6 +346,7 @@ ROI Colors:
   Green   = Item Name ROI (oben links)
   Violet  = Balance ROI (mittig links)
   Yellow  = Warehouse ROI (oben/unten links je nach Fenstertyp)
+  Orange  = Preorder Input ROI (rechts mittig - Desired Price/Amount oder Set Price/Register Quantity)
         """
     )
     
