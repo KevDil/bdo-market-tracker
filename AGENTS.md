@@ -1,4 +1,5 @@
 # Repository Guidelines
+- Reply to the user in German.
 
 ## Scope & Sources of Truth
 - This is the single authoritative guide for maintainers, automation agents, and contributors. Retired specs (`instructions.md`, `copilot-instructions.md`, `.windsurf/rules/project-rules.md`) now mirror this file or point to archived copies under `docs/archive/`.

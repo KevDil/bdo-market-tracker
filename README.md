@@ -1,6 +1,6 @@
 # BDO Market Tracker
 
-Ein OCR-basierter Marktplatz-Tracker für Black Desert Online. Das Projekt nimmt Screenshots des Marktfensters, führt Game-UI-optimierte Vorverarbeitung und OCR (EasyOCR / optional PaddleOCR / Tesseract) aus, parsed erkannte Log-Zeilen, wendet Heuristiken und Fuzzy-Korrekturen an und persistiert gefundene Transaktionen in einer lokalen SQLite-Datenbank.
+Ein OCR-basierter Marktplatz-Tracker für Black Desert Online. Das Projekt nimmt Screenshots des Marktfensters, führt Game-UI-optimierte Vorverarbeitung und OCR (EasyOCR mit Tesseract-Fallback) aus, parsed erkannte Log-Zeilen, wendet Heuristiken und Fuzzy-Korrekturen an und persistiert gefundene Transaktionen in einer lokalen SQLite-Datenbank.
 
 Dieses Repository enthält eine einfache Tkinter-GUI (`gui.py`) zur Live-Überwachung, Export-Funktionen (CSV/JSON) sowie mehrere Hilfs- und Diagnoseskripte unter `scripts/`.
 
@@ -9,7 +9,7 @@ Dieses Repository enthält eine einfache Tkinter-GUI (`gui.py`) zur Live-Überwa
 - Primäre Programmsprache: Python 3.10–3.13
 - Haupt-Einstiegspunkt (GUI): `python gui.py`
 - Datenbank: `bdo_tracker.db` (SQLite, liegt im Repo für Entwicklung)
-- Primäre OCR-Engine: EasyOCR (default). Tesseract als Fallback. PaddleOCR optional (nicht standardmäßig aktiviert wegen Latenz).
+- OCR-Engines: EasyOCR (primary) mit Tesseract als Fallback
 
 ## Features
 
