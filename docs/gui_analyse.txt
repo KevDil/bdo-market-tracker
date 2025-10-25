@@ -1,0 +1,156 @@
+### Verbesserungsvorschläge für die GUI des BDO Market Trackers
+
+Die aktuelle GUI in `gui.py` ist funktional, aber sie wirkt etwas überladen, textlastig und visuell eintönig. Tkinter ist eine solide Basis, aber es fehlt an modernem Design, besserer Organisation und nutzerzentrierten Elementen. Um sie nutzerfreundlicher (einfacher zu bedienen), übersichtlicher (besser strukturiert) und schöner (ästhetisch ansprechender) zu machen, schlage ich eine schrittweise Überarbeitung vor. Ich teile die Vorschläge in Kategorien ein, inklusive konkreter Code-Änderungen und Begründungen. Die Ziele sind:
+
+- **Nutzerfreundlichkeit**: Intuitive Navigation, klare Feedbacks (z.B. Tooltips, Fortschrittsanzeigen), weniger Fehleranfälligkeit (z.B. Validierung).
+- **Übersichtlichkeit**: Bessere Gruppierung, mehr Weißraum, Tabs oder Accordion-Elemente für Abschnitte.
+- **Schönheit**: Moderne Farben, Icons, konsistente Fonts und responsive Layouts.
+
+Ich basiere das auf dem bereitgestellten Code. Du kannst diese Änderungen schrittweise implementieren – starte mit dem Layout und dem Styling, da das den größten visuellen Impact hat.
+
+#### 1. **Allgemeines Layout und Struktur verbessern**
+   Die GUI verwendet hauptsächlich `pack()` für das Layout, was zu unflexiblen Stapeln führt. Wechsle zu `grid()` für präzise Kontrolle und Responsiveness. Gruppiere Abschnitte in Tabs (mit `ttk.Notebook`), um den Bildschirm nicht zu überladen – z.B. einen Tab für "Steuerung", einen für "Einstellungen & Status" und einen für "Datenanalyse".
+
+   **Vorschläge:**
+   - Füge ein `ttk.Notebook` als Haupt-Container hinzu.
+   - Erhöhe Padding und Spacing für mehr Weißraum (z.B. `padx=20`, `pady=10`).
+   - Mache die GUI responsiv: Verwende `grid_rowconfigure` und `grid_columnconfigure` mit `weight=1` für erweiterbare Bereiche.
+
+   **Code-Beispiel (am Anfang von `start_gui()` nach `main_container = tk.Frame(...)`):**
+   ```python
+   notebook = ttk.Notebook(main_container)
+   notebook.pack(fill="both", expand=True, pady=10)
+
+   # Tab 1: Scan-Steuerung
+   tab_control = tk.Frame(notebook)
+   notebook.add(tab_control, text="Steuerung")
+
+   # Tab 2: Einstellungen & Status
+   tab_settings = tk.Frame(notebook)
+   notebook.add(tab_settings, text="Einstellungen")
+
+   # Tab 3: Daten & Analyse
+   tab_data = tk.Frame(notebook)
+   notebook.add(tab_data, text="Analyse")
+
+   # Verschiebe bestehende Frames in die Tabs, z.B.:
+   region_frame.pack(in=tab_control, fill="x", pady=10)
+   settings_frame.pack(in=tab_settings, fill="x", pady=10)
+   status_frame.pack(in=tab_settings, fill="x", pady=10)
+   data_frame.pack(in=tab_data, fill="x", pady=10)
+   ```
+
+   **Warum besser?** Tabs reduzieren visuelle Überlastung – der Nutzer sieht nur, was relevant ist. Das macht die GUI übersichtlicher und nutzerfreundlicher für Anfänger.
+
+#### 2. **Styling und Theming erweitern**
+   Der aktuelle Style ist minimal ("clam"-Theme). Erweitere es mit Farben, Fonts und Hover-Effekten für Buttons. Verwende ein modernes Farbschema, z.B. Dunkelmodus (grau/blau) oder hell (weiß/blau), passend zu Black Desert Online (dunkle Fantasy-Ästhetik).
+
+   **Vorschläge:**
+   - Definiere ein Farbschema: Primärfarbe (#1E90FF für Blau), Akzent (#32CD32 für Grün), Warnung (#FF4500 für Orange).
+   - Füge Icons hinzu (z.B. mit `PIL` für Bilder oder Unicode-Emojis wie 🛡️, 📊).
+   - Erhöhe Font-Größen für Überschriften und mache Labels fett.
+
+   **Code-Beispiel (erweitere den `style`-Abschnitt):**
+   ```python
+   style.configure("TFrame", background="#f0f0f0")  # Heller Hintergrund
+   style.configure("Accent.TButton", background="#1E90FF", foreground="white", font=("Segoe UI", 10, "bold"))
+   style.map("Accent.TButton", background=[("active", "#104E8B")])  # Hover-Effekt
+   style.configure("Header.TLabel", foreground="#000080")  # Dunkelblau für Header
+   style.configure("Status.Green.TLabel", foreground="green")
+   style.configure("Status.Orange.TLabel", foreground="orange")
+   style.configure("Status.Red.TLabel", foreground="red")
+
+   # In update_health_status(): Dynamisch Styles zuweisen
+   if error_count == 0:
+       health_status_var.set("🟢 Healthy")
+       health_label.config(style="Status.Green.TLabel")
+   # Ähnlich für andere Zustände
+   ```
+
+   **Warum besser?** Farben machen die GUI ansprechender und helfen bei der Orientierung (z.B. Grün für "Healthy" signalisiert positiv). Icons (z.B. vor Buttons: "▶️ Auto-Tracking starten") machen sie visuell attraktiver.
+
+#### 3. **Nutzerfreundlichkeit steigern**
+   Füge Elemente hinzu, die den Nutzer leiten: Tooltips, Validierungen, Fortschrittsbalken und Tastenkürzel.
+
+   **Vorschläge:**
+   - **Tooltips:** Für Buttons und Felder, z.B. Erklärung für "Region (x1,y1,x2,y2)".
+   - **Eingabe-Validierung:** Überprüfe Region-Eingaben live, um Fehler zu vermeiden.
+   - **Fortschrittsanzeige:** Füge einen `ttk.Progressbar` während Scans hinzu.
+   - **Tastenkürzel:** Bind Shortcuts, z.B. Strg+S für Scan.
+   - **Fehler-Handling:** Zeige freundliche Messages mit Icons.
+
+   **Code-Beispiel (Tooltips mit `tkinter.tooltip` oder custom):**
+   ```python
+   from tkinter import ttk  # Falls nicht importiert
+   class ToolTip:
+       def __init__(self, widget, text):
+           self.widget = widget
+           self.text = text
+           self.widget.bind("<Enter>", self.show)
+           self.widget.bind("<Leave>", self.hide)
+       def show(self, event=None):
+           x, y, _, _ = self.widget.bbox("insert")
+           x += self.widget.winfo_rootx() + 25
+           y += self.widget.winfo_rooty() + 25
+           self.tip = tk.Toplevel(self.widget)
+           self.tip.wm_overrideredirect(True)
+           self.tip.wm_geometry(f"+{x}+{y}")
+           label = tk.Label(self.tip, text=self.text, background="yellow", relief="solid", borderwidth=1)
+           label.pack()
+       def hide(self, event=None):
+           if hasattr(self, 'tip'): self.tip.destroy()
+
+   # Anwenden:
+   ToolTip(region_entry, "Format: x1,y1,x2,y2 – Koordinaten des Marktfensters")
+   ToolTip(auto_button, "Startet/Stoppt automatischen Scan im Hintergrund")
+   ```
+
+   **Code-Beispiel (Validierung für Region):**
+   ```python
+   def validate_region(entry_text):
+       if _parse_region(entry_text):  # Deine bestehende Funktion
+           region_entry.config(bg="white")
+           return True
+       else:
+           region_entry.config(bg="#FFB6C1")  # Hellrot für Fehler
+           return False
+
+   region_entry.bind("<KeyRelease>", lambda e: validate_region(region_entry.get()))
+   ```
+
+   **Warum besser?** Tooltips reduzieren Lernkurve, Validierung verhindert Frustration, und Feedback macht die Interaktion flüssiger.
+
+#### 4. **Daten- und Analyse-Abschnitt optimieren**
+   Dieser Bereich ist textlastig. Verbessern durch bessere Tabellen, integrierte Plots und Filter-UI.
+
+   **Vorschläge:**
+   - **Filter-UI:** Verwende Labels mit Icons (z.B. 📅 für Datum) und Buttons für "Anwenden".
+   - **Tabellen:** Füge Sortierbarkeit hinzu (ttk.Treeview unterstützt das).
+   - **Plots:** Integriere Matplotlib-Plots direkt in Tabs, mit Zoom-Optionen.
+   - **Export-Buttons:** Gruppiere sie in einem Sub-Frame mit Icons (📤 CSV, 📄 JSON).
+
+   **Code-Beispiel (für view_data() – integriere Plot direkt):**
+   ```python
+   # In show_price_plot(): Statt separatem Window, embedde in result_window
+   plot_frame = tk.Frame(result_window)
+   plot_frame.pack(fill="x", pady=10)
+   fig = Figure(figsize=(8, 4), dpi=100)
+   ax = fig.add_subplot(111)
+   ax.plot(df['timestamp'], df['unit_price'], marker='o', color='#1E90FF')
+   ax.set_title("Preisverlauf", fontsize=14)
+   canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+   canvas.draw()
+   canvas.get_tk_widget().pack(fill="both", expand=True)
+   ```
+
+   **Warum besser?** Visuelle Daten (Plots) machen Analysen ansprechender und leichter verständlich. Sortierbare Tabellen erhöhen die Nutzbarkeit.
+
+#### 5. **Weitere Tipps und Best Practices**
+   - **Dark Mode:** Füge eine Checkbox für Dark Mode hinzu (wechsle Backgrounds dynamisch).
+   - **Icons laden:** Verwende `PhotoImage` für PNG-Icons (z.B. aus einem "icons/"-Ordner).
+   - **Performance:** Da es GPU-Optionen hat, stelle sicher, dass UI-Updates nicht blockieren (verwende `after()` für Loops).
+   - **Testen:** Starte mit kleinen Änderungen und teste auf verschiedenen Bildschirmgrößen.
+   - **Bibliotheken:** Für noch besseres Design, überlege `customtkinter` (moderne Tkinter-Erweiterung) – es hat schöne Buttons und Sliders, aber das erfordert eine Migration.
+   - **Zugänglichkeit:** Verwende ARIA-ähnliche Labels und Kontraste für Farbenblinde.
+
+Diese Änderungen sollten die GUI von "funktional" zu "professionell" heben. Wenn du spezifische Teile (z.B. nur den Daten-Tab) umsetzen möchtest, lass es mich wissen – ich kann detaillierteren Code liefern!

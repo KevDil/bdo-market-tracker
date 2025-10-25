@@ -438,9 +438,9 @@ def detect_log_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = int(h * 0.03)
-        y_end = int(h * 0.29)
-        x_start = int(w * 0.28)
+        y_start = int(h * 0.04)
+        y_end = int(h * 0.27)
+        x_start = int(w * 0.30)
         x_end = int(w * 0.97)
         width = x_end - x_start
         return (x_start, y_start, width, y_end - y_start)
@@ -469,9 +469,9 @@ def detect_metrics_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = int(h * 0.35)
-        y_end = int(h * 0.97)
-        x_start = int(w * 0.31)
+        y_start = int(h * 0.36)
+        y_end = int(h * 0.96)
+        x_start = int(w * 0.32)
         x_end = int(w * 0.96)
         return (x_start, y_start, x_end - x_start, y_end - y_start)
     except Exception:
