@@ -245,6 +245,7 @@ class MarketTracker:
         self._detail_partial_balance_delta = 0  # Akkumulierter Balance-Delta
         self._detail_partial_warehouse_delta = 0  # Akkumulierter Warehouse-Delta
         self._detail_balance_delta_timestamp = None  # Zeitpunkt des ersten balance_delta (für Timeout)
+        self._force_detail_metric_refresh = False
 
         # Preorder duplicate guard
         self._recent_preorder_hashes: dict[tuple[str, int, int, int], float] = {}
@@ -2775,7 +2776,7 @@ class MarketTracker:
         """Speichert eine Transaktion in der DB thread-sicher."""
         item = tx['item_name']
         qty = tx['quantity']
-        price = tx['price']
+        price = tx.get('price')
         ttype = tx['transaction_type']
         ts = tx['timestamp']
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime.datetime) else str(ts)
@@ -2785,8 +2786,39 @@ class MarketTracker:
             occ_idx = int(occ_idx_raw) if occ_idx_raw is not None else 0
         except Exception:
             occ_idx = 0
-        
-        sig = self.make_tx_sig(item, qty, price, ttype, ts, occ_idx)
+
+        # Versuche fehlende Preise frühzeitig zu rekonstruieren, bevor Dedupe greift
+        if (price is None or price <= 0) and tx.get('_recovered_price'):
+            try:
+                recovered_val = int(tx['_recovered_price'])
+                if recovered_val > 0:
+                    price = recovered_val
+                    tx['price'] = recovered_val
+            except Exception:
+                pass
+
+        if (price is None or price <= 0) and (ttype or '').lower() == 'sell':
+            raw_related = tx.get('raw_related') or []
+            candidate_qty = qty if isinstance(qty, (int, float)) else None
+            for raw_entry in raw_related:
+                if not isinstance(raw_entry, dict):
+                    continue
+                entry_qty = candidate_qty
+                if not entry_qty:
+                    entry_qty = raw_entry.get('qty')
+                try:
+                    entry_qty_int = int(entry_qty) if entry_qty is not None else 0
+                except Exception:
+                    entry_qty_int = 0
+                recovered_price = self._recover_sell_price(item, entry_qty_int, price, raw_entry)
+                if recovered_price and recovered_price > 0:
+                    price = int(recovered_price)
+                    tx['price'] = price
+                    tx['_recovered_price'] = price
+                    raw_entry['_recovered_price'] = price
+                    break
+
+        sig = self.make_tx_sig(item, qty, price or 0, ttype, ts, occ_idx)
         # CRITICAL: Generate content hash for reliable deduplication
         content_hash = self.make_content_hash(tx)
         ts_dt = ts if isinstance(ts, datetime.datetime) else None
@@ -2870,7 +2902,7 @@ class MarketTracker:
         # ADDITIONAL: Check for near-duplicate (Detail-Window vs Log-based)
         # If log-based parsing tries to save a transaction that was already captured
         # by detail-window monitoring (within 2 minutes), skip it
-        if not tx.get('_from_detail_window'):
+        if price is not None and not tx.get('_from_detail_window'):
             try:
                 db_cur = get_cursor()
                 # Round timestamp to minute for comparison
@@ -2933,9 +2965,12 @@ class MarketTracker:
             self.seen_tx_signatures.append(sig)  # deque uses append, not add
             return False
         # If a transaction with same (item, qty, price, type) already exists at a different timestamp, avoid duplicating it.
-        try:
-            existing = find_existing_tx_by_values(item, qty, int(price), ttype, ts_str, occ_idx)
-        except Exception:
+        if price is not None:
+            try:
+                existing = find_existing_tx_by_values(item, qty, int(price), ttype, ts_str, occ_idx)
+            except Exception:
+                existing = None
+        else:
             existing = None
         if existing is not None:
             # If the new timestamp is earlier, update; if later, skip as duplicate
@@ -2956,7 +2991,7 @@ class MarketTracker:
                     pass
                 else:
                     try:
-                        if transaction_exists_by_values_near_time(item, qty or 0, int(price), ts_dt, tolerance_minutes=5):
+                        if price is not None and transaction_exists_by_values_near_time(item, qty or 0, int(price), ts_dt, tolerance_minutes=5):
                             if self.debug:
                                 log_debug(f"[CONTENT-HASH] Skip near-time duplicate: {item} {qty}x @ {price} around {ts_dt}")
                             self.seen_tx_signatures.append(sig)
@@ -3013,12 +3048,12 @@ class MarketTracker:
         self._detail_needs_baseline_capture = False
         self._detail_baseline_captured = False
         self._detail_window_entry_item = None
-        
+        self._force_detail_metric_refresh = False
+
         # NEW (Phase 2): Reset preorder check state
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
-
     def _force_save_pending_transaction(self) -> bool:
         """
         Persist a pending balance-only transaction when the detail window closes.
@@ -3955,6 +3990,8 @@ class MarketTracker:
             self._detail_window_entry_item = raw_item_name  # Für Log-Fallback
             self._detail_baseline_captured = True
             self._detail_needs_baseline_capture = False
+            self._detail_detail_snapshot_ts = datetime.datetime.now()
+            self._force_detail_metric_refresh = True
             
             # Reset Delta-Akkumulation
             self._detail_partial_balance_delta = 0
@@ -4172,8 +4209,10 @@ class MarketTracker:
         # Setze permanente Flags (bleiben True bis Transaktion abgeschlossen)
         if balance_changed_this_scan:
             self._detail_balance_changed_once = True
+            self._force_detail_metric_refresh = True
         if warehouse_changed_this_scan:
             self._detail_warehouse_changed_once = True
+            self._force_detail_metric_refresh = True
         
         if self.debug:
             balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance is not None else 0
@@ -4501,8 +4540,8 @@ class MarketTracker:
                 warehouse_delta=warehouse_delta,
                 current_metrics=current_metrics,
                 timestamp=datetime.datetime.now(),
-                img=img,
-                proc_img=proc_img
+                balance_delta=balance_delta,
+                cached_input=self._detail_cached_input_fields if hasattr(self, '_detail_cached_input_fields') else None
             )
             
             if listing_detected:
@@ -4791,6 +4830,9 @@ class MarketTracker:
         # ALWAYS update last_metrics, even if transaction failed
         self._detail_last_metrics = current_metrics
         self._detail_confirmation_pending = False
+        # Allow cache reuse after deltas settled
+        if self._force_detail_metric_refresh and not self._detail_window_active:
+            self._force_detail_metric_refresh = False
 
     def process_ocr_text(self, full_text):
         """
@@ -5692,6 +5734,40 @@ class MarketTracker:
                                         f"[RELIST] ✅ Attached reconstructed preorder to transaction: "
                                         f"{transaction_qty:,}x @ {reconstructed['unit_price']:,.0f}"
                                     )
+
+                    # Ensure relist transaction provides a net price for downstream consumers
+                    if transaction_entry:
+                        relist_item = transaction_entry.get('item') or ent.get('item') or ''
+                        relist_qty = transaction_entry.get('qty') or ent.get('qty') or 0
+                        candidate_price = transaction_entry.get('price') or 0
+
+                        recovered_cluster_price = None
+                        if relist_item and relist_qty:
+                            recovered_cluster_price = self._recover_sell_price(
+                                relist_item,
+                                int(relist_qty),
+                                candidate_price,
+                                transaction_entry
+                            )
+
+                        if (not recovered_cluster_price or recovered_cluster_price <= 0) and listed_entry and listed_entry.get('price') and relist_qty:
+                            try:
+                                recovered_cluster_price = int(round(listed_entry.get('price') * MARKET_SELL_NET_FACTOR))
+                            except Exception:
+                                recovered_cluster_price = None
+
+                        if (not recovered_cluster_price or recovered_cluster_price <= 0) and transaction_entry.get('raw_price_hint'):
+                            try:
+                                recovered_cluster_price = int(transaction_entry['raw_price_hint'])
+                            except Exception:
+                                recovered_cluster_price = None
+
+                        if recovered_cluster_price and recovered_cluster_price > 0:
+                            recovered_cluster_price = int(recovered_cluster_price)
+                            transaction_entry['_recovered_price'] = recovered_cluster_price
+                            transaction_entry['_cluster_net_price'] = recovered_cluster_price
+                            if not transaction_entry.get('price') or transaction_entry.get('price') <= 0:
+                                transaction_entry['price'] = recovered_cluster_price
             
             # On sell overview, skip listed-only clusters UNLESS UI metrics show completed sales OR it's a relist
             if wtype == 'sell_overview' and not transaction_entry and listed_entry and ent['type'] == 'listed':

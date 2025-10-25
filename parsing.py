@@ -646,6 +646,8 @@ def extract_details_from_entry(ts_text, entry_text):
 
     # price extraction
     price = None
+    price_hint_value = None
+    price_hint_digits = None
     if typ in ("transaction", "purchased", "listed", "placed", "withdrew"):
         # For transaction lines, prefer 'worth <N> Silver' (net amount)
         if typ == "transaction":
@@ -811,6 +813,10 @@ def extract_details_from_entry(ts_text, entry_text):
                         best = val
                 price = best
 
+    if price is not None:
+        price_hint_value = int(price)
+        price_hint_digits = re.sub(r'\D', '', str(int(price))) or None
+
     # global item fallback if not set yet
     if item is None:
         # patterns: "Transaction of <item> xNN", "Listed <item> xNN for", "Placed order of <item> xNN"
@@ -959,6 +965,7 @@ def extract_details_from_entry(ts_text, entry_text):
         'price': int(price) if price else None,
         'timestamp': ts,
         'raw': entry_text,
-        'raw_price_hint': raw_price_hint,
+        'raw_price_hint': raw_price_hint or price_hint_value,
+        'price_hint_digits': price_hint_digits,
         'ts_text': ts_text
     }
