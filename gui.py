@@ -69,6 +69,7 @@ class MarketTrackerGUI:
             pass
 
         saved_dark = get_dark_mode(DEFAULT_THEME == "dark")
+        self.dark_mode_var = tk.BooleanVar(value=saved_dark)
         self._setup_theme(initial_dark=saved_dark)
 
         current_region = get_capture_region(DEFAULT_REGION)
@@ -76,7 +77,6 @@ class MarketTrackerGUI:
 
         self.use_gpu_var = tk.BooleanVar(value=get_use_gpu(USE_GPU))
         self.debug_var = tk.BooleanVar(value=tracker.debug)
-        self.dark_mode_var = tk.BooleanVar(value=saved_dark)
         self.status_var = tk.StringVar(value="Status: Idle")
         self.health_status_var = tk.StringVar(value="🟢 Healthy")
         self.window_status_var = tk.StringVar(value="Fenster: -")
