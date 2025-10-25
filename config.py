@@ -161,6 +161,16 @@ def set_debug_mode(value: bool) -> None:
     _set_bool_setting("debug_mode", value)
 
 
+def get_dark_mode(default: bool = False) -> bool:
+    """Return persisted dark-mode flag for the GUI."""
+    return _get_bool_setting("dark_mode", default)
+
+
+def set_dark_mode(value: bool) -> None:
+    """Persist dark-mode flag for the GUI."""
+    _set_bool_setting("dark_mode", value)
+
+
 def get_capture_region(default_region: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Return the persisted capture region tuple."""
     return _get_region_setting(default_region)

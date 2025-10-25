@@ -38,21 +38,21 @@
      3. `match_templates()` iteriert Templates & Skalen (0.85–1.15, Schritt 0.05).
      4. Top-K Ergebnis(e) (max. 3) nach Score sortieren.
      5. Validierung: Score ≥ Threshold (z. B. 0.85), optional Zweit-Template (Log oder Button-Reihe) auf konsistenten Offset prüfen.
-     6. Bei Erfolg: Region = `(x, y, x + width, y + height)` mit Fensterausdehnung aus `DEFAULT_REGION` (Breite/Höhe) berechnen.
+    6. Bei Erfolg: Match-Koordinaten auf die native Auflösung zurückskalieren (`x_native = x_downsampled / scale_factor`). Jede Template-Definition liefert `window_bbox = (offset_x, offset_y, width, height)` relativ zum Anchor; Offset & Größe werden mit derselben Skalierung multipliziert. Finale Region = `(x_native + offset_x_scaled, y_native + offset_y_scaled, x_native + offset_x_scaled + width_scaled, y_native + offset_y_scaled + height_scaled)`.
      7. Plausibilitätsprüfung: Monitorgröße (`mss.monitors`), Mindestabstände zu Rändern, optional Mittelwert über mehrere Frames.
    - Rückgabe: `DetectionResult(region, score, template_name, scale, timestamp)`.
 
 5. **Live-Tracking-Layer** (`window_tracker.py` neu oder in `template_matching.py`)
    - Verantwortlich für kontinuierliche Positionsüberwachung ohne merklichen Performance-Verlust.
-   - Nutzt bei jedem Scan den bereits erfassten Frame (`self._current_frame`) und führt ein **lokales Template-Matching** im Suchfenster um die zuletzt bekannte Region (Margin z. B. ±80 px) aus.
+   - Nutzt dedizierte Tracking-Captures: alle `TRACKING_INTERVAL`-Scans (z. B. 0.3–0.5 s) erstellt `capture_tracking_slice(region, margin)` einen Screenshot des zuletzt bekannten Fensters inkl. ±80 px Sicherheitsrand (an Monitorgrenzen geclamped). Die OCR-Pipeline verarbeitet weiterhin nur `self.region`.
    - Erzeugt aus dem ursprünglichen Treffer einen **Tracking-Template-Ausschnitt** (z. B. Kopfzeile „Central Market“ + Tab-Leiste) und cached diesen als `cv2`-Matrix.
-   - Ablauf pro Scan:
-     1. Zuschnitt des Suchfensters aus dem aktuellen Frame (gleiches Downsampling wie bei ROI-Analyse).
+   - Ablauf pro Tracking-Scan:
+     1. Downsample des Tracking-Slices (gleiche Pipeline wie Detection).
      2. `cv2.matchTemplate` mit Tracking-Template; akzeptiere Offsets bis ±80 px.
-     3. Wenn Offset > Toleranz (z. B. 6 px) → Region um Delta verschieben, ROI-Caches invalidieren.
+     3. Wenn Offset > Toleranz (z. B. 6 px) → Region um Delta verschieben, `tracker.region` aktualisieren, ROI-Caches invalidieren.
      4. Wenn Score < Threshold (z. B. 0.75) → Async-Task für Vollbild-Detection anstoßen, während aktuelle Region weitergenutzt wird.
    - Optional: Glättung via exponentiellem Moving Average, um Jitter zu vermeiden.
-   - Tracking läuft synchron mit `auto_track`-Polling (0.15 s) und nutzt vorhandene Frames → kein zusätzliches Screen-Capture nötig.
+   - Tracking läuft asynchron (Thread/Timer), kommuniziert Ergebnisse über eine Thread-Safe-Queue zu `MarketTracker` und verursacht dadurch nur einen zusätzlichen Screenshot je Tracking-Intervall.
 
 6. **Integration in `MarketTracker` (`tracker.py`)**
    - `MarketTracker.__init__`:
