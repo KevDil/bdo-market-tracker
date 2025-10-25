@@ -438,11 +438,10 @@ def detect_log_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = 0
-        y_end = int(h * 0.32)
-        y_end = max(y_start + 20, min(h, y_end))
-        x_start = int(w * 0.25)
-        x_end = w
+        y_start = int(h * 0.03)
+        y_end = int(h * 0.29)
+        x_start = int(w * 0.28)
+        x_end = int(w * 0.97)
         width = x_end - x_start
         return (x_start, y_start, width, y_end - y_start)
     except Exception:
@@ -456,11 +455,9 @@ def detect_window_label_roi(img):
     try:
         h, w = _shape_hw(img)
         y_start = int(h * 0.33)
-        y_end = int(h * 0.65)
-        x_start = int(w * 0.28)
-        x_end = int(w * 0.66)
-        y_end = max(y_start + 40, min(h, y_end))
-        x_end = max(x_start + 60, min(w, x_end))
+        y_end = int(h * 0.63)
+        x_start = int(w * 0.31)
+        x_end = int(w * 0.62)
         return (x_start, y_start, x_end - x_start, y_end - y_start)
     except Exception:
         return None
@@ -472,12 +469,10 @@ def detect_metrics_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = int(h * 0.33)
+        y_start = int(h * 0.35)
         y_end = int(h * 0.97)
-        x_start = int(w * 0.28)
+        x_start = int(w * 0.31)
         x_end = int(w * 0.96)
-        y_end = max(y_start + 40, min(h, y_end))
-        x_end = max(x_start + 60, min(w, x_end))
         return (x_start, y_start, x_end - x_start, y_end - y_start)
     except Exception:
         return None
@@ -537,12 +532,12 @@ def detect_detail_balance_roi(img, window_type: str):
         h, w = _shape_hw(img)
         if window_type == 'sell_item':
             x_start = int(w * 0.04)
-            x_end = int(w * 0.23)
+            x_end = int(w * 0.22)
             y_start = int(h * 0.46)
             y_end = int(h * 0.55)
         elif window_type == 'buy_item':
             x_start = int(w * 0.04)
-            x_end = int(w * 0.23)
+            x_end = int(w * 0.22)
             y_start = int(h * 0.50)
             y_end = int(h * 0.59)
         else:
@@ -624,9 +619,9 @@ def detect_detail_preorder_input_roi(img, window_type: str):
         
         # Kalibrierte Werte - identisch für buy und sell!
         x_start = int(w * 0.43)
-        x_end = int(w * 0.67)
+        x_end = int(w * 0.66)
         y_start = int(h * 0.49)
-        y_end = int(h * 0.73)
+        y_end = int(h * 0.70)
         
         width = x_end - x_start
         height = y_end - y_start
