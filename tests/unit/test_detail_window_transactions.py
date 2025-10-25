@@ -9,6 +9,7 @@ Tests für:
 
 import pytest
 import datetime
+import tracker
 from tracker import MarketTracker
 from utils import normalize_numeric_str
 
