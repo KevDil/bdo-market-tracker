@@ -12,14 +12,13 @@ TESS_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 pytesseract.pytesseract.tesseract_cmd = TESS_PATH
 
 # -----------------------
-# OCR Engine Selection (Phase 2 - ML Integration)
+# OCR Engine Selection
 # -----------------------
-# Available engines: 'paddle', 'easyocr', 'tesseract'
-# PaddleOCR: Zu langsam (5-6s pro Scan) -> Queue Latency Probleme
-# EasyOCR: Schneller (~400-700ms) und stabiler für BDO
-# Tesseract: Final fallback (system-level)
-OCR_ENGINE = 'easyocr'  # Beste Performance für BDO (PaddleOCR zu langsam)
-OCR_FALLBACK_ENABLED = False  # Fallback bei Bedarf
+# Available engines: 'easyocr', 'tesseract'
+# EasyOCR: Primary engine (~400-700ms) - beste Performance für BDO
+# Tesseract: Fallback engine (system-level)
+OCR_ENGINE = 'easyocr'  # Primary OCR engine
+OCR_FALLBACK_ENABLED = True  # Enable Tesseract fallback
 
 # Legacy compatibility
 USE_EASYOCR = True  # Behalten für Backward-Kompatibilität
@@ -162,6 +161,16 @@ def set_debug_mode(value: bool) -> None:
     _set_bool_setting("debug_mode", value)
 
 
+def get_dark_mode(default: bool = False) -> bool:
+    """Return persisted dark-mode flag for the GUI."""
+    return _get_bool_setting("dark_mode", default)
+
+
+def set_dark_mode(value: bool) -> None:
+    """Persist dark-mode flag for the GUI."""
+    _set_bool_setting("dark_mode", value)
+
+
 def get_capture_region(default_region: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Return the persisted capture region tuple."""
     return _get_region_setting(default_region)
@@ -190,8 +199,7 @@ FOCUS_WINDOW_TITLES = [
 # -----------------------
 # Async Pipeline Feature Flag
 # -----------------------
-# CRITICAL: Async Pipeline deaktiviert wegen hoher Queue-Latenz mit PaddleOCR
-# PaddleOCR braucht 5-6s pro Scan -> Queue Latency zu hoch
+# CRITICAL: Async Pipeline deaktiviert wegen Queue-Latenz-Problemen
 # Mit synchronem Processing: OCR blockiert, aber keine Queue-Latenz
 USE_ASYNC_PIPELINE = False  # Deaktiviert für bessere Latenz
 # CRITICAL FIX: Queue size = 1 to prevent stale frames
@@ -431,27 +439,10 @@ if USE_EASYOCR:
             reader = None
 
 # -----------------------
-# PaddleOCR Initialization (Phase 2 - ML Integration)
+# Tesseract Fallback Configuration
 # -----------------------
-paddle_reader = None
-if OCR_ENGINE == 'paddle' or OCR_FALLBACK_ENABLED:
-    try:
-        from ocr_engines import init_paddle_ocr, init_easyocr
-        
-        # Initialize PaddleOCR (primary engine)
-        paddle_success = init_paddle_ocr(use_gpu=USE_GPU, lang='en', show_log=False)
-        
-        # Initialize EasyOCR (fallback)
-        if OCR_FALLBACK_ENABLED:
-            easyocr_success = init_easyocr(use_gpu=USE_GPU, lang=['en'])
-        
-        if not paddle_success and not OCR_FALLBACK_ENABLED:
-            print("⚠️  PaddleOCR failed and fallback disabled - using EasyOCR")
-            OCR_ENGINE = 'easyocr'  # Fallback to EasyOCR
-            
-    except Exception as e:
-        print(f"⚠️  OCR engine initialization error: {e}")
-        print("⚠️  Falling back to legacy EasyOCR reader")
+# Tesseract wird als Fallback verwendet wenn EasyOCR fehlschlägt
+# Keine separate Initialisierung nötig - wird über pytesseract aufgerufen
 
 LETTER_TO_DIGIT = {'O':'0','o':'0','D':'0','Q':'0','I':'1','l':'1','|':'1','i':'1',
                    'S':'5','s':'5','B':'8','Z':'2','z':'2'}

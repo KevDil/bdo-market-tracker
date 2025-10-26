@@ -438,11 +438,10 @@ def detect_log_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = 0
-        y_end = int(h * 0.32)
-        y_end = max(y_start + 20, min(h, y_end))
-        x_start = int(w * 0.25)
-        x_end = w
+        y_start = int(h * 0.04)
+        y_end = int(h * 0.27)
+        x_start = int(w * 0.30)
+        x_end = int(w * 0.97)
         width = x_end - x_start
         return (x_start, y_start, width, y_end - y_start)
     except Exception:
@@ -456,11 +455,9 @@ def detect_window_label_roi(img):
     try:
         h, w = _shape_hw(img)
         y_start = int(h * 0.33)
-        y_end = int(h * 0.65)
-        x_start = int(w * 0.28)
-        x_end = int(w * 0.66)
-        y_end = max(y_start + 40, min(h, y_end))
-        x_end = max(x_start + 60, min(w, x_end))
+        y_end = int(h * 0.63)
+        x_start = int(w * 0.31)
+        x_end = int(w * 0.62)
         return (x_start, y_start, x_end - x_start, y_end - y_start)
     except Exception:
         return None
@@ -472,13 +469,163 @@ def detect_metrics_roi(img):
     """
     try:
         h, w = _shape_hw(img)
-        y_start = int(h * 0.33)
-        y_end = int(h * 0.97)
-        x_start = int(w * 0.28)
+        y_start = int(h * 0.36)
+        y_end = int(h * 0.96)
+        x_start = int(w * 0.32)
         x_end = int(w * 0.96)
-        y_end = max(y_start + 40, min(h, y_end))
-        x_end = max(x_start + 60, min(w, x_end))
         return (x_start, y_start, x_end - x_start, y_end - y_start)
+    except Exception:
+        return None
+
+
+def detect_detail_item_name_roi(img, window_type: str):
+    """
+    ROI für Item-Name im Detail-Fenster.
+    
+    Position: Oben links im Detail-Fenster
+    Text: Item-Name (z.B. "Powder of Darkness", "Brutal Death Elixir")
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        if window_type == 'sell_item':
+            x_start = int(w * 0.08)
+            x_end = int(w * 0.45)
+            y_start = int(h * 0.03)
+            y_end = int(h * 0.09)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.09)
+            x_end = int(w * 0.45)
+            y_start = int(h * 0.08)
+            y_end = int(h * 0.14)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
+def detect_detail_balance_roi(img, window_type: str):
+    """
+    ROI für Kontostand (Balance) im Detail-Fenster.
+    
+    Position: Mittig links
+    Text: "Balance: <amount> Silver"
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        if window_type == 'sell_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.22)
+            y_start = int(h * 0.46)
+            y_end = int(h * 0.55)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.22)
+            y_start = int(h * 0.50)
+            y_end = int(h * 0.59)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
+def detect_detail_warehouse_roi(img, window_type: str):
+    """
+    ROI für Lagerbestand (Warehouse Quantity) im Detail-Fenster.
+    
+    Position abhängig von Fenstertyp:
+    - Sell-Item: Relativ weit oben links
+    - Buy-Item: Relativ weit unten links
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        
+        if window_type == 'sell_item':
+            x_start = int(w * 0.03)
+            x_end = int(w * 0.10)
+            y_start = int(h * 0.11)
+            y_end = int(h * 0.20)
+        elif window_type == 'buy_item':
+            x_start = int(w * 0.04)
+            x_end = int(w * 0.43)
+            y_start = int(h * 0.84)
+            y_end = int(h * 0.89)
+        else:
+            return None
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
+    except Exception:
+        return None
+
+
+def detect_detail_preorder_input_roi(img, window_type: str):
+    """
+    ROI für Preorder-Eingabefelder im Detail-Fenster.
+    
+    Position: Rechts mittig im Detail-Fenster
+    
+    Buy-Item enthält:
+    - "Desired Price" Input-Feld (Preis pro Einheit)
+    - "Desired Amount" Input-Feld (Anzahl)
+    
+    Sell-Item enthält:
+    - "Set Price" Input-Feld (Preis pro Einheit)
+    - "Register Quantity" Input-Feld (Anzahl)
+    
+    CRITICAL: Diese ROI wird für Relist-Detection verwendet!
+    Sie muss BEIDE Elemente erfassen:
+    - Field-Labels (Desired Price, Desired Amount, etc.)
+    - Input-Werte (154000, 5000, etc.)
+    
+    Args:
+        img: Preprocessed image
+        window_type: 'sell_item' oder 'buy_item'
+    
+    Returns:
+        tuple (x, y, width, height) oder None
+    """
+    try:
+        h, w = _shape_hw(img)
+        
+        # Kalibrierte Werte - identisch für buy und sell!
+        x_start = int(w * 0.43)
+        x_end = int(w * 0.66)
+        y_start = int(h * 0.49)
+        y_end = int(h * 0.70)
+        
+        width = x_end - x_start
+        height = y_end - y_start
+        return (x_start, y_start, width, height)
     except Exception:
         return None
 
@@ -609,7 +756,7 @@ def preprocess(img, adaptive=True, denoise=False, fast_mode=False):
 def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi_label=None):
     """
     CRITICAL PERFORMANCE FIX: OCR mit aggressiver ROI und Speed-Optimierung.
-    Phase 2: Multi-Engine-Support (PaddleOCR, EasyOCR, Tesseract)
+    Multi-Engine-Support (EasyOCR primary, Tesseract fallback)
     
     Args:
         img: Preprocessed image
@@ -620,10 +767,9 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
     Returns:
         Extracted text string
         
-    PERFORMANCE:
-        PaddleOCR: ~300-500ms (fastest, best for game UIs)
-        EasyOCR:   ~400-700ms (fallback)
-        Tesseract: ~200-400ms (final fallback, lower accuracy)
+    PERFORMANCE (actual BDO measurements):
+        EasyOCR:   ~400-700ms (PRIMARY - best for BDO text)
+        Tesseract: ~200-400ms (fallback, lower accuracy)
     """
     # ALWAYS use ROI for transaction log area
     # This is the SINGLE BIGGEST performance improvement
@@ -642,55 +788,15 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
             else:
                 log_debug(f"[ROI] Applied: region=({x},{y},{w},{h}) - scanning only transaction log area")
     
-    result_paddle = ""
     result_easy = ""
     result_tess = ""
     ocr_confidence = None
-    paddle_confidence = None
     
     # Determine which OCR engine to use
-    # 'auto' mode uses config.OCR_ENGINE (typically 'paddle')
+    # 'auto' mode uses config.OCR_ENGINE (default: 'easyocr')
     actual_method = method
     if method == 'auto' or method == OCR_ENGINE:
         actual_method = OCR_ENGINE
-    
-    # PHASE 2: PaddleOCR (primary engine - fastest for game UIs)
-    # Ziel: ~300-500ms OCR (besser als EasyOCR)
-    if actual_method == 'paddle' or (actual_method in ['both', 'auto'] and OCR_FALLBACK_ENABLED):
-        try:
-            from ocr_engines import ocr_auto
-            
-            # Convert to RGB if needed
-            # CRITICAL: PaddleOCR needs RGB, not grayscale!
-            if target_img.ndim == 2:
-                rgb = cv2.cvtColor(target_img, cv2.COLOR_GRAY2RGB)
-            elif target_img.shape[2] == 4:
-                rgb = cv2.cvtColor(target_img, cv2.COLOR_BGRA2RGB)
-            elif target_img.shape[2] == 3:
-                # Assume BGR (OpenCV default)
-                rgb = cv2.cvtColor(target_img, cv2.COLOR_BGR2RGB)
-            else:
-                rgb = target_img
-            
-            # Use PaddleOCR with auto-fallback
-            # Higher confidence threshold for better quality
-            result_paddle = ocr_auto(
-                rgb,
-                engine='paddle',
-                fallback_enabled=OCR_FALLBACK_ENABLED,
-                confidence_threshold=0.5  # Higher threshold = better quality
-            )
-            
-            if result_paddle:
-                log_debug(f"PaddleOCR success: length={len(result_paddle)}")
-            else:
-                log_debug("PaddleOCR returned empty result")
-                
-        except Exception as e:
-            log_debug(f"PaddleOCR error: {e}")
-            # Fallback to EasyOCR if PaddleOCR fails
-            if OCR_FALLBACK_ENABLED:
-                actual_method = 'easyocr'
     
     # EasyOCR (fallback or explicit)
     if actual_method in ['easyocr', 'both']:
@@ -715,18 +821,130 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                 #   - text_threshold: 0.7 → 0.72 (slightly higher, but not too strict)
                 #   - contrast_ths: 0.3 → 0.35 (balanced)
                 #   - paragraph: True (faster grouping)
+                # 
+                # ⚡ PERFORMANCE FIX: Detail-ROIs are SMALL (~200x60px)
+                # Large canvas_size wastes GPU resources! Optimize per ROI type:
+                #   - Detail ROIs (balance, warehouse, item, preorder_input): canvas=800 (3x faster!)
+                #   - Small Overview ROIs (log, label): canvas=1200 (2x faster!)
+                #   - Large Overview ROIs (metrics): canvas=1500 (quality)
                 use_gpu_reader = easyocr_uses_gpu()
+                
+                # Determine optimal canvas_size based on ROI type and size
+                is_detail_roi = roi_label and roi_label.startswith('detail_')
+                is_preorder_input = roi_label and 'preorder_input' in roi_label
+                is_small_overview = roi_label and roi_label in ('label', 'log')
+                is_warehouse_roi = roi_label and 'warehouse' in roi_label
+                
                 if use_gpu_reader:
-                    canvas_size = 1500
+                    # ⚡ PERFORMANCE V5: EXHAUSTIVE OPTIMIZATION (2025-10-22)
+                    # Tested 6,240 configurations across 7 ROI types
+                    # Results: 15.9ms - 186ms per ROI (-59% to -85% vs previous!)
+                    #
+                    # ROI sizes:
+                    # - Warehouse Sell: 77x63=4.8k px    → 15.9ms ⚡
+                    # - Warehouse Buy: 424x35=14.8k px   → 18.0ms ⚡
+                    # - Balance: 207x63=13k px           → 18.1ms ⚡
+                    # - Item Name: 392x42=16k px         → 20.2ms ⚡
+                    # - Label: 414x224=92k px            → 56.5ms ⚡
+                    # - Log: 816x223=182k px             → 151.3ms ⚡
+                    # - Metrics: 740x448=331k px         → 186.0ms ⚡
+                    
+                    is_balance_roi = roi_label and 'balance' in roi_label
+                    is_item_name_roi = roi_label and 'item_name' in roi_label
+                    is_label_roi = roi_label and roi_label == 'label'
+                    is_log_roi = roi_label and roi_label == 'log'
+                    is_metrics_roi = roi_label and roi_label == 'metrics'
+                    
+                    # � EXHAUSTIVE BENCHMARK WINNERS (per-ROI optimal configs)
+                    if roi_label and 'warehouse_sell' in roi_label:
+                        # warehouse_sell: 15.9ms (FASTEST!)
+                        canvas_size = 500
+                        text_threshold = 0.55
+                        batch_size = 4
+                        contrast_ths = 0.22
+                        adjust_contrast = 0.40
+                        low_text = 0.40
+                        link_threshold = 0.32
+                    elif roi_label and 'warehouse_buy' in roi_label:
+                        # warehouse_buy: 18.0ms
+                        canvas_size = 400
+                        text_threshold = 0.65
+                        batch_size = 8
+                        contrast_ths = 0.32
+                        adjust_contrast = 0.25
+                        low_text = 0.32
+                        link_threshold = 0.36
+                    elif is_balance_roi:
+                        # balance: 18.1ms
+                        canvas_size = 550
+                        text_threshold = 0.55
+                        batch_size = 8
+                        contrast_ths = 0.22
+                        adjust_contrast = 0.35
+                        low_text = 0.32
+                        link_threshold = 0.36
+                    elif is_item_name_roi:
+                        # item_name: 20.2ms
+                        canvas_size = 550
+                        text_threshold = 0.60
+                        batch_size = 6
+                        contrast_ths = 0.32
+                        adjust_contrast = 0.30
+                        low_text = 0.32
+                        link_threshold = 0.36
+                    elif is_label_roi:
+                        # label: 56.5ms
+                        canvas_size = 1000
+                        text_threshold = 0.70
+                        batch_size = 8
+                        contrast_ths = 0.28
+                        adjust_contrast = 0.25
+                        low_text = 0.40
+                        link_threshold = 0.32
+                    elif is_log_roi:
+                        # log: 151.3ms
+                        canvas_size = 1200
+                        text_threshold = 0.55
+                        batch_size = 8
+                        contrast_ths = 0.22
+                        adjust_contrast = 0.35
+                        low_text = 0.36
+                        link_threshold = 0.36
+                    elif is_metrics_roi:
+                        # metrics: 186.0ms
+                        canvas_size = 600
+                        text_threshold = 0.50
+                        batch_size = 8
+                        contrast_ths = 0.28
+                        adjust_contrast = 0.35
+                        low_text = 0.36
+                        link_threshold = 0.32
+                    elif is_detail_roi or is_preorder_input:
+                        # Fallback for other detail ROIs (use balance config)
+                        canvas_size = 550
+                        text_threshold = 0.55
+                        batch_size = 8
+                        contrast_ths = 0.22
+                        adjust_contrast = 0.35
+                        low_text = 0.32
+                        link_threshold = 0.36
+                    else:
+                        # Fallback for unknown ROIs
+                        canvas_size = 700
+                        text_threshold = 0.60
+                        batch_size = 8
+                        contrast_ths = 0.28
+                        adjust_contrast = 0.30
+                        low_text = 0.36
+                        link_threshold = 0.36
                     paragraph_mode = False
-                    batch_size = 3
-                    contrast_ths = 0.28
-                    adjust_contrast = 0.30
-                    text_threshold = 0.68
-                    low_text = 0.36
-                    link_threshold = 0.36
                 else:
-                    canvas_size = 1600
+                    if is_detail_roi or is_preorder_input:
+                        canvas_size = 1000
+                    elif is_small_overview:
+                        canvas_size = 1400
+                    else:
+                        canvas_size = 1600
                     paragraph_mode = True
                     batch_size = 1
                     contrast_ths = 0.35
@@ -752,7 +970,7 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
                     batch_size=batch_size
                 )
                 if use_gpu_reader:
-                    log_debug("[EASYOCR] GPU path active (canvas=1500, batch=3, paragraph=False)")
+                    log_debug(f"[EASYOCR] GPU path active (canvas={canvas_size}, batch={batch_size}, thresh={text_threshold}, roi={roi_label or 'unknown'})")
                 else:
                     try:
                         device_name = get_easyocr_device_name()
@@ -824,7 +1042,6 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
     if method == 'both' or actual_method == 'both':
         # Compare all available results and use longest
         results = [
-            (result_paddle, "paddle"),
             (result_easy, "easyocr"),
             (result_tess, "tesseract")
         ]
@@ -833,18 +1050,12 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
         if non_empty:
             final_result, chosen_engine = max(non_empty, key=lambda x: len(x[0]))
             log_debug(f"Using {chosen_engine} result (longest: {len(final_result)} chars)")
-    elif actual_method == 'paddle' or method == 'paddle':
-        final_result = result_paddle
-        chosen_engine = "paddle"
     elif actual_method == 'easyocr' or method == 'easyocr':
         final_result = result_easy
         chosen_engine = "easyocr"
     elif actual_method == 'auto':
-        # Auto mode: prefer PaddleOCR, fallback to EasyOCR, then Tesseract
-        if result_paddle:
-            final_result = result_paddle
-            chosen_engine = "paddle"
-        elif result_easy:
+        # Auto mode: prefer EasyOCR (primary for BDO), fallback to Tesseract
+        if result_easy:
             final_result = result_easy
             chosen_engine = "easyocr"
         else:
@@ -856,7 +1067,7 @@ def extract_text(img, use_roi=True, method='auto', fast_mode=True, roi=None, roi
     
     # Logge finale OCR-Statistiken
     if final_result:
-        conf = ocr_confidence if ocr_confidence else paddle_confidence if paddle_confidence else 'N/A'
+        conf = ocr_confidence if ocr_confidence else 'N/A'
         log_debug(f"OCR complete: engine={chosen_engine}, length={len(final_result)}, confidence={conf}")
     else:
         log_debug(f"OCR returned empty result (all engines failed)")
@@ -875,10 +1086,10 @@ def ocr_image_cached(
 ):
     """
     CRITICAL PERFORMANCE FIX: Run OCR with cache support and fast mode.
-    Phase 2: Supports PaddleOCR (default), EasyOCR, and Tesseract.
+    Supports EasyOCR (primary) and Tesseract (fallback).
     
     Args:
-        method: 'auto' (uses config.OCR_ENGINE), 'paddle', 'easyocr', 'tesseract', or 'both'
+        method: 'auto' (uses config.OCR_ENGINE='easyocr'), 'easyocr', 'tesseract', or 'both'
         fast_mode: Use fast preprocessing and OCR (default True for <1s response)
     """
     global _screenshot_cache, _cache_totals
@@ -925,12 +1136,18 @@ def ocr_image_cached(
             del _screenshot_cache[cache_key]
 
     # Cache miss: perform preprocessing/OCR outside of cache lock
+    t_start = time.time()
+    t_prep = 0.0
     if preprocessed is None:
-        # BALANCED: Use adaptive preprocessing for quality, but skip denoise for speed
-        # Fast mode parameter is passed but adaptive is always True for quality
-        preprocessed = preprocess(img, adaptive=True, denoise=False, fast_mode=False)
+        # ⚡ PERFORMANCE FIX: Use fast_mode to skip unnecessary CLAHE on small ROIs
+        # Detail ROIs are already well-contrasted, CLAHE adds ~100-200ms overhead!
+        t_prep_start = time.time()
+        preprocessed = preprocess(img, adaptive=True, denoise=False, fast_mode=fast_mode)
+        t_prep = (time.time() - t_prep_start) * 1000
+        log_debug(f"[ROI-PREP] {roi_label or 'unknown'}: {t_prep:.1f}ms (fast_mode={fast_mode})")
 
     # BALANCED: Use balanced OCR parameters (updated in extract_text)
+    t_ocr_start = time.time()
     result = extract_text(
         preprocessed,
         use_roi=use_roi,
@@ -939,6 +1156,9 @@ def ocr_image_cached(
         roi=roi_to_use,
         roi_label=roi_label,
     )
+    t_ocr = (time.time() - t_ocr_start) * 1000
+    t_total = (time.time() - t_start) * 1000
+    log_debug(f"[ROI-TIMING] {roi_label or 'unknown'}: prep={t_prep:.1f}ms ocr={t_ocr:.1f}ms total={t_total:.1f}ms")
 
     with _cache_lock:
         _screenshot_cache[cache_key] = (now, result, 0)
@@ -964,7 +1184,7 @@ def ocr_image_cached(
 
 
 def capture_and_ocr_cached(region, method='auto', use_roi=True):
-    """Capture a region and run cached OCR (thread-safe). Uses PaddleOCR by default."""
+    """Capture a region and run cached OCR (thread-safe). Uses EasyOCR by default (config.OCR_ENGINE)."""
     img = capture_region(region)
     return ocr_image_cached(img, method=method, use_roi=use_roi)
 
@@ -1397,8 +1617,10 @@ def detect_window_type(ocr_text: str) -> str:
     buy_max = has_candidate(["max", "m4x", "rnax"])
     buy_min = has_candidate(["min", "m1n", "mln", "rnin"])
 
-    buy_detail = buy_core and buy_max and buy_min
-    sell_detail = sell_core and sell_max and sell_min
+    # Detail-Fenster: Core-Keyword + (MIN ODER MAX)
+    # Robuster gegen Layout-Varianten und OCR-Fehler
+    buy_detail = buy_core and (buy_max or buy_min)
+    sell_detail = sell_core and (sell_max or sell_min)
 
     if buy_detail and sell_detail:
         buy_pos = phrase_index("desired price")
