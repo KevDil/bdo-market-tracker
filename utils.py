@@ -1613,14 +1613,27 @@ def detect_window_type(ocr_text: str) -> str:
     sell_core = has_candidate(["set price"])
     sell_max = has_candidate(["max", "m4x", "rnax"])
     sell_min = has_candidate(["min", "m1n", "mln", "rnin"])
+    sell_extra = has_candidate([
+        "register quantity",
+        "total price",
+        "confirm sell",
+        "sell confirm",
+    ])
+
     buy_core = has_candidate(["desired price"])
     buy_max = has_candidate(["max", "m4x", "rnax"])
     buy_min = has_candidate(["min", "m1n", "mln", "rnin"])
+    buy_extra = has_candidate([
+        "desired amount",
+        "continue",
+        "capacity",
+        "confirm purchase",
+    ])
 
-    # Detail-Fenster: Core-Keyword + (MIN ODER MAX)
+    # Detail-Fenster: Core-Keyword + (MIN ODER MAX oder zusätzliche Detail-Tokens)
     # Robuster gegen Layout-Varianten und OCR-Fehler
-    buy_detail = buy_core and (buy_max or buy_min)
-    sell_detail = sell_core and (sell_max or sell_min)
+    buy_detail = buy_core and ((buy_max or buy_min) or buy_extra)
+    sell_detail = sell_core and ((sell_max or sell_min) or sell_extra)
 
     if buy_detail and sell_detail:
         buy_pos = phrase_index("desired price")

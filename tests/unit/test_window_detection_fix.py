@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Integration-Test für Window Detection Fix
-Tests die abgeänderte Option 1: Core-Keyword + (MIN ODER MAX)
+Tests die kombinierten Heuristiken: Core-Keyword + (MIN/MAX oder Detail-Tokens)
 """
 
 from utils import detect_window_type
@@ -66,20 +66,18 @@ def test_sell_item_with_min_only():
     assert result == 'sell_item', f"Expected 'sell_item', got '{result}'"
 
 def test_buy_item_no_scale_fields():
-    """Buy-Item sollte NICHT erkannt werden ohne MIN/MAX"""
+    """Buy-Item sollte NICHT erkannt werden ohne zusätzliche Detail-Tokens"""
     ocr_text = """
     Desired Price 
-    Desired Amount
     """
     result = detect_window_type(ocr_text)
     print(f"✅ Test 6: Buy-Item ohne MIN/MAX → '{result}' (expected: NOT 'buy_item')")
     assert result != 'buy_item', f"Should not detect buy_item without MIN/MAX, got '{result}'"
 
 def test_sell_item_no_scale_fields():
-    """Sell-Item sollte NICHT erkannt werden ohne MIN/MAX"""
+    """Sell-Item sollte NICHT erkannt werden ohne zusätzliche Detail-Tokens"""
     ocr_text = """
     Set Price
-    Register Quantity
     """
     result = detect_window_type(ocr_text)
     print(f"✅ Test 7: Sell-Item ohne MIN/MAX → '{result}' (expected: NOT 'sell_item')")
@@ -99,6 +97,51 @@ def test_real_ocr_from_logs():
     print(f"✅ Test 8: Real OCR (Powder of Flame) → '{result}' (expected: 'buy_item')")
     assert result == 'buy_item', f"Expected 'buy_item', got '{result}'"
 
+def test_buy_item_with_detail_tokens_only():
+    """Buy-Item sollte mit Desired Price + Capacity erkannt werden"""
+    ocr_text = """
+    Desired Price
+    Capacity 10 / 11,000 VT
+    Desired Amount
+    """
+    result = detect_window_type(ocr_text)
+    print(f"✅ Test 9: Buy-Item mit Detail-Token → '{result}' (expected: 'buy_item')")
+    assert result == 'buy_item', f"Expected 'buy_item', got '{result}'"
+
+def test_sell_item_with_detail_tokens_only():
+    """Sell-Item sollte mit Set Price + Confirm Sell erkannt werden"""
+    ocr_text = """
+    Set Price
+    Confirm Sell
+    """
+    result = detect_window_type(ocr_text)
+    print(f"✅ Test 10: Sell-Item mit Detail-Token → '{result}' (expected: 'sell_item')")
+    assert result == 'sell_item', f"Expected 'sell_item', got '{result}'"
+
+def test_buy_item_with_detail_tokens_and_max():
+    """Buy-Item sollte mit Desired Price + Capacity + MAX erkannt werden"""
+    ocr_text = """
+    Desired Price
+    Capacity 10 / 11,000 VT
+    MAX 2,370
+    Desired Amount
+    """
+    result = detect_window_type(ocr_text)
+    print(f"✅ Test 11: Buy-Item mit Detail-Token und MAX → '{result}' (expected: 'buy_item')")
+    assert result == 'buy_item', f"Expected 'buy_item', got '{result}'"
+
+def test_sell_item_with_detail_tokens_and_min():
+    """Sell-Item sollte mit Set Price + Confirm Sell + MIN erkannt werden"""
+    ocr_text = """
+    Set Price
+    Confirm Sell
+    MIN 1,000
+    Register Quantity
+    """
+    result = detect_window_type(ocr_text)
+    print(f"✅ Test 12: Sell-Item mit Detail-Token und MIN → '{result}' (expected: 'sell_item')")
+    assert result == 'sell_item', f"Expected 'sell_item', got '{result}'"
+
 if __name__ == "__main__":
     print("=" * 80)
     print("WINDOW DETECTION FIX - Integration Tests")
@@ -115,6 +158,10 @@ if __name__ == "__main__":
         test_buy_item_no_scale_fields,
         test_sell_item_no_scale_fields,
         test_real_ocr_from_logs,
+        test_buy_item_with_detail_tokens_only,
+        test_sell_item_with_detail_tokens_only,
+        test_buy_item_with_detail_tokens_and_max,
+        test_sell_item_with_detail_tokens_and_min,
     ]
     
     passed = 0

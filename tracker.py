@@ -231,6 +231,7 @@ class MarketTracker:
         self._detail_window_active = False  # True wenn in Detail-Fenster (buy_item/sell_item)
         self._detail_window_type = None  # 'sell_item' oder 'buy_item'
         self._detail_window_item = None  # Item-Name aus Detail-Fenster
+        self._detail_window_hint: str | None = None  # Fallback-Klassifikation aus Label-OCR
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -572,6 +573,12 @@ class MarketTracker:
                 elif any(keyword in label_lower for keyword in ["desired price", "desired amount"]):
                     detail_window_type_hint = "buy_item"
 
+            if detail_window_detected:
+                if detail_window_type_hint:
+                    self._detail_window_hint = detail_window_type_hint
+            elif not self._detail_window_active and self._detail_window_hint:
+                self._detail_window_hint = None
+
             if allow_debug and self.debug:
                 self._write_debug_images(
                     original_bgr=img,
@@ -648,6 +655,7 @@ class MarketTracker:
             # 
             # ALTE LOGIK (FALSCH): 5-Sekunden-Timer + "not overview_anchor" -> ständiges Auslesen
             # NEUE LOGIK: Nur bei Fensterwechsel, Burst oder Detail-Hinweisen
+            now_dt = datetime.datetime.now()
             refresh_metrics = False
             metrics_text = ""
             if self._needs_metrics_text:
@@ -751,6 +759,7 @@ class MarketTracker:
                         detected_detail_type = None
                 
                 if detected_detail_type:
+                    self._detail_window_hint = detected_detail_type
                     # Import Detail-ROI-Funktionen
                     from utils import detect_detail_item_name_roi, detect_detail_balance_roi, detect_detail_warehouse_roi
                     
@@ -5078,6 +5087,12 @@ class MarketTracker:
         # Fenster-Typ erkennen und State updaten
         prev_window = self.current_window
         detected_wtype = detect_window_type(full_text)
+        if detected_wtype == "unknown":
+            detail_hint_type = self._detail_window_hint or getattr(self, "_detail_window_type", None)
+            if detail_hint_type in ("buy_item", "sell_item"):
+                detected_wtype = detail_hint_type
+                if self.debug:
+                    log_debug(f"[WINDOW] Fallback to detail hint → {detected_wtype}")
         now = datetime.datetime.now()
         
         # HYSTERESIS: Require 2 consecutive same detections before accepting transition
