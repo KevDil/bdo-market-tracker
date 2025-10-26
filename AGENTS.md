@@ -101,6 +101,7 @@
 - Sync this file with actual behaviour and archive references whenever configuration, cases, or invariants change.
 
 ## Safety, Configuration & No-Go Items
+- **Long-Running Auto-Track Mode**: The application is designed to run continuously for hours in auto-track mode. All optimizations (caching, polling intervals, ROI usage) must maintain stability and performance over extended periods without memory leaks, performance degradation, or false positives. Never introduce changes that could cause issues after 2+ hours of continuous operation.
 - Maintain the focus guard, ROI bounds, caching, and content-hash dedupe. Disabling these invites duplicate writes and OCR noise.
 - Do not introduce system-time fallbacks for timestamps or bypass item whitelist validation to force saves.
 - Avoid blocking operations inside the capture loop; network calls (BDO API) and DB writes must occur after OCR completes.

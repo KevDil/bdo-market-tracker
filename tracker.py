@@ -11,7 +11,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from functools import lru_cache
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 from config import (
     DEFAULT_REGION,
@@ -246,6 +246,7 @@ class MarketTracker:
         self._detail_partial_warehouse_delta = 0  # Akkumulierter Warehouse-Delta
         self._detail_balance_delta_timestamp = None  # Zeitpunkt des ersten balance_delta (für Timeout)
         self._force_detail_metric_refresh = False
+        self._detail_last_delta_activity: datetime.datetime | None = None
 
         # Preorder duplicate guard
         self._recent_preorder_hashes: dict[tuple[str, int, int, int], float] = {}
@@ -290,6 +291,35 @@ class MarketTracker:
         }
         self._roi_force_refresh_threshold = 10  # Force-Refresh nach N Skips
         self._metrics_refresh_failures = 0  # Counter für ROI-Detection-Failures
+        
+        # === Bedarfsgesteuerte ROI-OCR Flags (Phase 1) ===
+        self._needs_log_text = True          # Log-ROI wird initial benötigt
+        self._needs_metrics_text = False     # Metrics-ROI nur bei Bedarf
+        self._needs_detail_balance = False   # Detail-Balance-ROI Bedarf
+        self._needs_detail_warehouse = False # Detail-Warehouse-ROI Bedarf
+        self._needs_detail_inputs = False    # Detail-Input-ROI Bedarf
+
+        # ROI-Usage Tracking (pro Scan & Session)
+        self._roi_usage_last_scan = {
+            'label': 'not_run',
+            'log': 'not_run',
+            'metrics': 'not_run',
+            'detail_balance': 'not_run',
+            'detail_warehouse': 'not_run',
+            'detail_inputs': 'not_run',
+        }
+        self._roi_usage_session_stats = {
+            'scans_total': 0,
+            'label': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'log': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'metrics': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_balance': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_warehouse': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_inputs': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+        }
+
+        # Detail-Window State Machine (idle → baseline → delta)
+        self._detail_metric_state = 'idle'
         
         # Window-Detection-Hysteresis: Requires 2 consecutive same detections
         self._window_detection_history = []  # Last 3 detections
@@ -351,6 +381,16 @@ class MarketTracker:
         detail_window_detected = False
 
         try:
+            # Reset ROI usage tracking for this scan
+            self._roi_usage_last_scan = {
+                'label': 'not_run',
+                'log': 'not_run',
+                'metrics': 'not_run',
+                'detail_balance': 'not_run',
+                'detail_warehouse': 'not_run',
+                'detail_inputs': 'not_run',
+            }
+
             use_fast_preprocess = self._use_fast_preprocess and self._fast_preprocess_cooldown <= 0
             if not use_fast_preprocess and self._fast_preprocess_cooldown > 0:
                 # count down cooldown after each slow run
@@ -501,6 +541,7 @@ class MarketTracker:
                         metrics["label_cache_hit"] = bool(label_cached)
                         metrics["label_cache_age_s"] = label_stats.get("cache_age")
                         metrics["label_ms"] = label_ms
+                    self._roi_usage_last_scan['label'] = 'cache' if label_cached else 'ocr'
                 else:
                     # Use cached result from last scan
                     label_text = self._last_roi_results["label"]
@@ -508,7 +549,10 @@ class MarketTracker:
                     if metrics is not None:
                         metrics["roi_label_skipped"] = True
                         metrics["label_ms"] = 0.0
-            
+                    self._roi_usage_last_scan['label'] = 'cache'
+            else:
+                self._roi_usage_last_scan['label'] = 'failed'
+
             cached_label = self._last_label_text if not label_text else label_text
             label_lower = (cached_label or "").lower()
 
@@ -541,90 +585,63 @@ class MarketTracker:
                     window_type=detail_window_type_hint,
                 )
 
-            # Decide if we need the log OCR: only for overview windows or when label is missing.
-            need_log_ocr = not detail_window_detected or not cached_label
-            
             text = ""
-            ocr_time = 0.0
             was_cached = False
+            log_stats: dict[str, Any] | dict = {}
+            log_ms = 0.0
             log_roi_skipped = False
-            cache_stats = {"hit_rate": 0.0, "cache_size": 0, "cache_age": None}
-            
-            if need_log_ocr:
-                if roi_changed["log"]:
-                    ocr_start = time.perf_counter()
-                    text, was_cached, cache_stats = ocr_image_cached(
+
+            if detail_window_detected:
+                # Detail-Fenster enthalten keinen Log-Text – Log-OCR überspringen
+                self._roi_usage_last_scan['log'] = 'skipped'
+                log_roi_skipped = True
+                if self._needs_log_text:
+                    self._set_need_flag('log_text', False, "detail_window_skip")
+            else:
+                if log_roi and (roi_changed["log"] or force_refresh or self._needs_log_text):
+                    log_start = time.perf_counter()
+                    text, was_cached, log_stats = ocr_image_cached(
                         img,
                         method='auto',
                         use_roi=True,
                         preprocessed=proc,
-                        fast_mode=True,
+                        fast_mode=use_fast_preprocess,
+                        roi=log_roi,
                         roi_label="log",
+                        cache_tag="log",
                     )
-                    ocr_elapsed = time.perf_counter() - ocr_start
-                    ocr_time = ocr_elapsed * 1000
-                    if text:
-                        self._last_roi_results["log"] = text
-                    if self.debug:
-                        cache_indicator = " [CACHED]" if was_cached else ""
-                        log_debug(
-                            f"{perf_prefix} OCR: {ocr_time:.1f}ms{cache_indicator} (BALANCED) "
-                            f"(cache_hit_rate={cache_stats.get('hit_rate', 0.0):.1f}%)"
-                        )
-                else:
-                    # Use cached result from ROI-Diffing
+                    log_ms = (time.perf_counter() - log_start) * 1000
+                    self._roi_usage_last_scan['log'] = 'cache' if was_cached else 'ocr'
+                    self._last_roi_results["log"] = text or ""
+                    self._latest_log_text = text or ""
+                    self._set_need_flag('log_text', False, "log_ocr_success" if text else "log_ocr_empty")
+                elif log_roi:
                     text = self._last_roi_results["log"]
+                    self._latest_log_text = text or ""
+                    self._roi_usage_last_scan['log'] = 'cache'
                     log_roi_skipped = True
-                    if self.debug:
-                        log_debug(f"{perf_prefix} Log-OCR skipped via ROI-Diff")
-                    if metrics is not None:
-                        metrics["roi_log_skipped"] = True
-            else:
-                if self.debug:
-                    log_debug(f"{perf_prefix} Skip log OCR (detail window detected via label)")
+                    self._set_need_flag('log_text', False, "log_cache_hit")
+                else:
+                    self._roi_usage_last_scan['log'] = 'failed'
+                    self._latest_log_text = ""
+                    self._set_need_flag('log_text', True, "log_roi_missing")
+                    text = ""
 
             if metrics is not None:
-                metrics["ocr_ms"] = ocr_time
-                metrics["ocr_cache_hit"] = bool(was_cached)
-                metrics["ocr_cache_age_s"] = cache_stats.get("cache_age")
-                metrics["ocr_cache_size"] = cache_stats.get("cache_size")
+                if log_roi_skipped:
+                    metrics["roi_log_skipped"] = True
+                if self._roi_usage_last_scan['log'] == 'failed':
+                    metrics["roi_log_failed"] = True
+                metrics["log_ms"] = log_ms
+                metrics["log_cache_hit"] = bool(was_cached)
+                if isinstance(log_stats, dict):
+                    metrics["log_cache_age_s"] = log_stats.get("cache_age")
+                    metrics["log_cache_size"] = log_stats.get("cache_size")
 
-            self._log_capture_failed = bool(need_log_ocr and not (text or "").strip())
-            if not need_log_ocr:
-                self._log_capture_failed = False
-            self._latest_log_text = text if need_log_ocr else ""
+            if detail_window_detected:
+                # Detail-Fenster: letzte Log-Erkennung behalten (für Fallbacks)
+                text = ""
 
-            current_device = get_easyocr_device_name()
-            if current_device != self._easyocr_device:
-                self._easyocr_device = current_device
-                self._easyocr_uses_gpu = easyocr_uses_gpu()
-                if metrics is not None:
-                    metrics["easyocr_device"] = self._easyocr_device
-                if self.debug:
-                    log_debug(f"[EASYOCR] Device updated -> {self._easyocr_device}")
-
-            self._scan_counter += 1
-
-            text_lower = (text or "").lower()
-
-            metrics_text = ""
-            overview_anchor = bool(
-                re.search(
-                    r"(sales\s+completed|orders\s+completed|items\s+listed)",
-                    label_lower,
-                )
-            )
-            if not overview_anchor:
-                overview_anchor = bool(
-                    re.search(
-                        r"(sales\s+completed|orders\s+completed)",
-                        text_lower,
-                    )
-                )
-            detail_hint = bool(re.search(r"(set\s*price|desired\s*price)", label_lower))
-            detail_window_detected = detail_hint and not overview_anchor
-            now_dt = datetime.datetime.now()
-            
             # CRITICAL FIX: Metrics-ROI wird NUR bei echten Transaktionen gebraucht!
             # Laut AGENTS.md: "Detail-/Metrics-ROI wird nach Fensterwechseln, Burst-Rescans, 
             # Detail-Hinweisen oder wenn im Fenster-Label keine Overview-Anker erkannt werden sofort neu ausgelesen"
@@ -632,28 +649,25 @@ class MarketTracker:
             # ALTE LOGIK (FALSCH): 5-Sekunden-Timer + "not overview_anchor" -> ständiges Auslesen
             # NEUE LOGIK: Nur bei Fensterwechsel, Burst oder Detail-Hinweisen
             refresh_metrics = False
-            if self._pending_metrics_refresh:
-                # Nach Fensterwechsel einmalig aktualisieren
+            metrics_text = ""
+            if self._needs_metrics_text:
+                refresh_metrics = True
+            elif self._pending_metrics_refresh:
                 refresh_metrics = True
             elif self._scan_counter <= 1:
-                # Erster Scan
                 refresh_metrics = True
             elif self._request_immediate_rescan > 0:
-                # Nach Burst-Rescan (Item-Fenster -> Overview)
                 refresh_metrics = True
-            elif detail_hint:
-                # Detail-Fenster erkannt (Set Price / Desired Price)
+            elif detail_hint and not detail_window_detected:
                 refresh_metrics = True
-            
-            # REMOVED: 5-Sekunden-Timer und "not overview_anchor" Bedingung
-            # Diese führten zu ständigem Auslesen auch ohne Transaktionen
-            
+
             metrics_refresh_ran = False
             metrics_roi_skipped = False
             if detail_window_detected:
                 refresh_metrics = False
                 self._pending_metrics_refresh = True
-            
+                self._roi_usage_last_scan['metrics'] = 'not_run'
+
             if refresh_metrics and roi_changed["metrics"]:
                 # Metrics-ROI hat sich geändert UND Refresh ist angefordert
                 if metrics_roi:
@@ -679,6 +693,8 @@ class MarketTracker:
                     self._metrics_refresh_failures = 0  # Reset counter on success
                     self._last_metrics_refresh_time = now_dt  # Update rate-limiting timer
                     self._last_metrics_refresh_ts = now_dt
+                    self._roi_usage_last_scan['metrics'] = 'cache' if metrics_cached else 'ocr'
+                    self._set_need_flag('metrics_text', False, "metrics_ocr_success")
                 else:
                     # ROI detection failed - count failure
                     self._metrics_refresh_failures += 1
@@ -688,6 +704,7 @@ class MarketTracker:
                         self._metrics_refresh_failures = 0
                         if self.debug:
                             log_debug("[ROI-STATS] Cleared stuck metrics_refresh after 3 ROI detection failures")
+                        self._set_need_flag('metrics_text', False, "metrics_detection_failed")
                     else:
                         # Retry on next scan
                         self._pending_metrics_refresh = True
@@ -704,8 +721,17 @@ class MarketTracker:
                 self._pending_metrics_refresh = False  # Mark as refreshed
                 self._metrics_refresh_failures = 0  # Reset counter
                 self._last_metrics_refresh_ts = now_dt
+                self._roi_usage_last_scan['metrics'] = 'cache'
+                self._set_need_flag('metrics_text', False, "metrics_cache_hit")
             if metrics is not None:
                 metrics["metrics_refresh"] = metrics_refresh_ran
+            if not refresh_metrics and not detail_window_detected:
+                self._roi_usage_last_scan['metrics'] = 'skipped'
+                if self._needs_metrics_text:
+                    self._set_need_flag('metrics_text', False, "metrics_skip_overview")
+            if refresh_metrics and not metrics_roi:
+                self._roi_usage_last_scan['metrics'] = 'failed'
+                self._set_need_flag('metrics_text', False, "metrics_roi_missing")
             cached_metrics = self._last_metrics_text if not metrics_text else metrics_text
             if detail_window_detected:
                 cached_metrics = ""
@@ -729,16 +755,9 @@ class MarketTracker:
                     from utils import detect_detail_item_name_roi, detect_detail_balance_roi, detect_detail_warehouse_roi
                     
                     # ⚡ PERFORMANCE FIX: Cache Item Name across scans
-                    # Item name NEVER changes during Detail-Window session
-                    # Skip OCR if we already have it from previous scan
-                    item_name_text = ""
-                    if self._detail_window_active and self._detail_window_item:
-                        # Reuse cached item name (saves ~400ms OCR!)
-                        item_name_text = self._detail_window_item
-                        if self.debug:
-                            log_debug(f"[DETAIL-PERF] ⚡ Reusing cached item name: {item_name_text}")
-                    else:
-                        # First scan or no cache → Extract Item-Name-ROI
+                    # Item name NEVER changes während einer Detail-Session
+                    item_name_text = self._detail_window_item or ""
+                    if not item_name_text:
                         item_name_roi = detect_detail_item_name_roi(proc, detected_detail_type)
                         if item_name_roi:
                             item_name_text, _, _ = ocr_image_cached(
@@ -751,12 +770,17 @@ class MarketTracker:
                                 roi_label="detail_item_name",
                                 cache_tag="detail_item_name",
                             )
-                    
-                    # Extrahiere Balance-ROI
+                            if item_name_text:
+                                self._detail_window_item = item_name_text
+
+                    balance_text = self._last_detail_balance_text if hasattr(self, "_last_detail_balance_text") else ""
+                    warehouse_text = self._last_detail_warehouse_text if hasattr(self, "_last_detail_warehouse_text") else ""
+
                     balance_roi = detect_detail_balance_roi(proc, detected_detail_type)
-                    balance_text = ""
-                    if balance_roi:
-                        balance_text, _, _ = ocr_image_cached(
+                    warehouse_roi = detect_detail_warehouse_roi(proc, detected_detail_type)
+
+                    if balance_roi and self._needs_detail_balance:
+                        balance_text, balance_cached, _ = ocr_image_cached(
                             img,
                             method='auto',
                             use_roi=True,
@@ -766,12 +790,18 @@ class MarketTracker:
                             roi_label="detail_balance",
                             cache_tag="detail_balance",
                         )
-                    
-                    # Extrahiere Warehouse-ROI
-                    warehouse_roi = detect_detail_warehouse_roi(proc, detected_detail_type)
-                    warehouse_text = ""
-                    if warehouse_roi:
-                        warehouse_text, _, _ = ocr_image_cached(
+                        self._last_detail_balance_text = balance_text or ""
+                        self._roi_usage_last_scan['detail_balance'] = 'cache' if balance_cached else 'ocr'
+                        self._set_need_flag('detail_balance', False, "detail_balance_ocr")
+                    elif balance_roi:
+                        self._roi_usage_last_scan['detail_balance'] = 'skipped'
+                    elif balance_text:
+                        self._roi_usage_last_scan['detail_balance'] = 'cache'
+                    else:
+                        self._roi_usage_last_scan['detail_balance'] = 'not_run'
+
+                    if warehouse_roi and self._needs_detail_warehouse:
+                        warehouse_text, warehouse_cached, _ = ocr_image_cached(
                             img,
                             method='auto',
                             use_roi=True,
@@ -781,7 +811,21 @@ class MarketTracker:
                             roi_label="detail_warehouse",
                             cache_tag="detail_warehouse",
                         )
-                    
+                        self._last_detail_warehouse_text = warehouse_text or ""
+                        self._roi_usage_last_scan['detail_warehouse'] = 'cache' if warehouse_cached else 'ocr'
+                        self._set_need_flag('detail_warehouse', False, "detail_warehouse_ocr")
+                    elif warehouse_roi:
+                        self._roi_usage_last_scan['detail_warehouse'] = 'skipped'
+                    elif warehouse_text:
+                        self._roi_usage_last_scan['detail_warehouse'] = 'cache'
+                    else:
+                        self._roi_usage_last_scan['detail_warehouse'] = 'not_run'
+
+                    if not hasattr(self, "_last_detail_balance_text"):
+                        self._last_detail_balance_text = balance_text
+                    if not hasattr(self, "_last_detail_warehouse_text"):
+                        self._last_detail_warehouse_text = warehouse_text
+
                     # Kombiniere Detail-Window-Text
                     detail_parts = []
                     if item_name_text:
@@ -804,6 +848,9 @@ class MarketTracker:
             elif text:
                 # Bei Overview-Fenstern: Log-Text
                 combined_parts.append(text)
+            if not detail_window_detected:
+                self._last_detail_balance_text = ""
+                self._last_detail_warehouse_text = ""
             if cached_metrics and not detail_window_detected:
                 # Metrics nur bei Overview-Fenstern
                 combined_parts.append(cached_metrics)
@@ -858,6 +905,26 @@ class MarketTracker:
             if self.error_count > 0:
                 self.error_count = max(0, self.error_count - 1)
 
+            # ROI usage aggregation & debug output (Phase 1 instrumentation)
+            self._roi_usage_session_stats['scans_total'] += 1
+            for roi_name, status in self._roi_usage_last_scan.items():
+                roi_stats = self._roi_usage_session_stats.get(roi_name)
+                if not roi_stats:
+                    continue
+                if status in roi_stats:
+                    roi_stats[status] += 1
+
+            if self.debug or get_debug_mode('roi_stats'):
+                ocr_count = sum(1 for status in self._roi_usage_last_scan.values() if status == 'ocr')
+                cache_count = sum(1 for status in self._roi_usage_last_scan.values() if status == 'cache')
+                skip_count = sum(1 for status in self._roi_usage_last_scan.values() if status == 'skipped')
+                failed_count = sum(1 for status in self._roi_usage_last_scan.values() if status == 'failed')
+                log_debug(
+                    f"[ROI-STATS] Scan #{self._scan_counter}: "
+                    f"OCR={ocr_count}, Cache={cache_count}, Skipped={skip_count}, Failed={failed_count} | "
+                    f"Details: {self._roi_usage_last_scan}"
+                )
+
             return text
         except Exception as exc:
             if self.debug:
@@ -872,6 +939,107 @@ class MarketTracker:
             self._fast_preprocess_cooldown = max(self._fast_preprocess_cooldown, 5)
             self._fast_preprocess_recovery = 0
             return None
+
+    def _set_need_flag(self, flag_name: str, value: bool, reason: str = "") -> None:
+        """Setzt Bedarf-Flags für ROI-OCR mit optionalem Debug-Log."""
+        attr_name = f"_needs_{flag_name}"
+        if not hasattr(self, attr_name):
+            if self.debug:
+                log_debug(f"[ROI-FLAG] Ignoring unknown flag '{flag_name}' (reason: {reason})")
+            return
+
+        current_value = getattr(self, attr_name)
+        if current_value == value:
+            return
+
+        setattr(self, attr_name, value)
+        if self.debug:
+            action = "ENABLED" if value else "DISABLED"
+            log_debug(f"[ROI-FLAG] {flag_name}: {action} | Reason: {reason}")
+
+    def _schedule_metrics_refresh(self, reason: str = "") -> None:
+        """Plant Metrics-ROI-OCR mit einfachem Rate-Limiting."""
+        now = datetime.datetime.now()
+        time_since_last_refresh = None
+        if self._last_metrics_refresh_time is not None:
+            time_since_last_refresh = (now - self._last_metrics_refresh_time).total_seconds()
+
+        is_burst = (self._burst_until and now < self._burst_until) or self._request_immediate_rescan > 0
+        if is_burst or time_since_last_refresh is None or time_since_last_refresh >= 1.0:
+            self._pending_metrics_refresh = True
+            self._set_need_flag('metrics_text', True, reason or "schedule_metrics_refresh")
+        else:
+            if self.debug:
+                log_debug(
+                    f"[METRICS-REFRESH] Skipped (rate limit {time_since_last_refresh:.2f}s < 1.0s) | Reason: {reason}"
+                )
+            self._pending_metrics_refresh = True
+            self._set_need_flag('metrics_text', True, "metrics_refresh_rate_limited")
+
+    DETAIL_DELTA_IDLE_TIMEOUT = 2.5  # seconds of inactivity allowed in delta-state before reverting to baseline
+
+    def _set_detail_metric_state(self, state: str, reason: str = "") -> None:
+        """Verwaltet den Detail-Window-State (idle/baseline/delta) und zugehörige Flags."""
+        valid_states = ("idle", "baseline", "delta")
+        if state not in valid_states:
+            if self.debug:
+                log_debug(f"[DETAIL-STATE] Invalid state '{state}' (reason: {reason})")
+            return
+
+        previous_state = getattr(self, "_detail_metric_state", "idle")
+        if previous_state == state:
+            return
+
+        now = datetime.datetime.now()
+        self._detail_metric_state = state
+
+        if state == "idle":
+            self._set_need_flag('detail_balance', False, "detail_state_idle")
+            self._set_need_flag('detail_warehouse', False, "detail_state_idle")
+            self._set_need_flag('detail_inputs', False, "detail_state_idle")
+            self._detail_last_delta_activity = None
+        elif state == "baseline":
+            self._set_need_flag('detail_balance', True, "detail_state_baseline")
+            self._set_need_flag('detail_warehouse', True, "detail_state_baseline")
+            if self._detail_window_type == 'buy_item':
+                self._set_need_flag('detail_inputs', True, "detail_state_baseline")
+            self._detail_last_delta_activity = now
+        elif state == "delta":
+            # delta-state nutzt on-demand Flags, kein Default-Toggle nötig
+            self._detail_last_delta_activity = now
+
+        if self.debug:
+            log_debug(f"[DETAIL-STATE] {previous_state} → {state} | Reason: {reason}")
+
+    def get_roi_usage_summary(self) -> dict[str, Any]:
+        """Gibt aggregierte ROI-Nutzungsstatistiken der aktuellen Session zurück."""
+        summary: dict[str, Any] = {'scans_total': self._roi_usage_session_stats['scans_total']}
+        total_scans = self._roi_usage_session_stats['scans_total']
+
+        for roi_name in ['label', 'log', 'metrics', 'detail_balance', 'detail_warehouse', 'detail_inputs']:
+            roi_stats = self._roi_usage_session_stats.get(roi_name, {})
+            roi_summary = dict(roi_stats)
+            total_activations = sum(roi_stats.values())
+            roi_summary['total_activations'] = total_activations
+            if total_scans > 0:
+                roi_summary['activation_rate'] = (total_activations / total_scans) * 100.0
+            else:
+                roi_summary['activation_rate'] = 0.0
+
+            if total_activations > 0:
+                roi_summary['ocr_rate'] = (roi_stats['ocr'] / total_activations) * 100.0 if roi_stats['ocr'] else 0.0
+                roi_summary['cache_rate'] = (roi_stats['cache'] / total_activations) * 100.0 if roi_stats['cache'] else 0.0
+                roi_summary['skip_rate'] = (roi_stats['skipped'] / total_activations) * 100.0 if roi_stats['skipped'] else 0.0
+                roi_summary['failed_rate'] = (roi_stats['failed'] / total_activations) * 100.0 if roi_stats['failed'] else 0.0
+            else:
+                roi_summary['ocr_rate'] = 0.0
+                roi_summary['cache_rate'] = 0.0
+                roi_summary['skip_rate'] = 0.0
+                roi_summary['failed_rate'] = 0.0
+
+            summary[roi_name] = roi_summary
+
+        return summary
 
     def _write_debug_images(
         self,
@@ -1114,11 +1282,22 @@ class MarketTracker:
             Dict mit {'price': int, 'quantity': int} oder None
         """
         try:
+            status = 'not_run'
+
+            if not getattr(self, '_needs_detail_inputs', False):
+                if self.debug:
+                    log_debug("[PREORDER-INPUT] Skip OCR (flag disabled)")
+                status = 'skipped'
+                self._roi_usage_last_scan['detail_inputs'] = status
+                return None
+            
             # Get preorder input ROI
             roi = detect_detail_preorder_input_roi(proc_img, window_type)
             if not roi:
                 if self.debug:
                     log_debug("[PREORDER-INPUT] ROI detection failed")
+                status = 'failed'
+                self._roi_usage_last_scan['detail_inputs'] = status
                 return None
             
             # OCR des Input-Bereichs
@@ -1135,9 +1314,13 @@ class MarketTracker:
             )
             ocr_time = (time.perf_counter() - ocr_start) * 1000
             
+            status = 'cache' if was_cached else 'ocr'
+            self._roi_usage_last_scan['detail_inputs'] = status
+
             if not input_text or len(input_text) < 3:
                 if self.debug:
                     log_debug(f"[PREORDER-INPUT] OCR empty ({ocr_time:.1f}ms)")
+                # Flag aktiv lassen, damit nächster Scan erneut versucht
                 return None
             
             if self.debug:
@@ -1220,11 +1403,13 @@ class MarketTracker:
                     f"(total: {total_price:,})"
                 )
             
+            self._needs_detail_inputs = False
             return result
             
         except Exception as e:
             if self.debug:
                 log_debug(f"[PREORDER-INPUT] ERROR: {e}")
+            self._roi_usage_last_scan['detail_inputs'] = 'failed'
             return None
 
     def _check_for_preorder_autocollect(
@@ -1263,7 +1448,7 @@ class MarketTracker:
             if warehouse_delta <= 0:
                 return None
 
-            # Get base price for estimation (fallback to cached unit price if base price missing)
+            # Get base price for estimation
             base_price = self._get_base_price(item_name)
             inferred_unit_price = None
 
@@ -2847,7 +3032,6 @@ class MarketTracker:
                     )
                 self.seen_tx_signatures.append(sig)
                 return False
-
         if content_hash in self._batch_content_hashes:
             if self.debug:
                 log_debug(f"[CONTENT-HASH] Skip duplicate in batch: {item} {qty}x @ {price} (hash={content_hash})")
@@ -2881,7 +3065,7 @@ class MarketTracker:
                             # Within 20 minutes - likely OCR duplicate from same session
                             if self.debug:
                                 log_debug(f"[CONTENT-HASH] Skip duplicate: {item} {qty}x @ {price} (hash={content_hash}, time_diff={time_diff_minutes:.1f}min, existing={existing_ts_str})")
-                            print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {str(ttype or '').upper()} - {qty}x {item} (Δ{time_diff_minutes:.1f}min)")
+                            print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {str(ttype or '').upper()} - {qty}x {item}")
                             self.seen_tx_signatures.append(sig)
                             return False
                         else:
@@ -3030,12 +3214,13 @@ class MarketTracker:
                 print("DB Error beim Speichern:", e)
                 return False
 
-    def _reset_detail_window_state(self):
-        """Reset Detail-Fenster State."""
+        self._detail_window_item = None  # Cache für Item-Name im Detail-Fenster
         self._detail_window_active = False
         self._detail_window_type = None
-        self._detail_window_item = None
-        self._detail_baseline_balance = None
+        self._detail_window_opened_at: datetime.datetime | None = None
+        self._detail_baseline: dict[str, Any] | None = None
+        self._last_detail_balance_text = ""
+        self._last_detail_warehouse_text = ""
         self._detail_baseline_warehouse = None
         self._detail_last_metrics = None
         self._detail_confirmation_pending = False
@@ -3047,13 +3232,16 @@ class MarketTracker:
         self._detail_warehouse_changed_once = False
         self._detail_needs_baseline_capture = False
         self._detail_baseline_captured = False
+        self._detail_last_delta_activity = None
         self._detail_window_entry_item = None
         self._force_detail_metric_refresh = False
+        self._set_detail_metric_state("idle", "reset_state")
 
         # NEW (Phase 2): Reset preorder check state
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
+
     def _force_save_pending_transaction(self) -> bool:
         """
         Persist a pending balance-only transaction when the detail window closes.
@@ -3083,35 +3271,25 @@ class MarketTracker:
         if isinstance(candidate_price, (int, float)) and candidate_price > 0:
             desired_price = int(candidate_price)
         else:
-            cached_fields = getattr(self, '_detail_cached_input_fields', None)
-            cache_ts = getattr(self, '_detail_cached_input_timestamp', None)
-            cache_fresh = False
-            if cache_ts and isinstance(cache_ts, datetime.datetime):
-                cache_age = (datetime.datetime.now() - cache_ts).total_seconds()
-                cache_fresh = cache_age < 60.0
-            if cached_fields and cache_fresh:
-                cached_price = cached_fields.get('price')
-                if isinstance(cached_price, (int, float)) and cached_price > 0:
-                    desired_price = int(cached_price)
-                    price_source = "cached_input"
-                cached_qty = cached_fields.get('quantity')
-                if isinstance(cached_qty, (int, float)):
-                    quantity_hint = int(cached_qty)
-
-        if quantity_hint is None:
-            qty_val = metrics.get('quantity')
-            if isinstance(qty_val, (int, float)):
-                quantity_hint = int(qty_val)
+            # Fallback: try to estimate from transaction price
+            # But transaction price might be COLLECTED price (different from preorder price)
+            # Better to use base price as last resort
+            base_price = self._get_base_price(item_name)
+            desired_price = base_price if base_price else None
 
         if desired_price is None or desired_price <= 0:
             if self.debug:
-                log_debug("[DETAIL] 🔶 Pending balance-only transaction but desired price missing - skipping force-save")
+                log_debug(
+                    f"[DETAIL] 🔶 Pending balance-only transaction but desired price missing - skipping force-save"
+                )
             return False
 
         qty_estimate = total_spent / desired_price
         quantity = int(round(qty_estimate)) if qty_estimate > 0 else 0
-        if quantity <= 0 and total_spent >= desired_price:
-            quantity = total_spent // desired_price
+        if quantity_hint is None:
+            qty_val = metrics.get('quantity')
+            if isinstance(qty_val, (int, float)):
+                quantity_hint = int(qty_val)
 
         if quantity_hint and quantity <= 0:
             quantity = int(quantity_hint)
@@ -3992,6 +4170,7 @@ class MarketTracker:
             self._detail_needs_baseline_capture = False
             self._detail_detail_snapshot_ts = datetime.datetime.now()
             self._force_detail_metric_refresh = True
+            self._set_detail_metric_state("delta", "baseline_captured")
             
             # Reset Delta-Akkumulation
             self._detail_partial_balance_delta = 0
@@ -4170,6 +4349,27 @@ class MarketTracker:
             # Keine Änderung → Weiter warten
             # Update last_metrics für spätere Vergleiche
             self._detail_last_metrics = current_metrics
+
+            # Delta-State: Timeout zurück nach Baseline, wenn zu lange inaktiv
+            if self._detail_metric_state == "delta":
+                now_idle = datetime.datetime.now()
+                last_activity = self._detail_last_delta_activity
+                if last_activity is None:
+                    self._detail_last_delta_activity = now_idle
+                else:
+                    try:
+                        elapsed_idle = (now_idle - last_activity).total_seconds()
+                    except Exception:
+                        elapsed_idle = 0.0
+                    if elapsed_idle >= self.DETAIL_DELTA_IDLE_TIMEOUT:
+                        if self.debug:
+                            log_debug(f"[DETAIL] Delta idle for {elapsed_idle:.2f}s → fallback to baseline")
+                        self._set_detail_metric_state("baseline", "delta_idle_timeout")
+                        self._detail_needs_baseline_capture = True
+                        self._force_detail_metric_refresh = True
+                        self._detail_last_delta_activity = now_idle
+                        return
+
             # Update Item-Name falls jetzt erkannt
             if not self._detail_window_item and current_metrics.get('item_name'):
                 self._detail_window_item = self._normalize_detail_item_name(current_metrics.get('item_name'))
@@ -4210,9 +4410,11 @@ class MarketTracker:
         if balance_changed_this_scan:
             self._detail_balance_changed_once = True
             self._force_detail_metric_refresh = True
+            self._detail_last_delta_activity = datetime.datetime.now()
         if warehouse_changed_this_scan:
             self._detail_warehouse_changed_once = True
             self._force_detail_metric_refresh = True
+            self._detail_last_delta_activity = datetime.datetime.now()
         
         if self.debug:
             balance_delta = current_balance - self._detail_baseline_balance if self._detail_baseline_balance is not None else 0
@@ -4250,6 +4452,7 @@ class MarketTracker:
                 log_debug(f"[DETAIL]    Waiting for both values to update before plausibility check...")
             # Update last_metrics trotzdem (für nächsten Scan)
             self._detail_last_metrics = current_metrics
+            self._detail_last_delta_activity = datetime.datetime.now()
             return
         
         # ===== NEW: PREORDER PLACEMENT DETECTION =====
@@ -4842,7 +5045,33 @@ class MarketTracker:
         - gruppiere transaction entries mit listed/withdrew bei gleichem timestamp (oder nahe)
         - bestimme finalen case (collect / relist_full / relist_partial)
         - speichere nur neue Transaktionen (neue im Vergleich zur letzten OCR-Ausgabe)
+
+        === ROI-FLAG-KONSUMENTEN (Phase 1 Logging) ===
+
+        `_needs_log_text`
+            Gesetzt: bei Overview-Fenstern oder wenn kein Label erkannt wird.
+            Verwendet: Scan-Pipeline entscheidet, ob Log-ROI erneut OCR benötigt.
+            Zurückgesetzt: nach erfolgreichem Log-OCR oder wenn Detail-Fenster aktiv ist.
+
+        `_needs_metrics_text`
+            Gesetzt: durch `_schedule_metrics_refresh()` (Fensterwechsel, UI-Inferenz, Burst-Scans).
+            Verwendet: Metrics-ROI wird nur bei aktivem Flag evaluiert.
+            Zurückgesetzt: nach erfolgreichem Metrics-OCR oder bei drei aufeinanderfolgenden Fehlschlägen.
+
+        `_needs_detail_balance` / `_needs_detail_warehouse`
+            Gesetzt: `_set_detail_metric_state("baseline")` oder Burst-Scans im Detail-Fenster.
+            Verwendet: Detail-ROI-OCR nur bei aktivem Flag, sonst Cache/Skip.
+            Zurückgesetzt: `_set_detail_metric_state("idle")` oder nach erfolgreichem Detail-OCR.
+
+        `_needs_detail_inputs`
+            Gesetzt: während Baseline in Buy-Detailfenstern oder bei Preorder/Listing-Erkennung.
+            Verwendet: `_extract_preorder_input_fields` führt OCR nur bei aktivem Flag aus.
+            Zurückgesetzt: nach erfolgreichem Input-OCR.
+
+        Diese Dokumentation dient als Referenz für Phase-1-Instrumentierung. Funktionales Verhalten
+        bleibt unverändert, bis die nachfolgenden Phasen die Flags produktiv einsetzen.
         """
+        
         if not full_text or not full_text.strip():
             return
 
@@ -4891,6 +5120,7 @@ class MarketTracker:
                 # CRITICAL: Reset kompletten Detail-Window State bei neuer Transition!
                 # Sonst bleibt alte Baseline aktiv (z.B. warehouse=6870 von vorherigem Item)
                 self._reset_detail_window_state()
+                self._set_detail_metric_state("baseline", "detail_window_entered")
                 
                 self._detail_needs_baseline_capture = True
                 self._detail_baseline_captured = False
@@ -5048,6 +5278,7 @@ class MarketTracker:
                     if self.debug:
                         log_debug("[DETAIL] Left detail window - resetting state")
                     self._reset_detail_window_state()
+                    self._set_detail_metric_state("idle", "detail_exit")
             # Kein Update von last_overview_text hier, damit Delta sauber bleibt
             return
 
@@ -6315,133 +6546,12 @@ class MarketTracker:
         # 🔍 LOG-FALLBACK: Füge fehlende Detail-Window Transaktionen hinzu
         if self._pending_log_fallback_txs:
             if self.debug:
-                log_debug(f"[LOG-FALLBACK] Adding {len(self._pending_log_fallback_txs)} missing transaction(s) to candidates")
+                log_debug(f"[LOG-FALLBACK] Applying {len(self._pending_log_fallback_txs)} pending detail transactions")
             tx_candidates.extend(self._pending_log_fallback_txs)
-            self._pending_log_fallback_txs = []  # Clear after adding
+            self._pending_log_fallback_txs = []
 
-        # Try to infer missing buy transactions directly from UI metrics when no log anchors were parsed.
-        if (
-            wtype == 'buy_overview'
-            and ui_buy
-            and (self._baseline_initialized or prev_ui_buy)
-        ):
-            existing_items = {(t.get('item_name') or '').lower() for t in tx_candidates if t.get('item_name')}
-            existing_norm = { _norm_key(t.get('item_name')) for t in tx_candidates if t.get('item_name') }
-            scan_ts = datetime.datetime.now()
-            structured_by_norm = {}
-            for entry in structured:
-                nm = _norm_key(entry.get('item') or '')
-                if not nm:
-                    continue
-                structured_by_norm.setdefault(nm, []).append(entry)
-            for item_lc, metrics in ui_buy.items():
-                if item_lc in existing_items or _norm_key(metrics.get('item') or item_lc) in existing_norm:
-                    continue
-                prev_metrics = prev_ui_buy.get(item_lc) if prev_ui_buy else None
-                if not prev_metrics and prev_ui_buy:
-                    prev_metrics = prev_ui_buy.get(_norm_key(metrics.get('item') or item_lc))
-                if not prev_metrics:
-                    continue
-                orders_completed = metrics.get('ordersCompleted') or 0
-                collect_amount = metrics.get('remainingPrice') or 0
-                prev_sales = prev_metrics.get('ordersCompleted') or 0
-                prev_collect = prev_metrics.get('remainingPrice') or 0
-                delta_qty = orders_completed - (prev_sales or 0)
-                delta_price = collect_amount - (prev_collect or 0)
-                if delta_qty <= 0 or delta_price <= 0:
-                    continue
-                if delta_qty < MIN_ITEM_QUANTITY or delta_qty > MAX_ITEM_QUANTITY:
-                    continue
-                corrected_name, _ = self._safe_correct_item_name(metrics.get('item') or item_lc)
-                corrected_name = corrected_name or metrics.get('item') or item_lc
-                
-                norm_metric_item = _norm_key(metrics.get('item') or item_lc)
-                anchor_entries = structured_by_norm.get(norm_metric_item, [])
-                anchor_present = any(
-                    (entry.get('type') in ('transaction', 'purchased', 'placed', 'withdrew'))
-                    for entry in anchor_entries
-                )
-                if not anchor_present:
-                    if self.debug:
-                        log_debug(f"[UI-INFER] Skip '{corrected_name}' - no matching log anchors in snapshot")
-                    continue
-                latest_anchor_ts = None
-                for entry in anchor_entries:
-                    ts_entry = entry.get('timestamp')
-                    if isinstance(ts_entry, datetime.datetime):
-                        if latest_anchor_ts is None or ts_entry > latest_anchor_ts:
-                            latest_anchor_ts = ts_entry
-                if latest_anchor_ts:
-                    try:
-                        if (scan_ts - latest_anchor_ts).total_seconds() > 180:
-                            if self.debug:
-                                log_debug(f"[UI-INFER] Skip '{corrected_name}' - anchor timestamp too old ({latest_anchor_ts})")
-                            continue
-                    except Exception:
-                        pass
-                
-                # CRITICAL FIX: Validate inferred price against market data
-                # This prevents using stale UI metrics that produce wrong prices
-                plausibility = {}
-                try:
-                    plausibility = check_price_plausibility(corrected_name, delta_qty, delta_price, tx_side='buy')
-                    if not plausibility.get('plausible', True):
-                        reason = plausibility.get('reason', 'unknown')
-                        expected_min = plausibility.get('expected_min')
-                        expected_max = plausibility.get('expected_max')
-                        # Skip if price is WAY off (outside 10x range)
-                        if reason == 'too_low' and expected_min and delta_price < expected_min * 0.1:
-                            if self.debug:
-                                log_debug(f"[UI-INFER] SKIP '{corrected_name}' - price {delta_price:,} too low (expected min: {expected_min:,})")
-                            continue
-                        elif reason == 'too_high' and expected_max and delta_price > expected_max * 10:
-                            if self.debug:
-                                log_debug(f"[UI-INFER] SKIP '{corrected_name}' - price {delta_price:,} too high (expected max: {expected_max:,})")
-                            continue
-                        # Warn but allow if within 10x range (might be correct)
-                        elif self.debug:
-                            log_debug(f"[UI-INFER] ⚠ '{corrected_name}' price {delta_price:,} is {reason} (expected: {expected_min:,} - {expected_max:,})")
-                except Exception:
-                    plausibility = {'plausible': True}
-                # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
-                # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
-                # UI-inferred means we're detecting a NEW collect/buy that just happened NOW
-                if not plausibility.get('plausible', True):
-                    rebuilt_price = self._reconstruct_ui_price(corrected_name, delta_qty, delta_price, anchor_entries)
-                    if rebuilt_price is None:
-                        if self.debug:
-                            log_debug(f"[UI-INFER] Skip '{corrected_name}' - unable to rebuild plausible total from anchors")
-                        continue
-                    delta_price = rebuilt_price
-                ts_for_ui = latest_anchor_ts or scan_ts
-                synthetic_tx = {
-                    'item_name': corrected_name,
-                    'quantity': delta_qty,
-                    'price': int(delta_price),
-                    'timestamp': ts_for_ui,
-                    'transaction_type': 'buy',
-                    'case': 'collect_ui_inferred',
-                    'raw_related': [
-                        {
-                            'type': 'ui_orders',
-                            'item': corrected_name,
-                            'qty': orders_completed,
-                            'price': collect_amount,
-                            'ts_text': ts_for_ui.strftime('%Y-%m-%d %H:%M') if isinstance(ts_for_ui, datetime.datetime) else str(ts_for_ui),
-                        }
-                    ],
-                    'occurrence_index': None,
-                    'occurrence_slot': 0,
-                    '_ui_inferred': True,
-                }
-                tx_candidates.append(synthetic_tx)
-                existing_items.add(corrected_name.lower())
-                existing_items.add((corrected_name or '').lower())
-                if self.debug:
-                    log_debug(
-                        f"[UI-INFER] Added synthetic buy for '{corrected_name}' qty={delta_qty} price={delta_price} "
-                        f"(ordersCompleted Δ{delta_qty}, collect Δ{delta_price})"
-                    )
+        if ui_buy_delta_detected:
+            self._schedule_metrics_refresh("ui_inference_buy")
 
         if (
             wtype == 'sell_overview'
@@ -6463,79 +6573,41 @@ class MarketTracker:
                 prev_sales = prev_metrics.get('salesCompleted') or 0
                 prev_collect = prev_metrics.get('price') or 0
                 delta_qty = sales_completed - prev_sales
-                delta_collect = collect_total - prev_collect
-                if delta_qty <= 0 or delta_collect <= 0:
+                delta_price = collect_total - prev_collect
+                if delta_qty <= 0 or delta_price <= 0:
                     continue
+                ui_sell_delta_detected = True
                 if delta_qty < MIN_ITEM_QUANTITY or delta_qty > MAX_ITEM_QUANTITY:
                     continue
+
                 corrected_name, _ = self._safe_correct_item_name(metrics.get('item') or item_lc)
                 corrected_name = corrected_name or metrics.get('item') or item_lc
-                
-                if not self._valid_item_name(corrected_name):
-                    continue
-                # CRITICAL FIX: Use current time for UI-inferred transactions, NOT overall_max_ts
-                # overall_max_ts comes from OLD transaction log entries which can have stale timestamps
-                # UI-inferred means we're detecting a NEW collect/sell that just happened NOW
-                ts_for_ui = datetime.datetime.now()
-                synthetic_sell = {
-                    'item_name': corrected_name,
-                    'quantity': int(delta_qty),
-                    'price': int(delta_collect),
-                    'timestamp': ts_for_ui,
-                    'transaction_type': 'sell',
-                    'case': 'sell_collect_ui_inferred',
-                    'raw_related': [
-                        {
-                            'type': 'ui_sales',
-                            'item': corrected_name,
-                            'qty': sales_completed,
-                            'price': collect_total,
-                            'ts_text': ts_for_ui.strftime('%Y-%m-%d %H:%M') if isinstance(ts_for_ui, datetime.datetime) else str(ts_for_ui),
-                        }
-                    ],
-                    'occurrence_index': None,
-                    'occurrence_slot': 0,
-                    '_ui_inferred': True,
-                }
-                tx_candidates.append(synthetic_sell)
-                existing_items.add(corrected_name.lower())
-                existing_norm.add(_norm_key(corrected_name))
-                if self.debug:
-                    log_debug(
-                        f"[UI-INFER] Added synthetic sell for '{corrected_name}' qty={delta_qty} price={delta_collect} "
-                        f"(salesCompleted Δ{delta_qty}, collect Δ{delta_collect})"
-                    )
-
-        # Post-process candidates after a dialog return: adjust timestamps to latest snapshot
-        # and keep only items that actually had a purchase/transaction anchor in this scan.
-        if 'returning_from_item' in locals() and returning_from_item and wtype == 'buy_overview' and tx_candidates:
-            # Determine overall latest timestamp in this snapshot
-            latest_ts = None
-            for t in tx_candidates:
-                if isinstance(t['timestamp'], datetime.datetime):
-                    if latest_ts is None or t['timestamp'] > latest_ts:
-                        latest_ts = t['timestamp']
-            # Build set of purchased/transaction anchor items from candidates' related entries
-            anchor_items_from_scan = set()
-            for t in tx_candidates:
-                for r in t.get('raw_related', []):
-                    if r.get('type') in ('purchased', 'transaction') and r.get('item'):
-                        anchor_items_from_scan.add((r['item'] or '').lower())
-            if anchor_items_from_scan:
-                # Adjust timestamps only when the original timestamp is recent (within FRESH_TX_WINDOW)
+                latest_ts = None
                 for t in tx_candidates:
-                    if (t['item_name'] or '').lower() in anchor_items_from_scan and isinstance(t['timestamp'], datetime.datetime) and latest_ts and t['timestamp'] < latest_ts:
-                        try:
-                            delta_seconds = (latest_ts - t['timestamp']).total_seconds()
-                        except Exception:
-                            delta_seconds = None
-                        if delta_seconds is not None and 0 < delta_seconds <= FRESH_TX_WINDOW:
-                            t['timestamp'] = latest_ts
-                # Filter out candidates not in the anchor set to avoid unrelated relist-only saves
-                before = len(tx_candidates)
-                tx_candidates = [t for t in tx_candidates if (t['item_name'] or '').lower() in anchor_items_from_scan]
-                if self.debug and len(tx_candidates) != before:
-                    log_debug(f"filtered non-anchor candidates after dialog return: {before} -> {len(tx_candidates)}")
+                    if isinstance(t['timestamp'], datetime.datetime):
+                        if latest_ts is None or t['timestamp'] > latest_ts:
+                            latest_ts = t['timestamp']
+                # Build set of purchased/transaction anchor items from candidates' related entries
+                anchor_items_from_scan = set()
+                for t in tx_candidates:
+                    for r in t.get('raw_related', []):
+                        if r.get('type') in ('purchased', 'transaction') and r.get('item'):
+                            anchor_items_from_scan.add((r['item'] or '').lower())
+                if anchor_items_from_scan:
+                    # Adjust timestamps only when the original timestamp ist recent (within FRESH_TX_WINDOW)
+                    for t in tx_candidates:
+                        if (t['item_name'] or '').lower() in anchor_items_from_scan and isinstance(t['timestamp'], datetime.datetime) and latest_ts and t['timestamp'] < latest_ts:
+                            try:
+                                delta_seconds = (latest_ts - t['timestamp']).total_seconds()
+                            except Exception:
+                                delta_seconds = None
+                            if delta_seconds is not None and 0 < delta_seconds <= FRESH_TX_WINDOW:
+                                t['timestamp'] = latest_ts
+                    # Filter out candidates not in the anchor set to avoid unrelated relist-only saves
+                    before = len(tx_candidates)
+                    tx_candidates = [t for t in tx_candidates if (t['item_name'] or '').lower() in anchor_items_from_scan]
+                    if self.debug and len(tx_candidates) != before:
+                        log_debug(f"filtered non-anchor candidates after dialog return: {before} -> {len(tx_candidates)}")
 
         if not tx_candidates:
             if self.debug:
