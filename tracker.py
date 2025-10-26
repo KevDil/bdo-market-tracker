@@ -232,6 +232,9 @@ class MarketTracker:
         self._detail_window_type = None  # 'sell_item' oder 'buy_item'
         self._detail_window_item = None  # Item-Name aus Detail-Fenster
         self._detail_window_hint: str | None = None  # Fallback-Klassifikation aus Label-OCR
+        self._detail_detail_snapshot_ts: datetime.datetime | None = None
+        self._detail_cached_input_fields: dict | None = None
+        self._detail_cached_input_timestamp: datetime.datetime | None = None
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -273,6 +276,7 @@ class MarketTracker:
         
         # Async pipeline controller placeholder
         self._async_controller = None
+        self._log_capture_failed = False
         
         # ROI-Diffing: State für Statistical Signature-based Change Detection
         self._last_roi_signatures = {
@@ -337,6 +341,9 @@ class MarketTracker:
         # Preorder Tracking (NEW)
         self._preorder_manager = PreorderManager(debug=self.debug)
 
+        # Stelle sicher, dass Detail-Window-State konsistent initialisiert ist
+        self._reset_detail_window_state(reason="init")
+
         if self.debug:
             log_debug(f"[INIT] Baseline initialized: {self._baseline_initialized}, Poll interval: {self.poll_interval}s")
 
@@ -380,6 +387,7 @@ class MarketTracker:
         self._current_frame_proc = None  # Will be set after preprocessing
 
         detail_window_detected = False
+        now_dt = datetime.datetime.now()
 
         try:
             # Reset ROI usage tracking for this scan
@@ -622,17 +630,20 @@ class MarketTracker:
                     self._last_roi_results["log"] = text or ""
                     self._latest_log_text = text or ""
                     self._set_need_flag('log_text', False, "log_ocr_success" if text else "log_ocr_empty")
+                    self._log_capture_failed = not bool(text)
                 elif log_roi:
                     text = self._last_roi_results["log"]
                     self._latest_log_text = text or ""
                     self._roi_usage_last_scan['log'] = 'cache'
                     log_roi_skipped = True
                     self._set_need_flag('log_text', False, "log_cache_hit")
+                    self._log_capture_failed = not bool(text)
                 else:
                     self._roi_usage_last_scan['log'] = 'failed'
                     self._latest_log_text = ""
                     self._set_need_flag('log_text', True, "log_roi_missing")
                     text = ""
+                    self._log_capture_failed = True
 
             if metrics is not None:
                 if log_roi_skipped:
@@ -655,7 +666,6 @@ class MarketTracker:
             # 
             # ALTE LOGIK (FALSCH): 5-Sekunden-Timer + "not overview_anchor" -> ständiges Auslesen
             # NEUE LOGIK: Nur bei Fensterwechsel, Burst oder Detail-Hinweisen
-            now_dt = datetime.datetime.now()
             refresh_metrics = False
             metrics_text = ""
             if self._needs_metrics_text:
@@ -1598,7 +1608,7 @@ class MarketTracker:
                 self._preorder_manager.mark_listing_collected(
                     listing_id=matching_listing['id'],
                     collected_at=ts_value,
-                    tx_id=None
+                    transaction_id=None
                 )
 
     def _reconstruct_missing_preorder_from_log(
@@ -3223,15 +3233,18 @@ class MarketTracker:
                 print("DB Error beim Speichern:", e)
                 return False
 
-        self._detail_window_item = None  # Cache für Item-Name im Detail-Fenster
+    def _reset_detail_window_state(self, reason: str = "manual_reset") -> None:
+        """Setzt den kompletten Detail-Window-State zurück (Baseline, Deltas, Caches)."""
+        self._detail_window_item = None
         self._detail_window_active = False
         self._detail_window_type = None
         self._detail_window_opened_at: datetime.datetime | None = None
         self._detail_baseline: dict[str, Any] | None = None
-        self._last_detail_balance_text = ""
-        self._last_detail_warehouse_text = ""
+        self._detail_baseline_balance = None
         self._detail_baseline_warehouse = None
+        self._detail_detail_snapshot_ts = None
         self._detail_last_metrics = None
+        self._detail_last_delta_activity = None
         self._detail_confirmation_pending = False
         self._detail_confirmation_timestamp = None
         self._detail_partial_balance_delta = 0
@@ -3241,15 +3254,19 @@ class MarketTracker:
         self._detail_warehouse_changed_once = False
         self._detail_needs_baseline_capture = False
         self._detail_baseline_captured = False
-        self._detail_last_delta_activity = None
         self._detail_window_entry_item = None
-        self._force_detail_metric_refresh = False
-        self._set_detail_metric_state("idle", "reset_state")
-
-        # NEW (Phase 2): Reset preorder check state
+        self._detail_window_hint = None
+        self._detail_cached_input_fields = None
+        self._detail_cached_input_timestamp = None
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
+        self._force_detail_metric_refresh = False
+        self._last_detail_balance_text = ""
+        self._last_detail_warehouse_text = ""
+        self._set_detail_metric_state("idle", reason)
+        if self.debug:
+            log_debug(f"[DETAIL] State reset ({reason})")
 
     def _force_save_pending_transaction(self) -> bool:
         """
