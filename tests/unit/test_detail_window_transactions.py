@@ -518,6 +518,50 @@ class TestDetailWindowStateMachine:
         self.tracker._preorder_manager.mark_collected.assert_called_once()
         assert self.tracker._detail_relist_autocollect_signature is not None
 
+    def test_detail_log_buffer_replays_snapshot(self):
+        now = datetime.datetime(2025, 10, 27, 21, 15, 0)
+        self.tracker._detail_pending_log_snapshots = [
+            {
+                "text": (
+                    "2025.10.27 21.14 Listed Trace of Nature x2OO for 27,500,000 Silver\n"
+                    "2025.10.27 21.15 Transaction of Trace of Nature x80 worth 9,120,000 Silver has been completed\n"
+                ),
+                "hash": "dummy",
+                "captured_at": now,
+                "source_window": "sell_item",
+                "prev_window": "sell_overview",
+            }
+        ]
+        self.tracker._detail_pending_snapshot_hashes = {"dummy"}
+
+        stored_rows = []
+
+        def fake_store(tx):
+            stored_rows.append(tx)
+            return True
+
+        self.tracker.store_transaction_db = fake_store
+        self.tracker._preorder_manager.mark_listing_collected = MagicMock()
+        self.tracker._preorder_manager.find_matching_listing = MagicMock(return_value=None)
+        self.tracker._preorder_manager.cancel_listing = MagicMock()
+
+        mt = self.tracker
+        mt._stable_window = 'sell_item'
+        mt._detail_window_active = True
+        mt._detail_window_type = 'sell_item'
+        mt._detail_window_entry_item = 'Trace of Nature'
+
+        # simulate transition to overview
+        mt.process_ocr_text(
+            "2025.10.27 21.15 Transaction of Trace of Nature x80 worth 9,120,000 Silver has been completed"
+        )
+
+        assert len(stored_rows) >= 1
+        tx = next(tx for tx in stored_rows if tx['transaction_type'] == 'sell')
+        assert tx['item_name'] == 'Trace of Nature'
+        assert tx['quantity'] == 80
+        assert tx['price'] == 9_120_000
+
     def test_relist_instant_buy_creates_second_transaction(self):
         self.tracker._safe_correct_item_name = MagicMock(return_value=("Ash Sap", True))
         self.tracker._extract_detail_window_metrics = MagicMock()

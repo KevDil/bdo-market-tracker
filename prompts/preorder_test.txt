@@ -1,15 +1,15 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 0 Gem of Void im warehouse. 
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1097 Sealed Black Magic Crystal im warehouse. 
 1. Öffnen des Marktfensters im buy-overview-fenster
-2. User klickt "Relist" auf bestehende 10x Gem of Void Preorder (davon 3x gefüllt)
+2. User klickt "Relist" auf bestehende 433x Sealed Black Magic Crystal Preorder (davon 433x gefüllt)
 3. Detail-Fenster öffnet sich
-4. Neue Preorder gesetzt: 10x @ 448,000,000  → Alte Preorder wird automatisch gecollected 3x @ 134,400,000) 
+4. Neue Preorder gesetzt: 765x @ 2,180,250,000  → Alte Preorder wird automatisch gecollected 433x @ 1,238,380,000) 
 5. Detail-Fenster wird durch User geschlossen
 6. Overview-Fenster wird durch User geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 0 sein 
-t=0.3: Neue Preorder gesetzt und alte collected → 3 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 1097 sein 
+t=0.3: Neue Preorder gesetzt und alte collected → 1530 im Warehouse [...]
 
-Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Preorders/Transaktionen) wurde. Die Gem of Void Transaktion wurde nicht gespeichert. Die neue Preorder wurde nicht korrekt angelegt.
+Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Preorders/Transaktionen) wurde. Die 433x Sealed Black Magic Crystal Transaktion wurde fälschlicherweise dreimal gespeichert. Die neue Preorder wurde nicht korrekt angelegt.
 Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 

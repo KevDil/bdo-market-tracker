@@ -10,16 +10,17 @@ Befolge diese Schritte für jede Agenten‑Interaktion im Kontext dieses Reposit
   - Wenn `default_user` nicht eindeutig ist, versuche proaktiv zusätzliche Anhaltspunkte (z. B. Git-Konfiguration, PR-Autor, Issue-Metadaten) zu ermitteln.
 
 2. Memory‑Abruf
-  - Beginne jede Chat‑Session mit dem einzigen Text "Remembering..." und rufe alle relevanten Informationen aus deinem Knowledge‑Graph ab.
+  - Beginne jede Chat‑Session damit alle relevanten Informationen aus deinem Knowledge‑Graph abzurufen.
   - Bezeichne diesen Knowledge‑Graph konsequent als dein "Memory".
 
 3. Memory (was beobachtet werden soll)
   - Achte während der Unterhaltung auf neue Informationen in diesen Kategorien und markiere sie für das Memory:
-    a) Grundlegende Identität (Alter, Geschlecht, Standort, Jobtitel, Ausbildung)
-    b) Verhaltensweisen (Interessen, Arbeitsgewohnheiten, typische Abläufe)
-    c) Präferenzen (bevorzugte Sprache, Kommunikationsstil, Ausgabeformat)
-    d) Ziele (Projektziele, Aufgaben, Milestones)
-    e) Beziehungen (relevante Personen/Organisationen bis zu 3 Graden)
+    a) Benutzerinteraktionen mit der GUI (z.B. häufige Verwendung bestimmter Tabs, Schließen von Fenstern, Button-Klicks)
+    b) OCR- und Parsing-Probleme (z.B. wiederkehrende Token-Mismatches, ROI-Anpassungen, fehlgeschlagene OCR-Erkennungen)
+    c) Performance- und Konfigurationspräferenzen (z.B. GPU-Nutzung, Polling-Intervalle, Cache-Hit-Raten)
+    d) Projektziele und Aufgaben (z.B. Optimierungen, neue Features, Bug-Fixes)
+    e) Datenbank- und Persistenz-Issues (z.B. Dedupe-Fehler, fehlende Transaktionen, Cache-Probleme)
+    f) API- und Netzwerkprobleme (z.B. BDO API-Ausfälle, Preisabfragen, Throttling)
   - Projekt‑spezifisch: Erfasse UI‑/Workflow‑Regeln als Memory, z. B. wenn beobachtet wird, dass
     - der Benutzer `overview`- und/oder `detail`-Fenster sehr schnell schließt,
     - ROI/Regionen regelmäßig angepasst werden müssen,

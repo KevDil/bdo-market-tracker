@@ -1,15 +1,15 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1 Crystal of Void Destruction im warehouse. 
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 2820 Magical Shard im warehouse. 
 1. Öffnen des Marktfensters im sell-overview-fenster
-2. Click "Relist" auf bestehendes 1x Crystal of Void Destruction Listing (davon 1x gefüllt)
+2. Click "Relist" auf bestehendes 80x Magical Shard Listing (davon 80x gefüllt)
 3. Detail-Fenster öffnet sich
-4. Neues Listing gesetzt: x @ 2,170,000,000 (brutto) → Altes Listing wird automatisch gecollected 1x @ 1,925,332,500 netto) 
+4. Neues Listing gesetzt: 200x @ 652,000,000 (brutto) → Altes Listing wird automatisch gecollected 80x @ 232,814,400 (netto) 
 5. Detail-Fenster wird automatisch direkt geschlossen
 6. Overview-Fenster wird geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 1 sein 
-t=0.3: Neues Listing gesetzt und altes collected → 0 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 2820 sein 
+t=0.3: Neues Listing gesetzt und altes collected → 2620 im Warehouse [...]
 
-Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die Crystal of Void Destruction transaktion wurde erst mit hilfe des logs gespeichert, das hätte aber schon mit den infos aus dem detail-fenster geschehen sollen.
+Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die magical shard transaktion wurde nicht gespeichert. die preorder wurde auch nicht aktualisiert und keine neue angelegt.
 Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 

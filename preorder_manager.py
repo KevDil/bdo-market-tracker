@@ -198,20 +198,45 @@ class PreorderManager:
             candidate = candidates[0]
             
             # Check if there's any filled quantity to collect
-            quantity_filled = candidate.get('quantity_filled', 0)
-            
+            quantity_filled = candidate.get('quantity_filled', 0) or 0
+
+            # Berechne erwartete Auto-Collect-Summe für gefüllte Mengen
+            expected_autocollect_total = None
+            try:
+                if candidate['quantity'] > 0 and quantity_filled > 0:
+                    unit_price = candidate['price'] / candidate['quantity']
+                    expected_autocollect_total = unit_price * quantity_filled
+            except Exception:
+                expected_autocollect_total = None
+
             # Validate quantity alignment
-            # For partial fills: we collect the filled portion
-            if quantity_filled > 0 and quantity_filled <= warehouse_delta:
-                if self.debug:
-                    log_debug(
-                        f"[PREORDER] Match found (partial fill): {candidate['item_name']} "
-                        f"x{candidate['quantity']} (filled={quantity_filled}) @ {candidate['price']:,.0f} "
-                        f"(ID: {candidate['id']})"
-                    )
-                return candidate
-            # For non-filled preorders: standard check
-            elif quantity_filled == 0 and candidate['quantity'] <= warehouse_delta:
+            # For partial fills: wir sammeln die gefüllte Menge ein
+            if quantity_filled > 0:
+                if warehouse_delta >= quantity_filled:
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER] Match found (partial fill): {candidate['item_name']} "
+                            f"x{candidate['quantity']} (filled={quantity_filled}) @ {candidate['price']:,.0f} "
+                            f"(ID: {candidate['id']})"
+                        )
+                    return candidate
+
+                # Sonderfall: warehouse_delta == 0 (Detail-OCR hat Lager nicht gelesen)
+                # Prüfe ob balance_delta dem erwarteten Auto-Collect entspricht (mit Toleranz)
+                if warehouse_delta == 0 and expected_autocollect_total is not None and balance_delta:
+                    spent = abs(balance_delta)
+                    tolerance = max(expected_autocollect_total * 0.02, 1000)  # 2% oder mindestens 1k Silver
+                    if abs(spent - expected_autocollect_total) <= tolerance:
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER] Match via balance delta: {candidate['item_name']} "
+                                f"filled={quantity_filled}, expected_total={expected_autocollect_total:,.0f}, "
+                                f"balance_delta={balance_delta:,.0f}"
+                            )
+                        return candidate
+
+            # Für komplett ungefüllte Preorders (quantity_filled == 0): Standard-Check
+            if quantity_filled == 0 and candidate['quantity'] <= warehouse_delta and candidate['quantity'] > 0:
                 if self.debug:
                     log_debug(
                         f"[PREORDER] Match found: {candidate['item_name']} "
@@ -219,14 +244,14 @@ class PreorderManager:
                         f"(ID: {candidate['id']})"
                     )
                 return candidate
-            else:
-                if self.debug:
-                    log_debug(
-                        f"[PREORDER] No quantity match for '{item_name}' "
-                        f"(preorder_qty={candidate['quantity']}, filled={quantity_filled}, "
-                        f"warehouse_delta={warehouse_delta})"
-                    )
-                return None
+
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] No quantity match for '{item_name}' "
+                    f"(preorder_qty={candidate['quantity']}, filled={quantity_filled}, "
+                    f"warehouse_delta={warehouse_delta}, balance_delta={balance_delta})"
+                )
+            return None
         
         except Exception as e:
             if self.debug:

@@ -235,6 +235,8 @@ class MarketTracker:
         self._detail_detail_snapshot_ts: datetime.datetime | None = None
         self._detail_cached_input_fields: dict | None = None
         self._detail_cached_input_timestamp: datetime.datetime | None = None
+        self._detail_pending_log_snapshots: list[dict] = []
+        self._detail_pending_snapshot_hashes: set[str] = set()
         self._detail_relist_autocollect_signature: tuple[str, int, int] | None = None
         self._detail_relist_instant_signature: tuple[str, int, int] | None = None
         
@@ -339,6 +341,7 @@ class MarketTracker:
         self._pending_log_fallback_txs = []
         self._log_fallback_recent_hashes = deque(maxlen=64)
         self._log_fallback_seen_hashes: set[str] = set()
+        self._log_fallback_ttl_seconds = 5.0
         
         # Preorder Tracking (NEW)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -995,7 +998,7 @@ class MarketTracker:
             log_debug(f"[ROI-FLAG] {flag_name}: {action} | Reason: {reason}")
 
     def _schedule_metrics_refresh(self, reason: str = "") -> None:
-        """Plant Metrics-ROI-OCR mit einfachem Rate-Limiting."""
+        """Plants Metrics-ROI-OCR mit einfachem Rate-Limiting."""
         now = datetime.datetime.now()
         time_since_last_refresh = None
         if self._last_metrics_refresh_time is not None:
@@ -1248,8 +1251,8 @@ class MarketTracker:
         estimated_unit_price = base_price * 0.925
         
         # Calculate raw quantity
-        estimated_qty = balance_delta / estimated_unit_price
-        
+        estimated_qty = balance_delta / estimated_unit_price if estimated_unit_price else 0
+
         # Round to nearest 1000 (most purchases are 1k, 2k, 5k, etc.)
         if estimated_qty >= 500:
             estimated_qty_rounded = round(estimated_qty / 1000) * 1000
@@ -1477,9 +1480,6 @@ class MarketTracker:
                 {'id': int, 'quantity': int, 'price': float, 'quantity_filled': int}
             None if no preorder auto-collect detected
         """
-        if not item_name:
-            return None
-
         try:
             # Sanity check: warehouse_delta must be positive
             if warehouse_delta <= 0:
@@ -1558,6 +1558,99 @@ class MarketTracker:
         if is_valid:
             return corrected
         return raw_name
+
+    def _sanitize_log_snapshot(self, text: str | None) -> str:
+        lines: list[str] = []
+        for line in (text or "").splitlines():
+            low = line.lower()
+            if re.search(r"20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2}", line):
+                lines.append(line)
+                continue
+            if any(tok in low for tok in ("transaction", "placed order", "withdrew", "listed", "purchased", "sold ", "sold")):
+                lines.append(line)
+                continue
+        return "\n".join(lines)
+
+    def _buffer_detail_log_snapshot(
+        self,
+        text: str | None,
+        source_window: str,
+        captured_at: datetime.datetime,
+        prev_window: str | None,
+    ) -> None:
+        if not text:
+            return
+        sanitized = text.strip()
+        if not sanitized:
+            return
+        normalized = " ".join(sanitized.lower().split())
+        try:
+            text_hash = hashlib.blake2s(normalized.encode("utf-8"), digest_size=12).hexdigest()
+        except Exception:
+            text_hash = f"fallback-{captured_at.timestamp()}"
+        if text_hash in self._detail_pending_snapshot_hashes:
+            return
+        self._detail_pending_snapshot_hashes.add(text_hash)
+        self._detail_pending_log_snapshots.append(
+            {
+                "text": sanitized,
+                "hash": text_hash,
+                "captured_at": captured_at,
+                "source_window": source_window,
+                "prev_window": prev_window,
+            }
+        )
+        if len(self._detail_pending_log_snapshots) > 12:
+            oldest = self._detail_pending_log_snapshots.pop(0)
+            old_hash = oldest.get("hash")
+            if old_hash and old_hash in self._detail_pending_snapshot_hashes:
+                self._detail_pending_snapshot_hashes.remove(old_hash)
+        if self.debug:
+            log_debug(
+                f"[DETAIL-PENDING] buffered snapshot hash={text_hash[:8]} source={source_window} prev={prev_window}"
+            )
+
+    def _consume_detail_log_snapshots(self, target_window: str) -> list[dict]:
+        if not self._detail_pending_log_snapshots:
+            return []
+        snapshots = self._detail_pending_log_snapshots
+        self._detail_pending_log_snapshots = []
+        self._detail_pending_snapshot_hashes.clear()
+        structured_entries: list[dict] = []
+        for snap in snapshots:
+            raw_text = snap.get("text") or ""
+            entries = split_text_into_log_entries(raw_text)
+            if not entries:
+                sanitized = self._sanitize_log_snapshot(raw_text)
+                if sanitized:
+                    entries = split_text_into_log_entries(sanitized)
+            for pos, ts_text, snippet in entries:
+                details = extract_details_from_entry(ts_text, snippet)
+                if not details.get("timestamp"):
+                    continue
+                if details.get("type") not in {"transaction", "placed", "listed", "withdrew", "purchased"}:
+                    continue
+                structured_entries.append(
+                    {
+                        "pos": pos,
+                        "ts_text": ts_text,
+                        "type": details.get("type"),
+                        "item": details.get("item"),
+                        "qty": details.get("qty"),
+                        "price": details.get("price"),
+                        "timestamp": details.get("timestamp"),
+                        "raw": details.get("raw"),
+                        "raw_price_hint": details.get("raw_price_hint"),
+                        "_detail_buffered": True,
+                        "_buffer_source_window": snap.get("source_window"),
+                        "_buffer_prev_window": snap.get("prev_window"),
+                        "_buffer_target_window": target_window,
+                        "_buffer_captured_at": snap.get("captured_at"),
+                    }
+                )
+        if self.debug and structured_entries:
+            log_debug(f"[DETAIL-PENDING] replay {len(structured_entries)} entries into {target_window}")
+        return structured_entries
 
     def _handle_preorder_cancellation(self, item_name, quantity, price) -> None:
         if item_name is None:
@@ -2342,7 +2435,6 @@ class MarketTracker:
         try:
             # PERFORMANCE: Use precompiled whitespace pattern
             s = _WHITESPACE_PATTERN.sub(' ', full_text)
-            s = s.replace('：', ':').replace('．', '.').replace('／', '/')
             # CRITICAL FIX: Two-pass approach to capture full item names
             # Pass 1: Find all "Orders ... Orders Completed ... Collect ... Re-list" blocks
             # Pass 2: Extract item name by looking backwards from "Orders" keyword
@@ -2473,6 +2565,9 @@ class MarketTracker:
             dict mit Metriken oder None
         """
         if not ocr_text:
+            # Kein text -> keine Metriken, vorherige Flags sollen erneuten OCR erzwingen
+            self._set_need_flag('detail_balance', True, "detail_extract_empty_text")
+            self._set_need_flag('detail_warehouse', True, "detail_extract_empty_text")
             return None
         
         try:
@@ -2504,17 +2599,16 @@ class MarketTracker:
                     metrics['set_price'] = set_price_val
 
             warehouse_patterns = [
-                r'(?:warehouse\s+quantity|warehouse|wh)\s*[:]?\s*([0-9OolI\|,\.]+)',
+                r'(?:warehouse\s+quantity|warehouse|wh)\s*[:]??\s*([0-9OolI\|,\.]+)',
                 r'([0-9OolI\|,\.]+)\s*(?:warehouse\s+quantity|warehouse|wh)'
             ]
-            
+
             # 2. Warehouse Quantity extrahieren
-            # Vier Formate möglich:
-            # - Overview Buy: "Warehouse Quantity: 50" (mit Doppelpunkt)
-            # - Detail Buy: "Warehouse Quantity 2" (OHNE Doppelpunkt, Zahl NACHHER)
-            # - Detail Sell: "In Stock\n1260" (Zahl auf neuer Zeile)
-            # - Alt-Detail: "10,000 Warehouse Quantity" (Zahl ZUERST - seltener)
-            
+            # Zusätzliche Sonderfälle:
+            # - OCR liefert "Warehouse Quantity" und Zahl erst im Folgescan
+            # - Zahl steht auf separater Zeile ("Warehouse Quantity"\n"3")
+            # - Zahl enthält nur Whitespaces → erneuten Scan erzwingen
+
             # Pattern 1: "In Stock" (Sell-Detail-ROI)
             # ⚡ FIX: Sell-Side nutzt "In Stock" statt "Warehouse Quantity"!
             in_stock_pattern = re.compile(
@@ -2538,6 +2632,8 @@ class MarketTracker:
                     wh_val = normalize_numeric_str(m.group(1))
                     if wh_val is not None:
                         metrics['warehouse_qty'] = wh_val
+                    elif self.debug:
+                        log_debug("[DETAIL-EXTRACT] Warehouse match ohne Zahl → erneutes OCR notwendig")
             
             # Pattern 3: Alt-Detail-ROI-Format (Zahl ZUERST)
             if 'warehouse_qty' not in metrics:
@@ -2552,6 +2648,21 @@ class MarketTracker:
                         if wh_val is not None:
                             metrics['warehouse_qty'] = wh_val
                             break
+
+            # Pattern 4: "Warehouse Quantity" / "In Stock" gefolgt von separater Zeile mit Zahl
+            if 'warehouse_qty' not in metrics:
+                lines = [ln.strip() for ln in s.split('\n') if ln.strip()]
+                for idx, line in enumerate(lines[:-1]):
+                    if re.search(r'(warehouse\s*(quantity)?|in\s*stock)', line, re.IGNORECASE):
+                        candidate = normalize_numeric_str(lines[idx + 1])
+                        if candidate is not None:
+                            metrics['warehouse_qty'] = candidate
+                            break
+
+            if 'warehouse_qty' not in metrics:
+                if self.debug:
+                    log_debug("[DETAIL-EXTRACT] Warehouse-Wert fehlt weiterhin – Flags bleiben aktiv")
+                self._set_need_flag('detail_warehouse', True, "detail_extract_missing_warehouse")
             
             # 3. Item-Name extrahieren (aus Item-Name-ROI)
             # Pattern: Suche nach zusammenhängendem Text ohne UI-Keywords
@@ -2604,15 +2715,20 @@ class MarketTracker:
             # (Warehouse-Änderung ist nicht immer sofort sichtbar)
             if 'balance' in metrics:
                 return metrics
-            
-            # Keine Balance erkannt → None zurückgeben
+
+            # Keine Balance erkannt → Flags aktiv halten und None zurückgeben
             if self.debug:
                 log_debug(f"[DETAIL-EXTRACT] No balance found in metrics, returning None")
+            self._set_need_flag('detail_balance', True, "detail_extract_missing_balance")
+            if 'warehouse_qty' not in metrics:
+                self._set_need_flag('detail_warehouse', True, "detail_extract_missing_balance")
             return None
             
         except Exception as e:
             if self.debug:
                 log_debug(f"[DETAIL] Error extracting detail window metrics: {e}")
+            self._set_need_flag('detail_balance', True, "detail_extract_exception")
+            self._set_need_flag('detail_warehouse', True, "detail_extract_exception")
             return None
 
     @lru_cache(maxsize=500)
@@ -3114,7 +3230,9 @@ class MarketTracker:
                         if time_diff_minutes <= 20:
                             # Within 20 minutes - likely OCR duplicate from same session
                             if self.debug:
-                                log_debug(f"[CONTENT-HASH] Skip duplicate: {item} {qty}x @ {price} (hash={content_hash}, time_diff={time_diff_minutes:.1f}min, existing={existing_ts_str})")
+                                log_debug(f"[CONTENT-HASH] Skip duplicate: {item} {qty}x already captured by detail-window (id={existing_id}, ts={existing_ts_str})")
+                                if abs(int(price) - int(existing_ts_str)) > 0:
+                                    log_debug(f"[CONTENT-HASH] 🔶 Price difference detected: Detail-Window={existing_ts_str:,}, Log-based={price:,} (preferring Detail-Window)")
                             print(f"⚠️ Duplikat erkannt (Content-Hash + Zeit): {str(ttype or '').upper()} - {qty}x {item}")
                             self.seen_tx_signatures.append(sig)
                             return False
@@ -3295,6 +3413,8 @@ class MarketTracker:
         self._detail_last_transaction_saved = None
         self._detail_relist_autocollect_signature = None
         self._detail_relist_instant_signature = None
+        self._detail_pending_log_snapshots = []
+        self._detail_pending_snapshot_hashes.clear()
         self._force_detail_metric_refresh = False
         self._last_detail_balance_text = ""
         self._last_detail_warehouse_text = ""
@@ -4542,7 +4662,16 @@ class MarketTracker:
             # 2. Mark old preorder as 'collected'
             # 3. Create new preorder with values from cached input fields
             
-            if is_relist_with_autocollect:
+            relist_log_candidates: list[dict] = []
+            if self._pending_log_fallback_txs:
+                current_item_lc = (self._detail_window_item or '').lower()
+                for pending in self._pending_log_fallback_txs:
+                    if (pending.get('item_name') or '').lower() == current_item_lc:
+                        relist_log_candidates.append(pending)
+
+            autocollect_candidates = relist_log_candidates
+            consume_log_fallback_entry: dict | None = None
+            if is_relist_with_autocollect or autocollect_candidates:
                 if self.debug:
                     log_debug(
                         f"[RELIST-DETECT] ✅ Pattern matched: "
@@ -4565,37 +4694,63 @@ class MarketTracker:
                     balance_delta=balance_delta,
                     timestamp=datetime.datetime.now()
                 )
-                
+
+                expected_autocollect_qty: int | None = None
+                autocollect_total: int | None = None
+
+                if not matching_preorder and autocollect_candidates:
+                    fallback_entry = autocollect_candidates[-1]
+                    fallback_qty = fallback_entry.get('quantity') or fallback_entry.get('quantity_filled')
+                    fallback_price = fallback_entry.get('price')
+                    if fallback_qty and fallback_price:
+                        expected_autocollect_qty = int(fallback_qty)
+                        autocollect_total = int(fallback_price)
+                        matching_preorder = {
+                            'id': None,
+                            'item_name': corrected_name or self._detail_window_item,
+                            'quantity': expected_autocollect_qty,
+                            'price': autocollect_total,
+                        }
+                        consume_log_fallback_entry = fallback_entry
+                        if self.debug:
+                            log_debug(
+                                f"[RELIST] ⚠️ Using log fallback for autocollect: qty={expected_autocollect_qty}, price={autocollect_total}"
+                            )
+                    else:
+                        if self.debug:
+                            log_debug("[RELIST] ❌ Log fallback missing quantity/price – skipping autocollect")
+                        return
+
                 if not matching_preorder:
                     if self.debug:
                         log_debug(f"[RELIST] ❌ No matching preorder found - cannot proceed")
                     return
-                
+
                 # Expected auto-collect quantity from old preorder
-                expected_autocollect_qty = matching_preorder['quantity']
+                if expected_autocollect_qty is None:
+                    expected_autocollect_qty = int(matching_preorder['quantity'])
                 actual_warehouse_delta = warehouse_delta
-                
-                # 2. Detect Instant Buy: warehouse_delta > expected_autocollect
+                if actual_warehouse_delta == 0 and expected_autocollect_qty:
+                    actual_warehouse_delta = expected_autocollect_qty
                 instant_buy_qty = 0
                 if actual_warehouse_delta > expected_autocollect_qty:
                     instant_buy_qty = actual_warehouse_delta - expected_autocollect_qty
-                    
-                    if self.debug:
-                        log_debug(
-                            f"[RELIST] Instant buy detected: {instant_buy_qty:,}x "
-                            f"(warehouse {actual_warehouse_delta:,} > expected {expected_autocollect_qty:,})"
-                        )
-                
-                # 3. Calculate auto-collect transaction
-                # Use preorder's unit price (most accurate)
-                preorder_unit_price = matching_preorder['price'] / matching_preorder['quantity']
-                autocollect_total = int(round(preorder_unit_price * expected_autocollect_qty))
+
+                if autocollect_total is None:
+                    preorder_unit_price = matching_preorder['price'] / matching_preorder['quantity']
+                    autocollect_total = int(round(preorder_unit_price * expected_autocollect_qty))
+                else:
+                    preorder_unit_price = autocollect_total / expected_autocollect_qty if expected_autocollect_qty else 0
                 
                 if self.debug:
                     log_debug(
                         f"[RELIST] Auto-collect: {expected_autocollect_qty:,}x @ {preorder_unit_price:,.0f} "
                         f"= {autocollect_total:,.0f} Silver"
                     )
+                if expected_autocollect_qty <= 0 or autocollect_total <= 0:
+                    if self.debug:
+                        log_debug("[RELIST] ❌ Invalid autocollect values – aborting relist handler")
+                    return
                 
                 # 4. Save auto-collect transaction
                 corrected_name, _ = self._safe_correct_item_name(self._detail_window_item)
@@ -4651,15 +4806,18 @@ class MarketTracker:
                                         f"[DETAIL] ✅ Transaction saved (auto-collect): "
                                         f"{expected_autocollect_qty:,}x {corrected_name} @ {autocollect_total:,}"
                                     )
-                                self._preorder_manager.mark_collected(
-                                    preorder_id=matching_preorder['id'],
-                                    collected_at=timestamp_now,
-                                    tx_id=None,
-                                )
-                                if self.debug:
-                                    log_debug(
-                                        f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected"
+                                if consume_log_fallback_entry and consume_log_fallback_entry in self._pending_log_fallback_txs:
+                                    self._pending_log_fallback_txs.remove(consume_log_fallback_entry)
+                                if matching_preorder.get('id'):
+                                    self._preorder_manager.mark_collected(
+                                        preorder_id=matching_preorder['id'],
+                                        collected_at=timestamp_now,
+                                        tx_id=None,
                                     )
+                                    if self.debug:
+                                        log_debug(
+                                            f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected"
+                                        )
                                 self._detail_relist_autocollect_signature = autocollect_signature
                                 self._detail_last_transaction_saved = timestamp_now
                             elif self.debug:
@@ -4758,8 +4916,12 @@ class MarketTracker:
                             log_debug(f"[RELIST] ❌ Invalid new preorder total: {new_preorder_total:,}")
                 
                 # Save instant buy transaction (if any)
-                if instant_buy_qty > 0 and new_preorder_total > 0:
-                    instant_buy_total = int(round(total_balance_decrease - new_preorder_total))
+                instant_buy_total = 0
+                if instant_buy_qty > 0:
+                    instant_buy_total = int(round(preorder_unit_price * instant_buy_qty)) if preorder_unit_price > 0 else 0
+                    new_preorder_total = max(total_balance_decrease - instant_buy_total, 0)
+
+                if instant_buy_qty > 0 and instant_buy_total > 0:
                     
                     if instant_buy_total > 0:
                         instant_signature = (
@@ -4800,16 +4962,13 @@ class MarketTracker:
                                     log_debug(f"[RELIST] ❌ Instant-Buy speichern fehlgeschlagen: {e}")
                             else:
                                 if saved_instant:
-                                    instant_buy_unit_price = (
-                                        instant_buy_total / instant_buy_qty if instant_buy_qty > 0 else 0
-                                    )
                                     if self.debug:
                                         log_debug(
-                                            f"[DETAIL] ✅ Transaction saved (instant-buy): "
-                                            f"{instant_buy_qty:,}x {corrected_name} @ {instant_buy_unit_price:,.0f}"
+                                            f"[DETAIL] ✅ Transaction saved (instant buy): "
+                                            f"{instant_buy_qty:,}x {corrected_name} @ {instant_buy_total:,}"
                                         )
                                     self._detail_relist_instant_signature = instant_signature
-                                    self._detail_last_transaction_saved = instant_buy_tx['timestamp']
+                                    self._detail_last_transaction_saved = datetime.datetime.now()
                                 elif self.debug:
                                     log_debug(
                                         f"[RELIST] ⚠️ Instant-Buy nicht gespeichert (Dedupe oder Plausibilität): "
@@ -5318,6 +5477,7 @@ class MarketTracker:
             if wtype in ("buy_item", "sell_item"):
                 # Aktiviere Detail-Window-Monitoring
                 self._monitor_detail_window(wtype, full_text)
+
                 
                 # 🚀 CRITICAL FIX: Extended burst duration for detail-window monitoring
                 # Must stay active during baseline capture AND subsequent transaction monitoring
@@ -5331,9 +5491,15 @@ class MarketTracker:
                 # Flags aktiv lassen, bis erste verlässliche Deltas erfasst wurden
                 self._set_need_flag('detail_balance', True, "detail_window_active")
                 self._set_need_flag('detail_warehouse', True, "detail_window_active")
+                self._buffer_detail_log_snapshot(
+                    text=self._latest_log_text,
+                    source_window=wtype,
+                    captured_at=now,
+                    prev_window=prev_window,
+                )
                 if self.debug:
                     log_debug(f"[BURST] 🚀 Detail-window burst enabled until {self._burst_until} (+{self._burst_fast_scans} fast scans, 80ms polling)")
-                
+
             else:
                 # Nicht in Detail-Fenster → Reset State
                 if self._detail_window_active:
@@ -5513,25 +5679,16 @@ class MarketTracker:
             print("DEBUG:", msg)
             log_debug(msg)
 
+        buffered_structured = []
+        if self._detail_pending_log_snapshots:
+            buffered_structured = self._consume_detail_log_snapshots(wtype)
         log_text_source = (getattr(self, '_latest_log_text', '') or '').strip()
         entries = split_text_into_log_entries(log_text_source) if log_text_source else []
 
         # Fallback: only attempt to parse the full snapshot when log ROI failed in an overview window.
         fallback_used = False
         if not entries and self._log_capture_failed and wtype in ("sell_overview", "buy_overview"):
-            def _sanitize_snapshot(text: str) -> str:
-                lines = []
-                for line in text.splitlines():
-                    low = line.lower()
-                    if re.search(r"20\d{2}[.\-/]\d{2}[.\-/]\d{2}\s+\d{2}[:\.,\-]\d{2}", line):
-                        lines.append(line)
-                        continue
-                    if any(tok in low for tok in ("transaction", "placed order", "withdrew", "listed", "purchased", "sold ", "sold")):
-                        lines.append(line)
-                        continue
-                return "\n".join(lines)
-
-            sanitized = _sanitize_snapshot(full_text)
+            sanitized = self._sanitize_log_snapshot(full_text)
             if sanitized:
                 entries = split_text_into_log_entries(sanitized)
                 fallback_used = True
@@ -5588,6 +5745,29 @@ class MarketTracker:
             })
 
         # sort by timestamp then pos
+        if buffered_structured:
+            existing_keys = {
+                (
+                    entry.get('type'),
+                    (entry.get('item') or '').lower(),
+                    entry.get('qty'),
+                    entry.get('price'),
+                    entry.get('timestamp')
+                )
+                for entry in structured
+            }
+            for buffered in buffered_structured:
+                key = (
+                    buffered.get('type'),
+                    (buffered.get('item') or '').lower(),
+                    buffered.get('qty'),
+                    buffered.get('price'),
+                    buffered.get('timestamp'),
+                )
+                if key in existing_keys:
+                    continue
+                structured.append(buffered)
+                existing_keys.add(key)
         structured = sorted(structured, key=lambda x: (x['timestamp'], x['pos']))
         if self.debug:
             log_debug(f"structured_count={len(structured)}")
@@ -5622,9 +5802,24 @@ class MarketTracker:
             if missing_txs:
                 if self.debug:
                     log_debug(f"[LOG-FALLBACK] Found {len(missing_txs)} missing transaction(s) from detail window")
-                # Füge fehlende Transaktionen direkt zu tx_candidates hinzu (wird später verarbeitet)
-                # Wir merken sie uns für später (nach dem Clustering)
-                self._pending_log_fallback_txs = missing_txs
+                now_ts = datetime.datetime.now()
+                ttl_cutoff = now_ts.timestamp() - self._log_fallback_ttl_seconds
+                pending = []
+                for tx in missing_txs:
+                    ts_val = tx.get('timestamp') if isinstance(tx.get('timestamp'), datetime.datetime) else None
+                    if not ts_val:
+                        continue
+                    ts_epoch = ts_val.timestamp()
+                    if ts_epoch < ttl_cutoff:
+                        continue
+                    new_entry = {
+                        **tx,
+                        '_fallback_source': 'detail_window',
+                        '_fallback_detected_at': now_ts,
+                        '_fallback_timestamp_epoch': ts_epoch,
+                    }
+                    pending.append(new_entry)
+                self._pending_log_fallback_txs = pending
             else:
                 self._pending_log_fallback_txs = []
 
@@ -6780,9 +6975,27 @@ class MarketTracker:
         
         # 🔍 LOG-FALLBACK: Füge fehlende Detail-Window Transaktionen hinzu
         if self._pending_log_fallback_txs:
-            if self.debug:
-                log_debug(f"[LOG-FALLBACK] Applying {len(self._pending_log_fallback_txs)} pending detail transactions")
-            tx_candidates.extend(self._pending_log_fallback_txs)
+            ttl_cutoff = datetime.datetime.now().timestamp() - self._log_fallback_ttl_seconds
+            filtered_pending = []
+            for pending in self._pending_log_fallback_txs:
+                detected_epoch = pending.get('_fallback_timestamp_epoch')
+                if detected_epoch is None:
+                    detected_epoch = pending.get('timestamp').timestamp() if isinstance(pending.get('timestamp'), datetime.datetime) else None
+                if detected_epoch is None or detected_epoch < ttl_cutoff:
+                    continue
+                hash_val = self._make_log_fallback_hash({
+                    'item': pending.get('item_name'),
+                    'qty': pending.get('quantity'),
+                    'price': pending.get('price'),
+                    'timestamp': pending.get('timestamp'),
+                })
+                if hash_val in self._log_fallback_seen_hashes:
+                    continue
+                self._log_fallback_seen_hashes.add(hash_val)
+                filtered_pending.append(pending)
+            if filtered_pending and self.debug:
+                log_debug(f"[LOG-FALLBACK] Applying {len(filtered_pending)} pending detail transactions")
+            tx_candidates.extend(filtered_pending)
             self._pending_log_fallback_txs = []
 
         if ui_buy_delta_detected:
