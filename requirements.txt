@@ -1,5 +1,5 @@
 # BDO Market Tracker Requirements
-
+--extra-index-url https://download.pytorch.org/whl/cu129
 # EasyOCR - Primary OCR engine
 easyocr>=1.7.0
 

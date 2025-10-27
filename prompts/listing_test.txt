@@ -1,12 +1,12 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1200 Magical Shard im warehouse. 
-1. Click "Relist" auf bestehendes 200x Magical Shard Listing (davon 133x gefüllt)
-2. Neues Listing gesetzt: 200x @ 686,000,000 (brutto) → Altes Listing wird automatisch gecollected (133x @ 404,754,577 netto) 
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1050 Magical Shard im warehouse. 
+1. Click "Relist" auf bestehendes 200x Magical Shard Listing (davon 200x gefüllt)
+2. Neues Listing gesetzt: 200x @ 698,000,000 (brutto) → Altes Listing wird automatisch gecollected 200x @ 617,526,000 netto) 
 3. Detail-Fenster wird geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 1200 sein 
-t=0.3: Neues Listing gesetzt und altes collected → 1067 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 1050 sein 
+t=0.3: Neues Listing gesetzt und altes collected → 850 im Warehouse [...]
 
-Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. 
+Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die transaktion wurde  nicht gespeichert. die alten transaktionen aus dem log wurden auch nicht gespeichert.
 Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 

@@ -798,7 +798,7 @@ class MarketTracker:
                     balance_roi = detect_detail_balance_roi(proc, detected_detail_type)
                     warehouse_roi = detect_detail_warehouse_roi(proc, detected_detail_type)
 
-                    if balance_roi and self._needs_detail_balance:
+                    if balance_roi and (self._needs_detail_balance or detail_window_detected):
                         balance_text, balance_cached, _ = ocr_image_cached(
                             img,
                             method='auto',
@@ -819,7 +819,7 @@ class MarketTracker:
                     else:
                         self._roi_usage_last_scan['detail_balance'] = 'not_run'
 
-                    if warehouse_roi and self._needs_detail_warehouse:
+                    if warehouse_roi and (self._needs_detail_warehouse or detail_window_detected):
                         warehouse_text, warehouse_cached, _ = ocr_image_cached(
                             img,
                             method='auto',
@@ -5696,17 +5696,30 @@ class MarketTracker:
                 return (s or "").lower()
         # Snapshot previous UI metrics at the very beginning so inference compares against the prior scan
         prev_ui_buy = {}
-        if wtype == 'buy_overview':
-            if getattr(self, '_last_ui_buy_metrics', None):
-                try:
-                    prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
-                except Exception:
-                    prev_ui_buy = self._last_ui_buy_metrics.copy()
-            elif self.last_overview_text:
-                try:
-                    prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
-                except Exception:
-                    prev_ui_buy = {}
+        if getattr(self, '_last_ui_buy_metrics', None):
+            try:
+                prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
+            except Exception:
+                prev_ui_buy = self._last_ui_buy_metrics.copy()
+        elif self.last_overview_text:
+            try:
+                prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
+            except Exception:
+                prev_ui_buy = {}
+
+        ui_buy_delta_detected = False
+        if wtype == 'buy_overview' and ui_buy and prev_ui_buy:
+            for item_lc, metrics in ui_buy.items():
+                prev_metrics = prev_ui_buy.get(item_lc)
+                if not prev_metrics:
+                    continue
+                orders_curr = metrics.get('ordersCompleted') or 0
+                orders_prev = prev_metrics.get('ordersCompleted') or 0
+                collect_curr = metrics.get('remainingPrice') or 0
+                collect_prev = prev_metrics.get('remainingPrice') or 0
+                if orders_curr > orders_prev or collect_curr > collect_prev:
+                    ui_buy_delta_detected = True
+                    break
         prev_ui_sell = {}
         prev_ui_sell_norm = {}
         if wtype == 'sell_overview':

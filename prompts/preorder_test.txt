@@ -1,12 +1,12 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 11420 Trace of Nature im warehouse. 
-1. Click "Relist" auf bestehende 5000x Trace of Nature Preorder (davon 131x gefüllt)
-2. Neue preorder gesetzt: 5000x @ 790,000,000  → Alte Preorder wird automatisch gecollected (131x @ 20,698,000) 
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 0 Ash Sap im warehouse. 
+1. Click "Relist" auf bestehende 1000x Ash Sap Preorder (davon 1000x gefüllt)
+2. Neue preorder gesetzt: 1000x @ 21,000,000  → Alte Preorder wird automatisch gecollected 1000x @ 21,000,000) 
 3. Detail-Fenster wird geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 11420 sein 
-t=0.3: Neue Preorder gesetzt und alte collected → 11551 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 0 sein 
+t=0.3: Neue Preorder gesetzt und alte collected → 1000 im Warehouse [...]
 
 Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Preorders/Transaktionen) wurde. 
 Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 
