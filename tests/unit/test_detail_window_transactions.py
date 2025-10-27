@@ -7,11 +7,28 @@ Tests für:
 - _monitor_detail_window (State Machine)
 """
 
-import pytest
+import sys
 import datetime
-import tracker
-from tracker import MarketTracker
-from utils import normalize_numeric_str
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+import tracker  # noqa: E402
+from tracker import MarketTracker  # noqa: E402
+from utils import normalize_numeric_str  # noqa: E402
 
 
 class TestDetailWindowMetrics:
@@ -436,6 +453,9 @@ class TestDetailWindowStateMachine:
     def setup_method(self):
         """Setup vor jedem Test."""
         self.tracker = MarketTracker(debug=False)
+        self.tracker._preorder_manager = MagicMock()
+        self.tracker.store_transaction_db = MagicMock(return_value=True)
+        self.tracker._safe_correct_item_name = lambda raw, min_score=86: (raw, True)
     
     def test_state_initial_entry(self):
         """Test: Erstes Betreten des Detail-Fensters setzt Baseline
@@ -459,9 +479,81 @@ class TestDetailWindowStateMachine:
         assert self.tracker._detail_window_active
         assert self.tracker._detail_window_type == 'sell_item'
         assert self.tracker._detail_baseline_balance == 1000000
-        # Baseline wird direkt aus OCR-Ablesung gesetzt (keine Manipulation mehr)
+        # Baseline wird direkt aus OCR-Ablesung gesetzt (keine Manipulation)
         assert self.tracker._detail_baseline_warehouse == 50
-    
+
+    def test_relist_autocollect_creates_transaction_and_marks_preorder(self):
+        self.tracker._safe_correct_item_name = MagicMock(return_value=("Ash Sap", True))
+        self.tracker._extract_detail_window_metrics = MagicMock()
+        self.tracker._detail_window_active = True
+        self.tracker._detail_window_type = 'buy_item'
+        self.tracker._detail_window_item = 'Ash Sap'
+        self.tracker._detail_baseline_balance = 10_000_000_000
+        self.tracker._detail_baseline_warehouse = 0
+        self.tracker._detail_last_metrics = {'balance': 10_000_000_000, 'warehouse_qty': 0}
+
+        matching_preorder = {
+            'id': 38,
+            'item_name': 'Ash Sap',
+            'quantity': 1000,
+            'price': 21_000_000_000,
+        }
+        self.tracker._preorder_manager.find_matching_preorder.return_value = matching_preorder
+
+        self.tracker._extract_detail_window_metrics.return_value = {
+            'balance': 10_000_000_000 - 21_000_000_000,
+            'warehouse_qty': 1000,
+            'timestamp': datetime.datetime(2025, 10, 27, 9, 36, 0),
+        }
+
+        self.tracker._monitor_detail_window('buy_item', 'dummy text')
+
+        assert self.tracker.store_transaction_db.called
+        tx = self.tracker.store_transaction_db.call_args.args[0]
+        assert tx['item_name'] == 'Ash Sap'
+        assert tx['quantity'] == 1000
+        assert tx['price'] == 21_000_000_000
+        assert tx['tx_case'] == 'buy_collect'
+        self.tracker._preorder_manager.mark_collected.assert_called_once()
+        assert self.tracker._detail_relist_autocollect_signature is not None
+
+    def test_relist_instant_buy_creates_second_transaction(self):
+        self.tracker._safe_correct_item_name = MagicMock(return_value=("Ash Sap", True))
+        self.tracker._extract_detail_window_metrics = MagicMock()
+        self.tracker._detail_window_active = True
+        self.tracker._detail_window_type = 'buy_item'
+        self.tracker._detail_window_item = 'Ash Sap'
+        self.tracker._detail_baseline_balance = 10_000_000_000
+        self.tracker._detail_baseline_warehouse = 0
+        self.tracker._detail_last_metrics = {'balance': 10_000_000_000, 'warehouse_qty': 0}
+
+        matching_preorder = {
+            'id': 38,
+            'item_name': 'Ash Sap',
+            'quantity': 1000,
+            'price': 21_000_000_000,
+        }
+        self.tracker._preorder_manager.find_matching_preorder.return_value = matching_preorder
+
+        total_balance_after = 10_000_000_000 - (21_000_000_000 + 2_100_000_000)
+        self.tracker._extract_detail_window_metrics.return_value = {
+            'balance': total_balance_after,
+            'warehouse_qty': 1200,
+            'timestamp': datetime.datetime(2025, 10, 27, 9, 36, 0),
+        }
+
+        self.tracker._monitor_detail_window('buy_item', 'dummy text')
+
+        assert self.tracker.store_transaction_db.call_count == 2
+        calls = [call.args[0] for call in self.tracker.store_transaction_db.call_args_list]
+        auto_collect = next(tx for tx in calls if tx['tx_case'] == 'buy_collect')
+        instant = next(tx for tx in calls if tx['tx_case'] == 'buy_collect_instant')
+
+        assert auto_collect['quantity'] == 1000
+        assert instant['quantity'] == 200
+        assert instant['price'] == 2_100_000_000
+        assert self.tracker._detail_relist_instant_signature is not None
+
     def test_state_no_change_no_transaction(self):
         """Test: Keine Änderung → Keine Transaktion"""
         ocr_text = """

@@ -648,6 +648,7 @@ def extract_details_from_entry(ts_text, entry_text):
     price = None
     price_hint_value = None
     price_hint_digits = None
+    raw_price_hint = None
     if typ in ("transaction", "purchased", "listed", "placed", "withdrew"):
         # For transaction lines, prefer 'worth <N> Silver' (net amount)
         if typ == "transaction":
@@ -683,6 +684,21 @@ def extract_details_from_entry(ts_text, entry_text):
                         cand = normalize_numeric_str(m_worth_relaxed.group(1))
                         if cand and cand >= 100000:
                             price = cand
+            if price is None:
+                # Handle fragmented "Silver has" sequences where the number sits between multiplicator and keyword
+                # Example: "Transaction of Crystal ... x1 2,049,547,500 Silver has" (OCR splits 'has been')
+                m_between = re.search(
+                    fr"x\s*[0-9OolI\|]+{silver_sep}([0-9OolI\|,\.\s]{{3,}}){silver_sep}silver\s*h[aA][sS]",
+                    entry_text,
+                    re.IGNORECASE,
+                )
+                if m_between:
+                    candidate = normalize_numeric_str(m_between.group(1))
+                    if candidate:
+                        price_hint_value = candidate
+                        if price is None or price <= 0:
+                            raw_price_hint = candidate
+
             if price is None:
                 # pick '<number> Silver' within the transaction segment only, excluding later 'listed/placed/withdrew/purchased' parts
                 m_anchor = re.search(r'\b(transaction|sold)\b', entry_text, re.IGNORECASE)
@@ -735,6 +751,9 @@ def extract_details_from_entry(ts_text, entry_text):
                         m_near_collect = re.search(fr'collect[\s\S]{{0,50}}?([0-9OolI\|,\.]{{3,}}){silver_sep}{silver_pat}', around, re.IGNORECASE)
                         if m_near_collect:
                             price = normalize_numeric_str(m_near_collect.group(1))
+            if price is None and raw_price_hint and raw_price_hint > 0:
+                # reuse the hint as final fallback when nothing else succeeded
+                price = raw_price_hint
         else:
             # purchased/listed: prefer price within their own segment to avoid picking UI numbers
             silver_pat = r's\s*[iIl1]\s*[lIl1]\s*[vV]\s*[eE]\s*[rR]'

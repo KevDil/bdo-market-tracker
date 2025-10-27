@@ -49,3 +49,23 @@ def test_crystal_of_void_destruction_transaction_is_parsed():
     crystal = crystal_entries[0]
     assert crystal["qty"] == 1
     assert crystal["price"] == 1_765_627_500
+
+
+def test_split_handles_silver_has_fragment():
+    text = (
+        "Transaction of Crystal of Void - Ah'krad x1 2,049,547,500 Silver has been completed "
+        "2025.10.27 09.36"
+    )
+
+    entries = split_text_into_log_entries(text)
+    assert entries, "Expected at least one entry from split"
+
+    ts_text = entries[0][1]
+    snippet = entries[0][2]
+    details = extract_details_from_entry(ts_text, snippet)
+
+    assert details is not None
+    assert details["type"] == "transaction"
+    assert details["qty"] == 1
+    assert details["item"].lower() == "crystal of void - ah'krad"
+    assert details["price"] == 2_049_547_500

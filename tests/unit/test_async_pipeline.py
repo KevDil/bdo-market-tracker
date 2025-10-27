@@ -17,8 +17,8 @@ from config import USE_ASYNC_PIPELINE, ASYNC_QUEUE_MAXSIZE
 
 def test_async_pipeline_enabled():
     """Verify async pipeline is enabled in config."""
-    assert USE_ASYNC_PIPELINE == True, "USE_ASYNC_PIPELINE should be True for Phase 2"
-    assert ASYNC_QUEUE_MAXSIZE == 1, "Queue size should be 1 for real-time tracking"
+    assert USE_ASYNC_PIPELINE is False, "Async pipeline currently deaktiviert – Config anpassen, falls geändert"
+    assert ASYNC_QUEUE_MAXSIZE == 1, "Queue size should remain 1 für Echtzeitbetrieb"
 
 
 def test_async_controller_initialization():

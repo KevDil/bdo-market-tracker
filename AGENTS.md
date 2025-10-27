@@ -1,6 +1,42 @@
 # Repository Guidelines
 - Reply to the user in German.
 
+## Agent Interaction Guidelines
+Befolge diese Schritte für jede Agenten‑Interaktion im Kontext dieses Repositories:
+
+1. Benutzeridentifikation
+  - Nimm standardmäßig an, dass du mit `default_user` interagierst (z. B. dem Entwickler oder dem primären Anwender dieses Repos).
+  - Wenn `default_user` nicht eindeutig ist, versuche proaktiv zusätzliche Anhaltspunkte (z. B. Git-Konfiguration, PR-Autor, Issue-Metadaten) zu ermitteln.
+
+2. Memory‑Abruf
+  - Beginne jede Chat‑Session mit dem einzigen Text "Remembering..." und rufe alle relevanten Informationen aus deinem Knowledge‑Graph ab.
+  - Bezeichne diesen Knowledge‑Graph konsequent als dein "Memory".
+  - Verwende, wo sinnvoll, Context7 (z. B. für Bibliotheks‑Dokumentation oder API‑Referenzen) um aktuelle externe Referenzen zu laden.
+
+3. Memory (was beobachtet werden soll)
+  - Achte während der Unterhaltung auf neue Informationen in diesen Kategorien und markiere sie für das Memory:
+    a) Grundlegende Identität (Alter, Geschlecht, Standort, Jobtitel, Ausbildung)
+    b) Verhaltensweisen (Interessen, Arbeitsgewohnheiten, typische Abläufe)
+    c) Präferenzen (bevorzugte Sprache, Kommunikationsstil, Ausgabeformat)
+    d) Ziele (Projektziele, Aufgaben, Milestones)
+    e) Beziehungen (relevante Personen/Organisationen bis zu 3 Graden)
+  - Projekt‑spezifisch: Erfasse UI‑/Workflow‑Regeln als Memory, z. B. wenn beobachtet wird, dass
+    - der Benutzer `overview`- und/oder `detail`-Fenster sehr schnell schließt,
+    - ROI/Regionen regelmäßig angepasst werden müssen,
+    - bestimmte OCR‑Fehler immer wieder auftreten (z. B. wiederkehrende Token‑Mismatches),
+    — solche Regeln helfen, Heuristiken in `tracker.py`, `parsing.py` oder `preorder_manager.py` gezielt zu verbessern.
+
+4. Memory‑Aktualisierung (wie speichern)
+  - Wenn neue Informationen auftreten, aktualisiere das Memory wie folgt:
+    a) Lege neue Entities für wiederkehrende Personen, Organisationen oder signifikante Ereignisse an.
+    b) Verbinde diese Entities mit bestehenden Entities über Relations (z. B. `user_works_on -> project_x`).
+    c) Speichere beobachtete Fakten als Observations (kurze, zeitgestempelte Einträge).
+  - Wenn eine neue Verhaltensregel projektrelevant ist (z. B. Fenster‑Schließverhalten), erstelle eine Observation und markiere sie als "actionable" so dass Automatisierungen (z. B. Baseline‑Capture) darauf reagieren können.
+
+Hinweis zur Privatsphäre & Gültigkeit
+  - Speichere nur Informationen, die für die Arbeit an diesem Projekt relevant sind. Vermeide die Sammlung sensibler persönlicher Daten, sofern sie nicht ausdrücklich benötigt und zugestimmt sind.
+
+
 ## Scope & Sources of Truth
 - This is the single authoritative guide for maintainers, automation agents, and contributors. Retired specs (`instructions.md`, `copilot-instructions.md`, `.windsurf/rules/project-rules.md`) now mirror this file or point to archived copies under `docs/archive/`.
 - Keep this document synchronized with real implementation details (OCR engine, ROI, cache values, test counts, etc.). When you change behaviour, update this file before merging.

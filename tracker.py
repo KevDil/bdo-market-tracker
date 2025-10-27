@@ -235,6 +235,8 @@ class MarketTracker:
         self._detail_detail_snapshot_ts: datetime.datetime | None = None
         self._detail_cached_input_fields: dict | None = None
         self._detail_cached_input_timestamp: datetime.datetime | None = None
+        self._detail_relist_autocollect_signature: tuple[str, int, int] | None = None
+        self._detail_relist_instant_signature: tuple[str, int, int] | None = None
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -2467,15 +2469,28 @@ class MarketTracker:
             
             # 1. Balance extrahieren
             # Pattern: "Balance: 1,234,567,890 Silver" oder "Balance 1,234,567,890" (Detail-ROI)
-            balance_pattern = re.compile(
-                r'Balance\s*[:;]?\s*([0-9,\.]+)(?:\s*Silver)?',  # "Silver" ist optional
-                re.IGNORECASE
-            )
-            m = balance_pattern.search(s)
-            if m:
-                balance_val = normalize_numeric_str(m.group(1))
+            balance_match = re.search(r'balance\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
+            if balance_match:
+                balance_val = normalize_numeric_str(balance_match.group(1))
                 if balance_val is not None:
                     metrics['balance'] = balance_val
+
+            desired_match = re.search(r'(desired\s+price)\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
+            if desired_match:
+                desired_val = normalize_numeric_str(desired_match.group(2))
+                if desired_val is not None:
+                    metrics['desired_price'] = desired_val
+
+            set_price_match = re.search(r'(set\s+price)\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
+            if set_price_match:
+                set_price_val = normalize_numeric_str(set_price_match.group(2))
+                if set_price_val is not None:
+                    metrics['set_price'] = set_price_val
+
+            warehouse_patterns = [
+                r'(?:warehouse\s+quantity|warehouse|wh)\s*[:]?\s*([0-9OolI\|,\.]+)',
+                r'([0-9OolI\|,\.]+)\s*(?:warehouse\s+quantity|warehouse|wh)'
+            ]
             
             # 2. Warehouse Quantity extrahieren
             # Vier Formate möglich:
@@ -3249,6 +3264,7 @@ class MarketTracker:
         self._detail_confirmation_timestamp = None
         self._detail_partial_balance_delta = 0
         self._detail_partial_warehouse_delta = 0
+        self._detail_pending_collect_qty = 0
         self._detail_balance_delta_timestamp = None
         self._detail_balance_changed_once = False
         self._detail_warehouse_changed_once = False
@@ -3261,6 +3277,8 @@ class MarketTracker:
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
+        self._detail_relist_autocollect_signature = None
+        self._detail_relist_instant_signature = None
         self._force_detail_metric_refresh = False
         self._last_detail_balance_text = ""
         self._last_detail_warehouse_text = ""
@@ -3901,6 +3919,8 @@ class MarketTracker:
             # Akkumuliere Warehouse-Deltas
             if warehouse_delta != 0:
                 self._detail_partial_warehouse_delta += warehouse_delta
+                if self._detail_partial_balance_delta == 0:
+                    self._detail_pending_collect_qty += warehouse_delta
                 if self.debug:
                     log_debug(f"[DETAIL] Accumulated warehouse delta: {self._detail_partial_warehouse_delta:+,} (this scan: {warehouse_delta:+,})")
                 
@@ -4553,7 +4573,7 @@ class MarketTracker:
                 # 3. Calculate auto-collect transaction
                 # Use preorder's unit price (most accurate)
                 preorder_unit_price = matching_preorder['price'] / matching_preorder['quantity']
-                autocollect_total = preorder_unit_price * expected_autocollect_qty
+                autocollect_total = int(round(preorder_unit_price * expected_autocollect_qty))
                 
                 if self.debug:
                     log_debug(
@@ -4562,37 +4582,75 @@ class MarketTracker:
                     )
                 
                 # 4. Save auto-collect transaction
-                try:
-                    corrected_name, _ = self._safe_correct_item_name(self._detail_window_item)
-                    corrected_name = corrected_name or self._detail_window_item
-                    
-                    from database import store_transaction_db
-                    store_transaction_db(
-                        item_name=corrected_name,
-                        quantity=expected_autocollect_qty,
-                        price=autocollect_total,
-                        transaction_type='buy',
-                        tx_case='buy_collect',
-                        timestamp=datetime.datetime.now(),
-                        occurrence_index=0
+                corrected_name, _ = self._safe_correct_item_name(self._detail_window_item)
+                corrected_name = corrected_name or self._detail_window_item
+
+                if not corrected_name:
+                    if self.debug:
+                        log_debug("[RELIST] ❌ Kein gültiger Item-Name für Auto-Collect ermittelbar")
+                else:
+                    timestamp_now = datetime.datetime.now()
+                    autocollect_signature = (
+                        corrected_name.lower(),
+                        int(expected_autocollect_qty),
+                        int(autocollect_total),
                     )
-                    
-                    if self.debug:
-                        log_debug(f"[RELIST] ✅ Auto-collect saved: {expected_autocollect_qty:,}x @ {autocollect_total:,.0f}")
-                    
-                    # Mark old preorder as collected
-                    self._preorder_manager.mark_collected(
-                        preorder_id=matching_preorder['id'],
-                        collected_at=datetime.datetime.now(),
-                        tx_id=None
-                    )
-                    
-                    if self.debug:
-                        log_debug(f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected")
-                
-                except Exception as e:
-                    if self.debug:
-                        log_debug(f"[RELIST] ❌ Failed to save auto-collect: {e}")
+
+                    if self._detail_relist_autocollect_signature == autocollect_signature:
+                        if self.debug:
+                            log_debug(
+                                f"[RELIST] 🔁 Auto-collect bereits in dieser Session gespeichert: "
+                                f"{expected_autocollect_qty:,}x {corrected_name}"
+                            )
+                    else:
+                        autocollect_tx = {
+                            'item_name': corrected_name,
+                            'quantity': int(expected_autocollect_qty),
+                            'price': int(autocollect_total),
+                            'transaction_type': 'buy',
+                            'tx_case': 'buy_collect',
+                            'timestamp': timestamp_now,
+                            'occurrence_index': 0,
+                            '_from_detail_window': True,
+                            'raw_related': [
+                                {
+                                    'source': 'detail_relist_autocollect',
+                                    'preorder_id': matching_preorder['id'],
+                                    'warehouse_delta': warehouse_delta,
+                                    'balance_delta': balance_delta,
+                                }
+                            ],
+                        }
+
+                        try:
+                            saved = self.store_transaction_db(autocollect_tx)
+                        except Exception as e:
+                            saved = False
+                            if self.debug:
+                                log_debug(f"[RELIST] ❌ Auto-collect speichern fehlgeschlagen: {e}")
+                        else:
+                            if saved:
+                                if self.debug:
+                                    log_debug(
+                                        f"[DETAIL] ✅ Transaction saved (auto-collect): "
+                                        f"{expected_autocollect_qty:,}x {corrected_name} @ {autocollect_total:,}"
+                                    )
+                                self._preorder_manager.mark_collected(
+                                    preorder_id=matching_preorder['id'],
+                                    collected_at=timestamp_now,
+                                    tx_id=None,
+                                )
+                                if self.debug:
+                                    log_debug(
+                                        f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected"
+                                    )
+                                self._detail_relist_autocollect_signature = autocollect_signature
+                                self._detail_last_transaction_saved = timestamp_now
+                            elif self.debug:
+                                log_debug(
+                                    f"[RELIST] ⚠️ Auto-collect nicht gespeichert (Dedupe oder Plausibilität): "
+                                    f"{expected_autocollect_qty:,}x {corrected_name}"
+                                )
                 
                 # 5. Calculate and save NEW preorder (moved from step 6)
                 # ⚠️ CRITICAL FIX: Cached Input Fields are captured TOO EARLY!
@@ -4685,32 +4743,62 @@ class MarketTracker:
                 
                 # Save instant buy transaction (if any)
                 if instant_buy_qty > 0 and new_preorder_total > 0:
-                    instant_buy_total = total_balance_decrease - new_preorder_total
+                    instant_buy_total = int(round(total_balance_decrease - new_preorder_total))
                     
                     if instant_buy_total > 0:
-                        try:
-                            store_transaction_db(
-                                item_name=corrected_name,
-                                quantity=instant_buy_qty,
-                                price=instant_buy_total,
-                                transaction_type='buy',
-                                tx_case='buy_collect',
-                                timestamp=datetime.datetime.now(),
-                                occurrence_index=0
-                            )
-                            
-                            instant_buy_unit_price = instant_buy_total / instant_buy_qty if instant_buy_qty > 0 else 0
-                            
-
+                        instant_signature = (
+                            (corrected_name or (self._detail_window_item or "")).lower(),
+                            int(instant_buy_qty),
+                            int(instant_buy_total),
+                        )
+                        if self._detail_relist_instant_signature == instant_signature:
                             if self.debug:
                                 log_debug(
-                                    f"[RELIST] ✅ Instant buy saved: {instant_buy_qty:,}x @ "
-                                    f"{instant_buy_unit_price:,.0f} = {instant_buy_total:,.0f}"
+                                    f"[RELIST] 🔁 Instant-Buy bereits gespeichert: "
+                                    f"{instant_buy_qty:,}x {corrected_name}"
                                 )
-                        
-                        except Exception as e:
-                            if self.debug:
-                                log_debug(f"[RELIST] ❌ Failed to save instant buy: {e}")
+                        else:
+                            instant_buy_tx = {
+                                'item_name': corrected_name,
+                                'quantity': int(instant_buy_qty),
+                                'price': int(instant_buy_total),
+                                'transaction_type': 'buy',
+                                'tx_case': 'buy_collect_instant',
+                                'timestamp': datetime.datetime.now(),
+                                'occurrence_index': 0,
+                                '_from_detail_window': True,
+                                'raw_related': [
+                                    {
+                                        'source': 'detail_relist_instant',
+                                        'warehouse_delta': warehouse_delta,
+                                        'balance_delta': balance_delta,
+                                    }
+                                ],
+                            }
+
+                            try:
+                                saved_instant = self.store_transaction_db(instant_buy_tx)
+                            except Exception as e:
+                                saved_instant = False
+                                if self.debug:
+                                    log_debug(f"[RELIST] ❌ Instant-Buy speichern fehlgeschlagen: {e}")
+                            else:
+                                if saved_instant:
+                                    instant_buy_unit_price = (
+                                        instant_buy_total / instant_buy_qty if instant_buy_qty > 0 else 0
+                                    )
+                                    if self.debug:
+                                        log_debug(
+                                            f"[DETAIL] ✅ Transaction saved (instant-buy): "
+                                            f"{instant_buy_qty:,}x {corrected_name} @ {instant_buy_unit_price:,.0f}"
+                                        )
+                                    self._detail_relist_instant_signature = instant_signature
+                                    self._detail_last_transaction_saved = instant_buy_tx['timestamp']
+                                elif self.debug:
+                                    log_debug(
+                                        f"[RELIST] ⚠️ Instant-Buy nicht gespeichert (Dedupe oder Plausibilität): "
+                                        f"{instant_buy_qty:,}x {corrected_name}"
+                                    )
                 
                 # ✅ Update last metrics to prevent duplicate detection
                 self._detail_last_metrics = current_metrics.copy()

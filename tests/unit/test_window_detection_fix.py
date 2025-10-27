@@ -5,7 +5,22 @@ Integration-Test für Window Detection Fix
 Tests die kombinierten Heuristiken: Core-Keyword + (MIN/MAX oder Detail-Tokens)
 """
 
-from utils import detect_window_type
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+from utils import detect_window_type  # noqa: E402
 
 def test_buy_item_with_max_only():
     """Buy-Item sollte mit Desired Price + MAX erkannt werden (ohne MIN)"""

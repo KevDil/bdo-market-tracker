@@ -4,9 +4,26 @@ Unit Tests für Pig Blood 3-Transaction-Bug Fix.
 Testet die Smart Delta-Reset Logik und Warehouse-Baseline-Handling.
 """
 
-import pytest
-from tracker import MarketTracker
+import sys
 import datetime
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+from tracker import MarketTracker  # noqa: E402
 
 
 class TestPigBloodFix:
@@ -23,6 +40,7 @@ class TestPigBloodFix:
         Expected: Baseline wird ERST gesetzt wenn beide Metriken vorhanden
         """
         tracker = MarketTracker(debug=True)
+        tracker._preorder_manager = MagicMock()
         
         # Scan 1: Nur Balance vorhanden
         tracker._extract_detail_window_metrics = lambda text, wtype: {
