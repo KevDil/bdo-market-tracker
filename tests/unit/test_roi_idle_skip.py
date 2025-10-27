@@ -154,6 +154,7 @@ class TestROIIdleSkip(unittest.TestCase):
              patch('utils.detect_log_roi', return_value=DUMMY_LOG_ROI) as mock_detect_log, \
              patch('utils.detect_metrics_roi', return_value=DUMMY_METRICS_ROI) as mock_detect_metrics, \
              patch('utils.detect_window_label_roi', return_value=DUMMY_LABEL_ROI) as mock_detect_label, \
+             patch('tracker.MarketTracker._reset_roi_state'), \
              patch('tracker.compute_roi_stats_signature', return_value=DUMMY_SIG), \
              patch('tracker.compare_roi_signatures', return_value=True):
             

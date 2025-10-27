@@ -498,6 +498,13 @@ class MarketTracker:
                     self._last_roi_signatures[roi_name] = current_sig
                     self._roi_skip_counters[roi_name] = 0
                     roi_changed[roi_name] = True
+                if self.debug:
+                    log_debug(
+                        f"[ROI-STATS] counters after {roi_name}: "
+                        f"log={self._roi_skip_counters['log']}, "
+                        f"label={self._roi_skip_counters['label']}, "
+                        f"metrics={self._roi_skip_counters['metrics']}"
+                    )
             
             roi_stats_time = (time.perf_counter() - roi_stats_start) * 1000
             if metrics is not None and self.debug:
@@ -505,7 +512,6 @@ class MarketTracker:
             
             # Force-Refresh Heuristiken
             force_refresh = (
-                self._pending_metrics_refresh or
                 self._request_immediate_rescan > 0 or
                 any(count >= self._roi_force_refresh_threshold 
                     for count in self._roi_skip_counters.values())
@@ -514,18 +520,15 @@ class MarketTracker:
             if force_refresh:
                 if self.debug:
                     reasons = []
-                    if self._pending_metrics_refresh:
-                        reasons.append("metrics_pending")
                     if self._request_immediate_rescan > 0:
                         reasons.append(f"burst_rescan={self._request_immediate_rescan}")
                     for key, count in self._roi_skip_counters.items():
                         if count >= self._roi_force_refresh_threshold:
                             reasons.append(f"{key}_skip_limit={count}")
-                    log_debug(f"[ROI-STATS] Force refresh: {', '.join(reasons)}")
+                    log_debug(f"[ROI-STATS] Force refresh: {', '.join(reasons) if reasons else 'manual trigger'}")
                 
                 for key in roi_changed:
                     roi_changed[key] = True
-                    self._roi_skip_counters[key] = 0
 
             # First, OCR the label ROI to determine window context.
             label_text = ""
@@ -638,11 +641,13 @@ class MarketTracker:
                     self._latest_log_text = text or ""
                     self._roi_usage_last_scan['log'] = 'cache'
                     log_roi_skipped = True
+                    self._roi_skip_counters['log'] = self._roi_skip_counters.get('log', 0) + 1
                     self._set_need_flag('log_text', False, "log_cache_hit")
                     self._log_capture_failed = not bool(text)
                 else:
                     self._roi_usage_last_scan['log'] = 'failed'
                     self._latest_log_text = ""
+                    self._roi_skip_counters['log'] = self._roi_skip_counters.get('log', 0) + 1
                     self._set_need_flag('log_text', True, "log_roi_missing")
                     text = ""
                     self._log_capture_failed = True
@@ -742,15 +747,18 @@ class MarketTracker:
                 self._metrics_refresh_failures = 0  # Reset counter
                 self._last_metrics_refresh_ts = now_dt
                 self._roi_usage_last_scan['metrics'] = 'cache'
+                self._roi_skip_counters['metrics'] = self._roi_skip_counters.get('metrics', 0) + 1
                 self._set_need_flag('metrics_text', False, "metrics_cache_hit")
             if metrics is not None:
                 metrics["metrics_refresh"] = metrics_refresh_ran
             if not refresh_metrics and not detail_window_detected:
                 self._roi_usage_last_scan['metrics'] = 'skipped'
+                self._roi_skip_counters['metrics'] = self._roi_skip_counters.get('metrics', 0) + 1
                 if self._needs_metrics_text:
                     self._set_need_flag('metrics_text', False, "metrics_skip_overview")
             if refresh_metrics and not metrics_roi:
                 self._roi_usage_last_scan['metrics'] = 'failed'
+                self._roi_skip_counters['metrics'] = self._roi_skip_counters.get('metrics', 0) + 1
                 self._set_need_flag('metrics_text', False, "metrics_roi_missing")
             cached_metrics = self._last_metrics_text if not metrics_text else metrics_text
             if detail_window_detected:
@@ -813,7 +821,11 @@ class MarketTracker:
                         )
                         self._last_detail_balance_text = balance_text or ""
                         self._roi_usage_last_scan['detail_balance'] = 'cache' if balance_cached else 'ocr'
-                        self._set_need_flag('detail_balance', False, "detail_balance_ocr")
+                        if balance_text and balance_text.strip():
+                            self._set_need_flag('detail_balance', False, "detail_balance_ocr")
+                        else:
+                            self._set_need_flag('detail_balance', True, "detail_balance_empty")
+
                     elif balance_roi:
                         self._roi_usage_last_scan['detail_balance'] = 'skipped'
                     elif balance_text:
@@ -834,7 +846,11 @@ class MarketTracker:
                         )
                         self._last_detail_warehouse_text = warehouse_text or ""
                         self._roi_usage_last_scan['detail_warehouse'] = 'cache' if warehouse_cached else 'ocr'
-                        self._set_need_flag('detail_warehouse', False, "detail_warehouse_ocr")
+                        if warehouse_text and warehouse_text.strip():
+                            self._set_need_flag('detail_warehouse', False, "detail_warehouse_ocr")
+                        else:
+                            self._set_need_flag('detail_warehouse', True, "detail_warehouse_empty")
+
                     elif warehouse_roi:
                         self._roi_usage_last_scan['detail_warehouse'] = 'skipped'
                     elif warehouse_text:
@@ -5209,19 +5225,33 @@ class MarketTracker:
         if len(self._window_detection_history) > 3:
             self._window_detection_history = self._window_detection_history[-3:]
         
-        # Check if last 2 detections agree OR if it's a detail window (immediate transition)
-        if is_detail_window or (len(self._window_detection_history) >= 2 and
-            self._window_detection_history[-1] == self._window_detection_history[-2]):
-            # Stable detection (or detail window) - use this as the actual window type
+        history_len = len(self._window_detection_history)
+        last_two_same = (
+            history_len >= 2 and
+            self._window_detection_history[-1] == self._window_detection_history[-2]
+        )
+        detail_oscillation = (
+            history_len == 3 and
+            self._window_detection_history[0] in ("buy_item", "sell_item") and
+            self._window_detection_history[1] in ("buy_overview", "sell_overview") and
+            self._window_detection_history[2] == self._window_detection_history[0]
+        )
+
+        if is_detail_window or last_two_same or detail_oscillation:
             wtype = self._window_detection_history[-1]
+            if detail_oscillation:
+                # auf Overview zwingen, damit Log/OCR wieder aktiv wird
+                wtype = self._window_detection_history[1]
+                self._set_need_flag('detail_balance', True, "detail_window_oscillation")
+                self._set_need_flag('detail_warehouse', True, "detail_window_oscillation")
             if wtype != self._stable_window:
-                # Real transition confirmed
                 if self.debug:
                     transition_type = "IMMEDIATE" if is_detail_window else "Stable"
+                    if detail_oscillation:
+                        transition_type = "FORCED"
                     log_debug(f"[WINDOW-HYSTERESIS] {transition_type} transition confirmed: {self._stable_window} → {wtype}")
                 self._stable_window = wtype
         else:
-            # No stable detection yet - use previous stable state
             wtype = self._stable_window if self._stable_window != 'unknown' else detected_wtype
             if self.debug:
                 log_debug(f"[WINDOW-HYSTERESIS] Unstable detection {detected_wtype}, using stable state {wtype}")
@@ -5266,9 +5296,10 @@ class MarketTracker:
                 if self.debug:
                     log_debug(f"[METRICS-REFRESH] Skipped due to rate-limiting (time_since_last={time_since_last_refresh:.2f}s < 1.0s)")
             
-            # ROI-DIFFING: Reset signatures bei Fensterwechsel
+            # ROI-DIFFING: Reset Signaturen bei Fensterwechsel; Skip-Counter nur für betroffene ROIs zurücksetzen
             self._last_roi_signatures = {"log": None, "label": None, "metrics": None}
-            self._roi_skip_counters = {"log": 0, "label": 0, "metrics": 0}
+            for key in self._roi_skip_counters:
+                self._roi_skip_counters[key] = 0
             if self.debug:
                 log_debug("[ROI-STATS] Signatures reset due to window transition")
         if wtype in ("sell_overview", "buy_overview"):
@@ -5297,8 +5328,12 @@ class MarketTracker:
                 self._burst_fast_scans = max(self._burst_fast_scans, 5)
                 # also request immediate re-scans from single_scan (no wait)
                 self._request_immediate_rescan = max(self._request_immediate_rescan, 2)
+                # Flags aktiv lassen, bis erste verlässliche Deltas erfasst wurden
+                self._set_need_flag('detail_balance', True, "detail_window_active")
+                self._set_need_flag('detail_warehouse', True, "detail_window_active")
                 if self.debug:
                     log_debug(f"[BURST] 🚀 Detail-window burst enabled until {self._burst_until} (+{self._burst_fast_scans} fast scans, 80ms polling)")
+                
             else:
                 # Nicht in Detail-Fenster → Reset State
                 if self._detail_window_active:
@@ -5330,7 +5365,10 @@ class MarketTracker:
                         corrected_name = corrected_name or self._detail_window_entry_item
                         
                         # Check for "Transaction of" (auto-collect) - only if not already saved
-                        pattern_transaction = rf"Transaction\s+of\s+{item_escaped}\s+[xX]?(\d[\d,]+)\s+.*?(\d[\d,\.\s]+)\s+[Ss]ilver"
+                        pattern_transaction = (
+                            rf"Transaction\s+of\s+{item_escaped}\s+[xX]?(\d[\d,]+)"
+                            rf"\s+.*?(\d[\d,\.\s]+)\s+[Ss]ilver"
+                        )
                         matches_transaction = re.finditer(pattern_transaction, full_text, re.IGNORECASE)
                         
                         for match in matches_transaction:
@@ -5342,55 +5380,119 @@ class MarketTracker:
                                 autocollect_price = normalize_numeric_str(autocollect_price_str)
                                 
                                 if autocollect_price and autocollect_price > 0:
-                                    # Check if already saved
-                                    from database import get_connection, store_transaction_db
                                     conn = get_connection()
                                     cur = conn.cursor()
-                                    
                                     cur.execute('''
                                         SELECT COUNT(*) FROM transactions
                                         WHERE item_name = ?
-                                        AND quantity = ?
-                                        AND ABS(price - ?) < 1000
-                                        AND timestamp >= datetime('now', '-30 seconds')
+                                          AND quantity = ?
+                                          AND ABS(price - ?) < 1000
+                                          AND timestamp >= datetime('now', '-30 seconds')
                                     ''', (corrected_name, autocollect_qty, autocollect_price))
-                                    
-                                    if cur.fetchone()[0] == 0:
-                                        store_transaction_db(
-                                            item_name=corrected_name,
-                                            quantity=autocollect_qty,
-                                            price=autocollect_price,
-                                            transaction_type='buy',
-                                            tx_case='buy_collect',
-                                            timestamp=now,
-                                            occurrence_index=0
-                                        )
-                                        
-                                        if self.debug:
-                                            log_debug(
-                                                f"[DETAIL-FALLBACK] ✅ Auto-collect saved: "
-                                                f"{corrected_name} x{autocollect_qty} @ {autocollect_price:,}"
-                                            )
-                                        
-                                        # Mark old preorder as collected
-                                        matching_preorder = self._preorder_manager.find_matching_preorder(
-                                            item_name=corrected_name,
-                                            warehouse_delta=autocollect_qty,
-                                            balance_delta=-autocollect_price,
-                                            timestamp=now
-                                        )
-                                        if matching_preorder:
-                                            self._preorder_manager.mark_collected(
-                                                preorder_id=matching_preorder['id'],
-                                                collected_at=now,
-                                                tx_id=None
-                                            )
+                                    already_saved = cur.fetchone()[0] > 0
+
+                                    if not already_saved:
+                                        fallback_tx = {
+                                            'item_name': corrected_name,
+                                            'quantity': autocollect_qty,
+                                            'price': autocollect_price,
+                                            'transaction_type': 'buy',
+                                            'tx_case': 'buy_collect',
+                                            'timestamp': now,
+                                            'occurrence_index': 0,
+                                            '_from_detail_window': False,
+                                            'raw_related': [
+                                                {
+                                                    'source': 'detail_log_fallback_autocollect',
+                                                    'log_line': match.group(0),
+                                                }
+                                            ],
+                                        }
+
+                                        saved = False
+                                        try:
+                                            saved = self.store_transaction_db(fallback_tx)
+                                        except Exception as store_err:
                                             if self.debug:
-                                                log_debug(f"[DETAIL-FALLBACK] ✅ Marked preorder ID={matching_preorder['id']} as collected")
-                            
+                                                log_debug(f"[DETAIL-FALLBACK] ❌ Failed to store auto-collect: {store_err}")
+                                        
+                                        if saved:
+                                            if self.debug:
+                                                log_debug(
+                                                    f"[DETAIL-FALLBACK] ✅ Auto-collect saved: "
+                                                    f"{corrected_name} x{autocollect_qty} @ {autocollect_price:,}"
+                                                )
+                                            matching_preorder = self._preorder_manager.find_matching_preorder(
+                                                item_name=corrected_name,
+                                                warehouse_delta=autocollect_qty,
+                                                balance_delta=-autocollect_price,
+                                                timestamp=now
+                                            )
+                                            if matching_preorder:
+                                                self._preorder_manager.mark_collected(
+                                                    preorder_id=matching_preorder['id'],
+                                                    collected_at=now,
+                                                    tx_id=None
+                                                )
+                                                if self.debug:
+                                                    log_debug(f"[DETAIL-FALLBACK] ✅ Marked preorder ID={matching_preorder['id']} as collected")
+                                        elif self.debug:
+                                            log_debug(
+                                                f"[DETAIL-FALLBACK] ⚠️ Auto-collect not stored (duplicate/plausibility): "
+                                                f"{corrected_name} x{autocollect_qty}"
+                                            )
                             except Exception as e:
                                 if self.debug:
                                     log_debug(f"[DETAIL-FALLBACK] Error processing auto-collect: {e}")
+
+                        # Neue Preorder aus Log ableiten, falls Detail-Fenster zu früh geschlossen wurde
+                        pattern_placed = (
+                            rf"Placed\s+order\s+of\s+{item_escaped}\s+[xX]?(\d[\d,]+)"
+                            rf"\s+for\s+([\d,\.\s]+)\s+[Ss]ilver"
+                        )
+                        matches_placed = re.finditer(pattern_placed, full_text, re.IGNORECASE)
+                        for match in matches_placed:
+                            try:
+                                placed_qty = int(match.group(1).replace(',', ''))
+                                placed_price = normalize_numeric_str(match.group(2))
+                                if not placed_qty or placed_qty <= 0 or not placed_price or placed_price <= 0:
+                                    continue
+
+                                now_ts = datetime.datetime.now().timestamp()
+                                self._recent_preorder_hashes = {
+                                    k: v for k, v in self._recent_preorder_hashes.items()
+                                    if (now_ts - v) < self._recent_preorder_ttl
+                                }
+                                dedupe_key = (
+                                    corrected_name.lower(),
+                                    int(placed_qty),
+                                    int(placed_price)
+                                )
+                                last_seen = self._recent_preorder_hashes.get(dedupe_key)
+                                if last_seen and (now_ts - last_seen) < self._recent_preorder_ttl:
+                                    if self.debug:
+                                        log_debug(
+                                            f"[DETAIL-FALLBACK] Duplicate preorder detected via log for {corrected_name} "
+                                            f"x{placed_qty} @ {placed_price:,} – skipping"
+                                        )
+                                    continue
+
+                                preorder_id = self._preorder_manager.store_preorder(
+                                    item_name=corrected_name,
+                                    quantity=placed_qty,
+                                    price=placed_price,
+                                    timestamp=now
+                                )
+                                if preorder_id > 0:
+                                    self._recent_preorder_hashes[dedupe_key] = now_ts
+                                    if self.debug:
+                                        log_debug(
+                                            f"[DETAIL-FALLBACK] ✅ Stored preorder from log: {corrected_name} "
+                                            f"x{placed_qty} @ {placed_price:,} (ID={preorder_id})"
+                                        )
+                            except Exception as e:
+                                if self.debug:
+                                    log_debug(f"[DETAIL-FALLBACK] Error processing preorder placement: {e}")
                     
                     # 🔴 FIX #2: Force-Save BEVOR Reset!
                     self._force_save_pending_transaction()

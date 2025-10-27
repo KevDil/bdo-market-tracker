@@ -2,6 +2,7 @@
 - Reply to the user in German.
 
 ## Agent Interaction Guidelines
+Nutze immer, wenn es sinnvoll ist, die dir zur Verfügung stehenden MCP-Server.
 Befolge diese Schritte für jede Agenten‑Interaktion im Kontext dieses Repositories:
 
 1. Benutzeridentifikation
@@ -11,7 +12,6 @@ Befolge diese Schritte für jede Agenten‑Interaktion im Kontext dieses Reposit
 2. Memory‑Abruf
   - Beginne jede Chat‑Session mit dem einzigen Text "Remembering..." und rufe alle relevanten Informationen aus deinem Knowledge‑Graph ab.
   - Bezeichne diesen Knowledge‑Graph konsequent als dein "Memory".
-  - Verwende, wo sinnvoll, Context7 (z. B. für Bibliotheks‑Dokumentation oder API‑Referenzen) um aktuelle externe Referenzen zu laden.
 
 3. Memory (was beobachtet werden soll)
   - Achte während der Unterhaltung auf neue Informationen in diesen Kategorien und markiere sie für das Memory:

@@ -1,12 +1,15 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1050 Magical Shard im warehouse. 
-1. Click "Relist" auf bestehendes 200x Magical Shard Listing (davon 200x gefüllt)
-2. Neues Listing gesetzt: 200x @ 698,000,000 (brutto) → Altes Listing wird automatisch gecollected 200x @ 617,526,000 netto) 
-3. Detail-Fenster wird geschlossen
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 1 Crystal of Void Destruction im warehouse. 
+1. Öffnen des Marktfensters im sell-overview-fenster
+2. Click "Relist" auf bestehendes 1x Crystal of Void Destruction Listing (davon 1x gefüllt)
+3. Detail-Fenster öffnet sich
+4. Neues Listing gesetzt: x @ 2,170,000,000 (brutto) → Altes Listing wird automatisch gecollected 1x @ 1,925,332,500 netto) 
+5. Detail-Fenster wird automatisch direkt geschlossen
+6. Overview-Fenster wird geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 1050 sein 
-t=0.3: Neues Listing gesetzt und altes collected → 850 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 1 sein 
+t=0.3: Neues Listing gesetzt und altes collected → 0 im Warehouse [...]
 
-Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die transaktion wurde  nicht gespeichert. die alten transaktionen aus dem log wurden auch nicht gespeichert.
+Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die Crystal of Void Destruction transaktion wurde erst mit hilfe des logs gespeichert, das hätte aber schon mit den infos aus dem detail-fenster geschehen sollen.
 Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 

@@ -27,6 +27,7 @@ except ImportError:
 install_dependency_stubs()
 
 import tracker  # noqa: E402
+import database  # noqa: E402
 from tracker import MarketTracker  # noqa: E402
 from utils import normalize_numeric_str  # noqa: E402
 
@@ -592,6 +593,73 @@ class TestDetailWindowStateMachine:
         assert self.tracker._detail_baseline_balance == 2000000
         # Baseline wird direkt aus OCR-Ablesung gesetzt
         assert self.tracker._detail_baseline_warehouse == 10
+    
+    def test_relist_helix_elixir_fast_close_fallback(self, monkeypatch):
+        """Sicherstellt, dass Relist-Autocollects beim schnellen Schließen via Log-Fallback gespeichert werden."""
+
+        tracker_instance = MarketTracker(debug=False)
+        tracker_instance._preorder_manager = MagicMock()
+        tracker_instance._preorder_manager.find_matching_preorder.return_value = {
+            'id': 40,
+            'item_name': 'Helix Elixir',
+            'quantity': 500,
+            'price': 82_000_000,
+            'quantity_filled': 500,
+        }
+        tracker_instance._preorder_manager.store_preorder.return_value = 41
+
+        # Tracker erwartet aktive Detail-Session kurz vor dem Schließen
+        tracker_instance._detail_window_active = False
+        tracker_instance._detail_window_entry_item = 'Helix Elixir'
+        tracker_instance._detail_window_item = 'Helix Elixir'
+        tracker_instance._stable_window = 'buy_overview'
+
+        # store_transaction_db im Tracker beobachten
+        tracker_store_mock = MagicMock(return_value=True)
+        tracker_instance.store_transaction_db = tracker_store_mock
+
+        # Direkte DB-Aufrufe mocken, damit sie nicht ausgeführt werden
+        db_store_mock = MagicMock(return_value=True)
+        db_conn_mock = MagicMock()
+        db_conn_mock.cursor.return_value.fetchone.return_value = (None, None)
+
+        monkeypatch.setattr(database, 'store_transaction_db', db_store_mock)
+        monkeypatch.setattr(database, 'get_connection', MagicMock(return_value=db_conn_mock))
+
+        # Zeitstempel deterministisch halten
+        fixed_now = datetime.datetime(2025, 10, 27, 16, 47, 0)
+        monkeypatch.setattr(datetime, 'datetime', MagicMock(now=MagicMock(return_value=fixed_now)))
+
+        # OCR-Text simuliert Buy-Overview mit Transaction + Placed order
+        full_text = (
+            "2025.10.27 16:46 Transaction of Helix Elixir x500 worth 82,000,000 Silver\n"
+            "2025.10.27 16:46 Placed order of Helix Elixir x500 for 82,000,000 Silver\n"
+            "Orders Completed 1\nOrders 1\n"
+        )
+
+        tracker_instance.process_ocr_text(full_text)
+
+        # Prüfen, dass der Tracker selbst speichert
+        tracker_store_mock.assert_called()
+        saved_tx = tracker_store_mock.call_args.args[0]
+        assert saved_tx['item_name'] == 'Helix Elixir'
+        assert saved_tx['quantity'] == 500
+        assert saved_tx['price'] == 82_000_000
+        assert saved_tx['tx_case'] == 'buy_collect'
+
+        # Preorder muss als collected markiert werden
+        tracker_instance._preorder_manager.mark_collected.assert_called_once()
+
+        # Neue Preorder sollte trotz Detail-Abbruch erstellt werden
+        tracker_instance._preorder_manager.store_preorder.assert_called_once()
+        preorder_args = tracker_instance._preorder_manager.store_preorder.call_args
+        assert preorder_args.kwargs.get('item_name') == 'Helix Elixir'
+        assert preorder_args.kwargs.get('quantity') == 500
+        assert preorder_args.kwargs.get('price') == 82_000_000
+
+        # Alter Direkt-Import darf nicht mehr genutzt werden
+        db_store_mock.assert_not_called()
+
     
     def test_state_manual_reset(self):
         """Test: Manueller State-Reset"""
