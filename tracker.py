@@ -240,6 +240,8 @@ class MarketTracker:
         self._detail_relist_autocollect_signature: tuple[str, int, int] | None = None
         self._detail_relist_instant_signature: tuple[str, int, int] | None = None
         self._detail_relist_new_preorder_signature: tuple[str, int, int] | None = None
+        self._relist_side_effect_signatures: dict[tuple, float] = {}
+        self._relist_side_effect_ttl = 120.0
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -2121,16 +2123,16 @@ class MarketTracker:
 
         return price
 
-    def _recover_buy_price(
+    def _process_overview_text(
         self,
-        item_name: str,
-        quantity: int,
-        price: int | None,
-        entry: dict | None,
-        raw_related: list[dict],
+        full_text: str,
+        window_type: str,
+        prev_window: str | None = None,
+        entry: dict | None = None,
+        raw_related: list[dict] = [],
     ) -> int | None:
-        if not item_name or not quantity or quantity <= 0:
-            return price
+        if not full_text:
+            return None
 
         hint_values: list[int] = []
         hint_suffixes: list[str] = []
@@ -7011,54 +7013,15 @@ class MarketTracker:
             
             # ⚡ RELIST HANDLING: Process relist pattern (transaction + listed/placed at same timestamp)
             if tx.get('_is_relist'):
-                from preorder_manager import PreorderManager
-                pm = PreorderManager()
-                
-                # Extract transaction details
-                tx_item = tx['item_name']
-                tx_qty = tx['quantity']
-                tx_price = tx['price']
-                tx_ts = tx['timestamp']
-                tx_type = tx['transaction_type']
-                
-                # Get stored entries
-                listed_entry_stored = tx.get('_listed_entry')
-                placed_entry_stored = tx.get('_placed_entry')
-                
-                # Process based on side
-                if tx_type == 'sell' and listed_entry_stored:
-                    new_order_qty = listed_entry_stored.get('qty')
-                    new_order_price = listed_entry_stored.get('price')
-                    
-                    if new_order_qty and new_order_price and new_order_qty > 0 and new_order_price > 0:
-                        # Find and mark old listing as collected
-                        old_listing = pm.find_matching_listing(tx_item, tx_qty, tx_price, tx_ts)
-                        if old_listing:
-                            pm.mark_listing_collected(old_listing['id'], tx_ts, transaction_id=None)
-                            if self.debug:
-                                log_debug(f"[RELIST] Marked old listing ID={old_listing['id']} as collected")
-                        
-                        # Create NEW listing
-                        pm.store_listing(tx_item, new_order_qty, new_order_price, tx_ts)
-                        if self.debug:
-                            log_debug(f"[RELIST] Created new listing: {new_order_qty}x {tx_item} @ {new_order_price:,}")
-                
-                elif tx_type == 'buy' and placed_entry_stored:
-                    new_order_qty = placed_entry_stored.get('qty')
-                    new_order_price = placed_entry_stored.get('price')
-                    
-                    if new_order_qty and new_order_price and new_order_qty > 0 and new_order_price > 0:
-                        # Find and mark old preorder as collected
-                        old_preorder = pm.find_matching_preorder(tx_item, tx_qty, tx_price, tx_ts)
-                        if old_preorder:
-                            pm.mark_collected(old_preorder['id'], tx_ts, transaction_id=None)
-                            if self.debug:
-                                log_debug(f"[RELIST] Marked old preorder ID={old_preorder['id']} as collected")
-                        
-                        # Create NEW preorder
-                        pm.store_preorder(tx_item, new_order_qty, new_order_price, tx_ts)
-                        if self.debug:
-                            log_debug(f"[RELIST] Created new preorder: {new_order_qty}x {tx_item} @ {new_order_price:,}")
+                tx['_pending_relist'] = {
+                    'tx_item': tx.get('item_name'),
+                    'tx_qty': tx.get('quantity'),
+                    'tx_price': tx.get('price'),
+                    'tx_timestamp': tx.get('timestamp'),
+                    'tx_type': tx.get('transaction_type'),
+                    'listed_entry': tx.get('_listed_entry'),
+                    'placed_entry': tx.get('_placed_entry'),
+                }
 
             if final_type in ('sell', 'buy') and len(transaction_entries_sorted) > 1:
                 for extra_entry in transaction_entries_sorted[1:]:
@@ -7580,11 +7543,13 @@ class MarketTracker:
 
             # store in DB
             saved = self.store_transaction_db(tx)
-            if saved and isinstance(tx['timestamp'], datetime.datetime):
-                if not tx.get('_ui_inferred'):
-                    saved_any_ts.append(tx['timestamp'])
-                if self.debug:
-                    log_debug(f"[SAVE] ✅ {tx['transaction_type']} {tx['case']} {tx['quantity']}x {tx['item_name']} price={tx['price']} ts={tx['timestamp']}")
+            if saved:
+                self._apply_relist_side_effects(tx)
+                if isinstance(tx['timestamp'], datetime.datetime):
+                    if not tx.get('_ui_inferred'):
+                        saved_any_ts.append(tx['timestamp'])
+                    if self.debug:
+                        log_debug(f"[SAVE] ✅ {tx['transaction_type']} {tx['case']} {tx['quantity']}x {tx['item_name']} price={tx['price']} ts={tx['timestamp']}")
             elif self.debug:
                 log_debug(f"[SAVE] ❌ FAILED {tx['item_name']} {tx['quantity']}x @ {tx['timestamp']}")
 
@@ -7653,11 +7618,13 @@ class MarketTracker:
                 if occurrence_reused_fb:
                     continue
                 saved = self.store_transaction_db(fallback)
-                if saved and isinstance(fallback['timestamp'], datetime.datetime):
-                    if not fallback.get('_ui_inferred'):
-                        saved_any_ts.append(fallback['timestamp'])
-                    if self.debug:
-                        log_debug(f"fallback saved tx: {fallback['transaction_type']} {fallback['case']} {fallback['quantity']}x {fallback['item_name']} price={fallback['price']} ts={fallback['timestamp']}")
+                if saved:
+                    self._apply_relist_side_effects(fallback)
+                    if isinstance(fallback['timestamp'], datetime.datetime):
+                        if not fallback.get('_ui_inferred'):
+                            saved_any_ts.append(fallback['timestamp'])
+                        if self.debug:
+                            log_debug(f"fallback saved tx: {fallback['transaction_type']} {fallback['case']} {fallback['quantity']}x {fallback['item_name']} price={fallback['price']} ts={fallback['timestamp']}")
 
         # After batch, update last_processed_game_ts to max of saved or keep existing
         if saved_any_ts:
@@ -7768,6 +7735,129 @@ class MarketTracker:
                 pass
 
         self._persist_occurrence_state_if_needed()
+
+    def _apply_relist_side_effects(self, tx: dict) -> None:
+        if not tx or not tx.get('_pending_relist'):
+            return
+
+        payload = tx['_pending_relist']
+        tx_item = payload.get('tx_item')
+        tx_qty = payload.get('tx_qty')
+        tx_price = payload.get('tx_price')
+        tx_timestamp = payload.get('tx_timestamp')
+        tx_type = payload.get('tx_type')
+
+        try:
+            occurrence_idx = tx.get('occurrence_index')
+            ts_bucket = None
+            if isinstance(tx_timestamp, datetime.datetime):
+                ts_bucket = int(tx_timestamp.timestamp())
+            signature = (tx_type, (tx_item or '').lower(), int(tx_qty or 0), int(tx_price or 0), ts_bucket, occurrence_idx)
+        except Exception:
+            signature = None
+
+        now_ts = time.time()
+
+        if signature:
+            cutoff = now_ts - self._relist_side_effect_ttl
+            self._relist_side_effect_signatures = {
+                sig: ts
+                for sig, ts in self._relist_side_effect_signatures.items()
+                if ts >= cutoff
+            }
+            if self._relist_side_effect_signatures.get(signature):
+                if self.debug:
+                    log_debug(f"[RELIST] 🔁 Nebenwirkungen bereits angewendet für {tx_item} (signature={signature})")
+                return
+
+        pm = self._preorder_manager
+        listed_entry = payload.get('listed_entry')
+        placed_entry = payload.get('placed_entry')
+
+        def _safe_int(val):
+            try:
+                if val is None:
+                    return None
+                return int(val)
+            except (ValueError, TypeError):
+                return None
+
+        if tx_type == 'sell' and listed_entry:
+            new_qty = _safe_int(listed_entry.get('qty'))
+            new_price = _safe_int(listed_entry.get('price'))
+
+            if new_qty and new_qty > 0 and new_price and new_price > 0:
+                old_listing = pm.find_matching_listing(
+                    tx_item,
+                    tx_qty or 0,
+                    tx_price or 0,
+                    tx_timestamp or datetime.datetime.now(),
+                )
+                if old_listing:
+                    try:
+                        pm.mark_listing_collected(
+                            old_listing['id'],
+                            tx_timestamp or datetime.datetime.now(),
+                            transaction_id=tx.get('id'),
+                        )
+                        if self.debug:
+                            log_debug(f"[RELIST] ✅ Alte Listing ID={old_listing['id']} als collected markiert")
+                    except Exception as exc:
+                        if self.debug:
+                            log_debug(f"[RELIST] ❌ Mark Listing Collect fehlgeschlagen: {exc}")
+
+                try:
+                    pm.store_listing(
+                        tx_item,
+                        new_qty,
+                        new_price,
+                        tx_timestamp or datetime.datetime.now(),
+                    )
+                    if self.debug:
+                        log_debug(f"[RELIST] ✅ Neue Listing gespeichert: {new_qty}x {tx_item} @ {new_price:,}")
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[RELIST] ❌ Neue Listing speichern fehlgeschlagen: {exc}")
+
+        elif tx_type == 'buy' and placed_entry:
+            new_qty = _safe_int(placed_entry.get('qty'))
+            new_price = _safe_int(placed_entry.get('price'))
+
+            if new_qty and new_qty > 0 and new_price and new_price > 0:
+                old_preorder = pm.find_matching_preorder(
+                    tx_item,
+                    tx_qty or 0,
+                    tx_price or 0,
+                    tx_timestamp or datetime.datetime.now(),
+                )
+                if old_preorder:
+                    try:
+                        pm.mark_collected(
+                            old_preorder['id'],
+                            tx_timestamp or datetime.datetime.now(),
+                            transaction_id=tx.get('id'),
+                        )
+                        if self.debug:
+                            log_debug(f"[RELIST] ✅ Alte Preorder ID={old_preorder['id']} als collected markiert")
+                    except Exception as exc:
+                        if self.debug:
+                            log_debug(f"[RELIST] ❌ Mark Collected fehlgeschlagen: {exc}")
+
+                try:
+                    pm.store_preorder(
+                        tx_item,
+                        new_qty,
+                        new_price,
+                        tx_timestamp or datetime.datetime.now(),
+                    )
+                    if self.debug:
+                        log_debug(f"[RELIST] ✅ Neue Preorder gespeichert: {new_qty}x {tx_item} @ {new_price:,}")
+                except Exception as exc:
+                    if self.debug:
+                        log_debug(f"[RELIST] ❌ Neue Preorder speichern fehlgeschlagen: {exc}")
+
+        if signature:
+            self._relist_side_effect_signatures[signature] = now_ts
 
     # -----------------------
     # Scanning loops

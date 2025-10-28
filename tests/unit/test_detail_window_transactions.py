@@ -599,6 +599,60 @@ class TestDetailWindowStateMachine:
         assert instant['price'] == 2_100_000_000
         assert self.tracker._detail_relist_instant_signature is not None
 
+    def test_relist_side_effects_deferred_until_tx_saved(self):
+        preorder_manager_mock = MagicMock()
+        preorder_manager_mock.find_matching_preorder.return_value = {"id": 201, "item_name": "Unknown Seed"}
+        self.tracker._preorder_manager = preorder_manager_mock
+
+        store_calls: list[dict] = []
+
+        def fake_store(tx: dict) -> bool:
+            store_calls.append(tx)
+            saved_now = len(store_calls) == 2
+            if saved_now:
+                self.tracker._apply_relist_side_effects(tx)
+            return saved_now
+
+        self.tracker.store_transaction_db = fake_store
+
+        relist_candidate = {
+            'item_name': 'Unknown Seed',
+            'quantity': 10,
+            'price': 1_420_000_000,
+            'timestamp': datetime.datetime(2025, 10, 28, 11, 40, 0),
+            'transaction_type': 'buy',
+            'case': 'buy_relist_full',
+            'raw_related': [],
+            'occurrence_index': None,
+            'occurrence_slot': 0,
+            '_is_relist': True,
+            '_pending_relist': {
+                'tx_item': 'Unknown Seed',
+                'tx_qty': 10,
+                'tx_price': 1_420_000_000,
+                'tx_timestamp': datetime.datetime(2025, 10, 28, 11, 40, 0),
+                'tx_type': 'buy',
+                'placed_entry': {'qty': 10, 'price': 1_420_000_000},
+                'listed_entry': None,
+            },
+        }
+
+        self.tracker.seen_tx_signatures.clear()
+        self.tracker._relist_side_effect_signatures.clear()
+
+        saved = self.tracker.store_transaction_db(relist_candidate)
+        assert saved is False
+        preorder_manager_mock.store_preorder.assert_not_called()
+        preorder_manager_mock.mark_collected.assert_not_called()
+
+        relist_candidate['_pending_relist']['tx_timestamp'] = datetime.datetime(2025, 10, 28, 11, 41, 0)
+
+        saved_second = self.tracker.store_transaction_db(relist_candidate)
+        assert saved_second is True
+        preorder_manager_mock.store_preorder.assert_called_once()
+        preorder_manager_mock.mark_collected.assert_called_once()
+        assert self.tracker._relist_side_effect_signatures
+
     def test_state_no_change_no_transaction(self):
         """Test: Keine Änderung → Keine Transaktion"""
         ocr_text = """

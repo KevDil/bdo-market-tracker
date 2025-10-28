@@ -103,3 +103,49 @@ def test_relist_partial_autocollect_handles_missing_warehouse(monkeypatch, track
     assert preorder_kwargs["item_name"] == "Gem of Void"
     assert preorder_kwargs["quantity"] == 10
     assert preorder_kwargs["price"] == 448_000_000
+
+
+def test_apply_relist_side_effects_idempotent(tracker_with_mocks):
+    tracker = tracker_with_mocks
+    tracker._relist_side_effect_signatures.clear()
+    tracker._preorder_manager.reset_mock()
+    tracker._preorder_manager.find_matching_preorder.return_value = {
+        "id": 51,
+        "item_name": "Gem of Void",
+    }
+
+    tx_payload = {
+        'item_name': 'Gem of Void',
+        'quantity': 10,
+        'price': 448_000_000,
+        'timestamp': datetime.datetime(2025, 10, 27, 18, 45, 0),
+        'transaction_type': 'buy',
+        'occurrence_index': None,
+        '_pending_relist': {
+            'tx_item': 'Gem of Void',
+            'tx_qty': 10,
+            'tx_price': 448_000_000,
+            'tx_timestamp': datetime.datetime(2025, 10, 27, 18, 45, 0),
+            'tx_type': 'buy',
+            'placed_entry': {'qty': 10, 'price': 448_000_000},
+            'listed_entry': None,
+        },
+    }
+
+    tracker._apply_relist_side_effects(tx_payload)
+    tracker._apply_relist_side_effects(tx_payload)
+
+    tracker._preorder_manager.find_matching_preorder.assert_called_once()
+    tracker._preorder_manager.store_preorder.assert_called_once()
+    tracker._preorder_manager.mark_collected.assert_called_once()
+
+
+def test_apply_relist_side_effects_no_payload(tracker_with_mocks):
+    tracker = tracker_with_mocks
+    tracker._preorder_manager.reset_mock()
+
+    tracker._apply_relist_side_effects({'item_name': 'Gem of Void'})
+
+    tracker._preorder_manager.find_matching_preorder.assert_not_called()
+    tracker._preorder_manager.store_preorder.assert_not_called()
+    tracker._preorder_manager.mark_collected.assert_not_called()
