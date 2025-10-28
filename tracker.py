@@ -239,6 +239,7 @@ class MarketTracker:
         self._detail_pending_snapshot_hashes: set[str] = set()
         self._detail_relist_autocollect_signature: tuple[str, int, int] | None = None
         self._detail_relist_instant_signature: tuple[str, int, int] | None = None
+        self._detail_relist_new_preorder_signature: tuple[str, int, int] | None = None
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -1694,20 +1695,27 @@ class MarketTracker:
                 timestamp=ts_value
             )
             if matching_preorder:
-                self._preorder_manager.mark_collected(
+                marked = self._preorder_manager.mark_collected(
                     preorder_id=matching_preorder['id'],
                     collected_at=ts_value,
-                    tx_id=None
+                    transaction_id=None
                 )
-                filled_existing = matching_preorder.get('quantity_filled') or 0
-                total_quantity = matching_preorder.get('quantity') or qty
-                new_filled = min(total_quantity, max(filled_existing, qty))
-                if new_filled > filled_existing:
-                    self._preorder_manager.update_quantity_filled(
-                        preorder_id=matching_preorder['id'],
-                        filled_quantity=new_filled
-                    )
-                handled = True
+                if not marked:
+                    if self.debug:
+                        log_debug(
+                            f"[DETAIL] ⚠️ Failed to mark preorder ID={matching_preorder['id']} as collected"
+                        )
+                else:
+                    filled_existing = matching_preorder.get('quantity_filled') or 0
+                    total_quantity = matching_preorder.get('quantity') or qty
+                    new_filled = min(total_quantity, max(filled_existing, qty))
+                    if new_filled > filled_existing:
+                        self._preorder_manager.update_quantity_filled(
+                            preorder_id=matching_preorder['id'],
+                            filled_quantity=new_filled
+                        )
+                    handled = True
+
         if not handled and window_type == 'sell_overview':
             matching_listing = self._preorder_manager.find_matching_listing(
                 item_name=normalized_name,
@@ -1716,11 +1724,15 @@ class MarketTracker:
                 timestamp=ts_value
             )
             if matching_listing:
-                self._preorder_manager.mark_listing_collected(
+                marked_listing = self._preorder_manager.mark_listing_collected(
                     listing_id=matching_listing['id'],
                     collected_at=ts_value,
                     transaction_id=None
                 )
+                if not marked_listing and self.debug:
+                    log_debug(
+                        f"[DETAIL] ⚠️ Failed to mark listing ID={matching_listing['id']} as collected"
+                    )
 
     def _reconstruct_missing_preorder_from_log(
         self,
@@ -2592,11 +2604,25 @@ class MarketTracker:
                 if desired_val is not None:
                     metrics['desired_price'] = desired_val
 
+            desired_amount_match = re.search(r'(desired\s+amount)\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
+            if desired_amount_match:
+                desired_amount_val = normalize_numeric_str(desired_amount_match.group(2))
+                if desired_amount_val is not None:
+                    metrics['desired_amount'] = desired_amount_val
+                    metrics['quantity'] = desired_amount_val
+
             set_price_match = re.search(r'(set\s+price)\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
             if set_price_match:
                 set_price_val = normalize_numeric_str(set_price_match.group(2))
                 if set_price_val is not None:
                     metrics['set_price'] = set_price_val
+
+            register_qty_match = re.search(r'(register\s+quantity)\s*[:]?\s*([0-9OolI\|,\.]+)', s, re.IGNORECASE)
+            if register_qty_match:
+                register_val = normalize_numeric_str(register_qty_match.group(2))
+                if register_val is not None:
+                    metrics['register_quantity'] = register_val
+                    metrics['quantity'] = register_val
 
             warehouse_patterns = [
                 r'(?:warehouse\s+quantity|warehouse|wh)\s*[:]??\s*([0-9OolI\|,\.]+)',
@@ -2613,7 +2639,7 @@ class MarketTracker:
             # ⚡ FIX: Sell-Side nutzt "In Stock" statt "Warehouse Quantity"!
             in_stock_pattern = re.compile(
                 r'In\s+Stock\s*[:;]?\s*([0-9,\.]+)',
-                re.IGNORECASE
+                re.IGNORECASE,
             )
             m = in_stock_pattern.search(s)
             if m:
@@ -2625,7 +2651,7 @@ class MarketTracker:
             if 'warehouse_qty' not in metrics:
                 warehouse_pattern_overview = re.compile(
                     r'(?:Warehouse\s*(?:Quantity)?|WH)\s*[:;]?\s*([0-9,\.]+)',
-                    re.IGNORECASE
+                    re.IGNORECASE,
                 )
                 m = warehouse_pattern_overview.search(s)
                 if m:
@@ -2639,7 +2665,7 @@ class MarketTracker:
             if 'warehouse_qty' not in metrics:
                 warehouse_pattern_detail = re.compile(
                     r'([0-9,\.]+)\s+Warehouse\s+Quantity',
-                    re.IGNORECASE
+                    re.IGNORECASE,
                 )
                 for line in s.split('\n'):
                     m = warehouse_pattern_detail.search(line)
@@ -2731,7 +2757,6 @@ class MarketTracker:
             self._set_need_flag('detail_warehouse', True, "detail_extract_exception")
             return None
 
-    @lru_cache(maxsize=500)
     def _valid_item_name(self, name: str) -> bool:
         """
         Validiert einen Itemnamen:
@@ -3413,11 +3438,13 @@ class MarketTracker:
         self._detail_last_transaction_saved = None
         self._detail_relist_autocollect_signature = None
         self._detail_relist_instant_signature = None
+        self._detail_relist_new_preorder_signature = None
         self._detail_pending_log_snapshots = []
         self._detail_pending_snapshot_hashes.clear()
         self._force_detail_metric_refresh = False
         self._last_detail_balance_text = ""
         self._last_detail_warehouse_text = ""
+        self._set_need_flag('detail_inputs', False, "detail_state_reset")
         self._set_detail_metric_state("idle", reason)
         if self.debug:
             log_debug(f"[DETAIL] State reset ({reason})")
@@ -3769,7 +3796,25 @@ class MarketTracker:
             )
 
             if preorder_id > 0:
+                now_saved = datetime.datetime.now()
                 self._recent_preorder_hashes[dedupe_key] = now_ts
+                self._detail_last_transaction_saved = now_saved
+                self._detail_baseline_balance = current_metrics.get('balance', self._detail_baseline_balance)
+                self._detail_baseline_warehouse = current_metrics.get('warehouse_qty', self._detail_baseline_warehouse)
+                self._detail_last_metrics = current_metrics.copy() if isinstance(current_metrics, dict) else {
+                    'balance': self._detail_baseline_balance,
+                    'warehouse_qty': self._detail_baseline_warehouse,
+                }
+                self._detail_partial_balance_delta = 0
+                self._detail_partial_warehouse_delta = 0
+                self._detail_balance_changed_once = False
+                self._detail_warehouse_changed_once = False
+                self._detail_cached_input_fields = {
+                    'quantity': int(preorder_qty),
+                    'price': int(preorder_unit_price)
+                }
+                self._detail_cached_input_timestamp = now_saved
+                self._set_need_flag('detail_inputs', False, 'preorder_detect_saved')
                 if self.debug:
                     log_debug(
                         f"[PREORDER-PLACED] ✅ Detected: {corrected_name} "
@@ -4336,10 +4381,10 @@ class MarketTracker:
                 baseline_warehouse = min(s['warehouse'] for s in samples)
             else:  # sell_item
                 baseline_warehouse = max(s['warehouse'] for s in samples)
-            
+
             # Balance vom ersten Sample (sollte stabil sein)
             baseline_balance = samples[0]['balance']
-            
+
             # ⚡ BASELINE SET: Nutze konservativste Warehouse-Menge
             self._detail_window_active = True
             self._detail_window_type = window_type
@@ -4353,35 +4398,36 @@ class MarketTracker:
             self._detail_detail_snapshot_ts = datetime.datetime.now()
             self._force_detail_metric_refresh = True
             self._set_detail_metric_state("delta", "baseline_captured")
-            
+
             # Reset Delta-Akkumulation
             self._detail_partial_balance_delta = 0
             self._detail_partial_warehouse_delta = 0
             self._detail_balance_delta_timestamp = None
-            
+
             # ✅ CRITICAL FIX: Proaktive Input-Field-Extraktion
             # Extract input fields IMMEDIATELY at baseline capture!
             # This is CRITICAL for Relist detection where balance_delta won't help us.
             # The input fields show the NEW preorder values even before any transaction happens.
             self._detail_cached_input_fields = None
             self._detail_cached_input_timestamp = None
-            
+
             if window_type == 'buy_item' and img is not None and proc_img is not None:
+                self._set_need_flag('detail_inputs', True, "detail_baseline_capture")
                 if self.debug:
                     log_debug(f"[DETAIL] 🔍 Extracting preorder input fields from baseline frame...")
-                
+
                 try:
                     input_fields = self._extract_preorder_input_fields(
                         img=img,
                         proc_img=proc_img,
                         window_type=window_type
                     )
-                    
+
                     if input_fields and 'quantity' in input_fields and 'price' in input_fields:
                         # Cache for later use (valid for 5 seconds)
                         self._detail_cached_input_fields = input_fields
                         self._detail_cached_input_timestamp = now
-                        
+
                         total = input_fields['price'] * input_fields['quantity']
                         if self.debug:
                             log_debug(
@@ -4390,12 +4436,14 @@ class MarketTracker:
                                 f"(total: {total:,})"
                             )
                     else:
+                        self._set_need_flag('detail_inputs', True, "detail_input_incomplete")
                         if self.debug:
                             log_debug(f"[DETAIL] ⚠️ Input field extraction failed (incomplete data)")
                 except Exception as e:
+                    self._set_need_flag('detail_inputs', True, "detail_input_error")
                     if self.debug:
                         log_debug(f"[DETAIL] ⚠️ Input field extraction error: {e}")
-            
+
             if self.debug:
                 log_debug(
                     f"[DETAIL] ⚡ BASELINE CAPTURED\n"
@@ -4773,6 +4821,14 @@ class MarketTracker:
                                 f"[RELIST] 🔁 Auto-collect bereits in dieser Session gespeichert: "
                                 f"{expected_autocollect_qty:,}x {corrected_name}"
                             )
+                        # Baselines synchronisieren, damit keine erneuten Saves ausgelöst werden
+                        self._detail_last_transaction_saved = timestamp_now
+                        self._detail_baseline_balance = current_balance
+                        self._detail_baseline_warehouse = current_warehouse
+                        self._detail_last_metrics = current_metrics.copy()
+                        if consume_log_fallback_entry and consume_log_fallback_entry in self._pending_log_fallback_txs:
+                            self._pending_log_fallback_txs.remove(consume_log_fallback_entry)
+                        return
                     else:
                         autocollect_tx = {
                             'item_name': corrected_name,
@@ -4809,17 +4865,24 @@ class MarketTracker:
                                 if consume_log_fallback_entry and consume_log_fallback_entry in self._pending_log_fallback_txs:
                                     self._pending_log_fallback_txs.remove(consume_log_fallback_entry)
                                 if matching_preorder.get('id'):
-                                    self._preorder_manager.mark_collected(
+                                    marked = self._preorder_manager.mark_collected(
                                         preorder_id=matching_preorder['id'],
                                         collected_at=timestamp_now,
-                                        tx_id=None,
+                                        transaction_id=None,
                                     )
-                                    if self.debug:
+                                    if not marked and self.debug:
+                                        log_debug(
+                                            f"[RELIST] ⚠️ Failed to mark old preorder ID={matching_preorder['id']} as collected"
+                                        )
+                                    elif self.debug:
                                         log_debug(
                                             f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected"
                                         )
                                 self._detail_relist_autocollect_signature = autocollect_signature
                                 self._detail_last_transaction_saved = timestamp_now
+                                self._detail_baseline_balance = current_balance
+                                self._detail_baseline_warehouse = current_warehouse
+                                self._detail_last_metrics = current_metrics.copy()
                             elif self.debug:
                                 log_debug(
                                     f"[RELIST] ⚠️ Auto-collect nicht gespeichert (Dedupe oder Plausibilität): "
@@ -4869,7 +4932,37 @@ class MarketTracker:
                         try:
                             preorder_timestamp = current_metrics.get('timestamp') or datetime.datetime.now()
 
-                            new_preorder_unit_price = new_preorder_total / new_preorder_qty if new_preorder_qty > 0 else 0
+                            # Primär: Verwende ROI-Cache falls aktuell verfügbar (max 3s alt)
+                            metrics_qty = None
+                            metrics_price = None
+                            cached_fields = getattr(self, '_detail_cached_input_fields', None)
+                            cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
+                            if cached_fields and cached_ts and isinstance(cached_ts, datetime.datetime):
+                                if (timestamp_now - cached_ts).total_seconds() <= 3.0:
+                                    try:
+                                        cand_qty = int(cached_fields.get('quantity'))
+                                        if cand_qty > 0:
+                                            metrics_qty = cand_qty
+                                    except Exception:
+                                        metrics_qty = None
+                                    try:
+                                        cand_price = int(cached_fields.get('price'))
+                                        if cand_price > 0:
+                                            metrics_price = cand_price
+                                    except Exception:
+                                        metrics_price = None
+
+                            if metrics_qty and metrics_price:
+                                new_preorder_qty = metrics_qty
+                                new_preorder_unit_price = metrics_price
+                                new_preorder_total = new_preorder_qty * new_preorder_unit_price
+                                if self.debug:
+                                    log_debug(
+                                        f"[RELIST] ROI cache reused for new preorder: "
+                                        f"{new_preorder_qty:,}x @ {new_preorder_unit_price:,}"
+                                    )
+                            else:
+                                new_preorder_unit_price = new_preorder_total / new_preorder_qty if new_preorder_qty > 0 else 0
 
                             dedupe_key = (
                                 corrected_name.lower(),
@@ -4892,14 +4985,44 @@ class MarketTracker:
                                     )
                             else:
                                 self._capture_detail_debug_images('relist_new_preorder', img, proc_img)
-                                preorder_id = self._preorder_manager.store_preorder(
-                                    item_name=corrected_name,
-                                    quantity=new_preorder_qty,
-                                    price=new_preorder_total,
-                                    timestamp=preorder_timestamp
+                                relist_signature = (
+                                    corrected_name.lower(),
+                                    int(new_preorder_qty),
+                                    int(round(new_preorder_total))
                                 )
-                                if preorder_id > 0:
-                                    self._recent_preorder_hashes[dedupe_key] = now_ts
+
+                                if self._detail_relist_new_preorder_signature == relist_signature:
+                                    if self.debug:
+                                        log_debug(
+                                            f"[RELIST] 🔁 New preorder already stored this session: "
+                                            f"{new_preorder_qty:,}x {corrected_name}"
+                                        )
+                                else:
+                                    self._capture_detail_debug_images('relist_new_preorder', img, proc_img)
+                                    preorder_id = self._preorder_manager.store_preorder(
+                                        item_name=corrected_name,
+                                        quantity=new_preorder_qty,
+                                        price=new_preorder_total,
+                                        timestamp=preorder_timestamp
+                                    )
+                                    if preorder_id > 0:
+                                        now_saved = datetime.datetime.now()
+                                        self._recent_preorder_hashes[dedupe_key] = now_ts
+                                        self._detail_relist_new_preorder_signature = relist_signature
+                                        self._detail_last_transaction_saved = now_saved
+                                        self._detail_baseline_balance = current_balance
+                                        self._detail_baseline_warehouse = current_warehouse
+                                        self._detail_last_metrics = current_metrics.copy()
+                                        self._detail_partial_balance_delta = 0
+                                        self._detail_partial_warehouse_delta = 0
+                                        self._detail_balance_changed_once = False
+                                        self._detail_warehouse_changed_once = False
+                                        self._detail_cached_input_fields = {
+                                            'quantity': int(new_preorder_qty),
+                                            'price': int(new_preorder_unit_price)
+                                        }
+                                        self._detail_cached_input_timestamp = now_saved
+                                        self._set_need_flag('detail_inputs', False, 'relist_new_preorder_saved')
 
 
                             if self.debug:
@@ -5595,13 +5718,16 @@ class MarketTracker:
                                                 timestamp=now
                                             )
                                             if matching_preorder:
-                                                self._preorder_manager.mark_collected(
+                                                marked = self._preorder_manager.mark_collected(
                                                     preorder_id=matching_preorder['id'],
                                                     collected_at=now,
-                                                    tx_id=None
+                                                    transaction_id=None
                                                 )
                                                 if self.debug:
-                                                    log_debug(f"[DETAIL-FALLBACK] ✅ Marked preorder ID={matching_preorder['id']} as collected")
+                                                    if marked:
+                                                        log_debug(f"[DETAIL-FALLBACK] ✅ Marked preorder ID={matching_preorder['id']} as collected")
+                                                    else:
+                                                        log_debug(f"[DETAIL-FALLBACK] ⚠️ Failed to mark preorder ID={matching_preorder['id']} as collected")
                                         elif self.debug:
                                             log_debug(
                                                 f"[DETAIL-FALLBACK] ⚠️ Auto-collect not stored (duplicate/plausibility): "
