@@ -116,6 +116,8 @@ def test_sell_item_triggers_listing_detection():
     # Setup: Mock OCR results with Magical Shard
     # Assert: _detect_listing_placement called
     # Assert: store_listing creates new DB entry
+
+# Neuer Unit-Test `test_listing_placement_uses_cached_input_fields` prüft, dass Detail-Listings die gecachten Werte konsumieren.
 ```
 
 ---
@@ -150,8 +152,8 @@ def mark_listing_collected(self, listing_id, transaction_id=None, tx_id=None, ..
 ```
 
 **Akzeptanzkriterien:**
-- ✅ Kein TypeError mehr bei Auto-Collect
-- ✅ Listing wird korrekt als collected markiert
+- Kein TypeError mehr bei Auto-Collect
+- Listing wird korrekt als collected markiert
 
 ### 3.2 Auto-Collect Test
 **Datei:** `tests/unit/test_listing_auto_collect.py` (neu)
@@ -208,9 +210,9 @@ def _detect_listing_placement(self, item_name, warehouse_delta, ...):
 ```
 
 **Akzeptanzkriterien:**
-- ✅ Alte Listing: `status='collected'`, `collected_at` gesetzt
-- ✅ Neue Listing: `status='active'`, korrekte Quantity/Price
-- ✅ Transaction-Eintrag für collected Items (122×381,020,640 netto)
+- Alte Listing: `status='collected'`, `collected_at` gesetzt
+- Neue Listing: `status='active'`, korrekte Quantity/Price
+- Transaction-Eintrag für collected Items (122×381,020,640 netto)
 
 ### 4.2 Logging & Duplicate-Guards
 **Datei:** `preorder_manager.py`
@@ -224,8 +226,8 @@ def _detect_listing_placement(self, item_name, warehouse_delta, ...):
   - Cache: `{item_name}_{quantity}_{price}: timestamp`
 
 **Akzeptanzkriterien:**
-- ✅ Klare Log-Messages bei Listing-Operationen
-- ✅ Keine Duplikate bei schnellen Relist-Aktionen
+- Klare Log-Messages bei Listing-Operationen
+- Keine Duplikate bei schnellen Relist-Aktionen
 
 ---
 
@@ -261,8 +263,8 @@ python scripts/run_all_tests.py
 ```
 
 **Akzeptanzkriterien:**
-- ✅ Alle Unit-Tests bestehen
-- ✅ Keine Regressions-Fehler in bestehenden Tests
+- Alle Unit-Tests bestehen
+- Keine Regressions-Fehler in bestehenden Tests
 
 ### 5.3 Manuelle Autotrack-Session
 **Durchführung:**
@@ -307,14 +309,13 @@ python scripts/run_all_tests.py
 ## [Version X.X.X] - 2025-10-26
 
 ### Fixed
-- Detail-Window State wird jetzt korrekt initialisiert (keine AttributeErrors mehr)
-- Relist-Operationen speichern neue Listings korrekt in der DB
+- Detail-Baseline-Capture puffert jetzt IMMER die Eingabefelder (Preis/Menge) der Detailfenster – nicht nur für `buy_item`, sondern auch für `sell_item`. Die Werte bleiben für 5 s gültig und werden direkt nach erfolgreichem Listing wieder gelöscht. Listing-Detection nutzt den Cache priorisiert und ruft die ROI-Extraktion nur noch als Fallback auf.
 - Auto-Collect verwendet korrektes API-Keyword (transaction_id)
 - Warehouse-Baseline wird auch bei verzögertem OCR korrekt erfasst
 
 ### Added
 - Duplicate-Guards für Listing-Operationen (TTL-basiert)
-- Erweiterte Logging für Auto-Collect Pipeline
+- Erweiterte Logging-Optionen
 - Unit-Tests für sell_item Detail-Window
 ```
 

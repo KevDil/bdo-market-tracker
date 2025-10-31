@@ -3579,7 +3579,9 @@ class MarketTracker:
         current_metrics: dict,
         timestamp: datetime.datetime,
         img=None,
-        proc_img=None
+        proc_img=None,
+        cached_input: Optional[dict] = None,
+        cached_timestamp: Optional[datetime.datetime] = None
     ) -> bool:
         """
         Detect when user places a preorder in detail-window.
@@ -3839,7 +3841,9 @@ class MarketTracker:
         current_metrics: dict,
         timestamp: datetime.datetime,
         img=None,
-        proc_img=None
+        proc_img=None,
+        cached_input: Optional[dict] = None,
+        cached_timestamp: Optional[datetime.datetime] = None
     ) -> bool:
         """
         Detect when user places a listing (sell order) in detail-window.
@@ -3876,28 +3880,63 @@ class MarketTracker:
             extraction_method = "unknown"
             
             # ═══════════════════════════════════════════════════════════════
-            # STRATEGY 1 (PRIMARY): Extract from Detail-Window Input Fields
+            # STRATEGY 1 (PRIMARY): Use cached baseline input fields when fresh
             # ═══════════════════════════════════════════════════════════════
-            
-            if img is not None and proc_img is not None:
+
+            cache_used = False
+            if cached_input and isinstance(cached_input, dict) and cached_timestamp:
+                try:
+                    cache_age = (datetime.datetime.now() - cached_timestamp).total_seconds()
+                except Exception:
+                    cache_age = None
+
+                if cache_age is not None and cache_age <= 5.0:
+                    try:
+                        listing_qty = int(cached_input.get('quantity'))
+                        listing_unit_price = int(cached_input.get('price'))
+                    except Exception:
+                        listing_qty = cached_input.get('quantity')
+                        listing_unit_price = cached_input.get('price')
+
+                    if listing_qty and listing_unit_price:
+                        listing_price = listing_unit_price * listing_qty
+                        extraction_method = "cached_input_fields"
+                        cache_used = True
+                        if self.debug:
+                            log_debug(
+                                f"[LISTING-DETECT] ✅ Using cached input fields: "
+                                f"{listing_qty:,}x @ {listing_unit_price:,}/ea "
+                                f"(total: {listing_price:,})"
+                            )
+
+            # ═══════════════════════════════════════════════════════════════
+            # STRATEGY 2: On-demand extraction if cache missing (same frame)
+            # ═══════════════════════════════════════════════════════════════
+
+            if not cache_used and img is not None and proc_img is not None:
                 input_fields = self._extract_preorder_input_fields(
                     img=img,
                     proc_img=proc_img,
                     window_type='sell_item'
                 )
-                
+
                 if input_fields and 'price' in input_fields and 'quantity' in input_fields:
-                    listing_qty = input_fields['quantity']
-                    listing_unit_price = input_fields['price']
-                    listing_price = listing_unit_price * listing_qty
-                    extraction_method = "input_fields_roi"
-                    
-                    if self.debug:
-                        log_debug(
-                            f"[LISTING-DETECT] ✅ ROI Extraction SUCCESS: "
-                            f"{listing_qty:,}x @ {listing_unit_price:,}/ea "
-                            f"(total: {listing_price:,}, method: {extraction_method})"
-                        )
+                    try:
+                        listing_qty = int(input_fields['quantity'])
+                        listing_unit_price = int(input_fields['price'])
+                    except Exception:
+                        listing_qty = input_fields['quantity']
+                        listing_unit_price = input_fields['price']
+
+                    if listing_qty and listing_unit_price:
+                        listing_price = listing_unit_price * listing_qty
+                        extraction_method = "input_fields_roi"
+                        if self.debug:
+                            log_debug(
+                                f"[LISTING-DETECT] ✅ ROI Extraction SUCCESS: "
+                                f"{listing_qty:,}x @ {listing_unit_price:,}/ea "
+                                f"(total: {listing_price:,}, method: {extraction_method})"
+                            )
             
             # ═══════════════════════════════════════════════════════════════
             # STRATEGY 2 (FALLBACK): Calculate from warehouse_delta
@@ -4413,10 +4452,11 @@ class MarketTracker:
             self._detail_cached_input_fields = None
             self._detail_cached_input_timestamp = None
 
-            if window_type == 'buy_item' and img is not None and proc_img is not None:
+            if window_type in ('buy_item', 'sell_item') and img is not None and proc_img is not None:
+                purpose = "preorder" if window_type == 'buy_item' else "listing"
                 self._set_need_flag('detail_inputs', True, "detail_baseline_capture")
                 if self.debug:
-                    log_debug(f"[DETAIL] 🔍 Extracting preorder input fields from baseline frame...")
+                    log_debug(f"[DETAIL] 🔍 Extracting {purpose} input fields from baseline frame...")
 
                 try:
                     input_fields = self._extract_preorder_input_fields(
@@ -4426,17 +4466,32 @@ class MarketTracker:
                     )
 
                     if input_fields and 'quantity' in input_fields and 'price' in input_fields:
-                        # Cache for later use (valid for 5 seconds)
-                        self._detail_cached_input_fields = input_fields
-                        self._detail_cached_input_timestamp = now
+                        try:
+                            cached_quantity = int(input_fields['quantity'])
+                            cached_price = int(input_fields['price'])
+                        except Exception:
+                            cached_quantity = input_fields['quantity']
+                            cached_price = input_fields['price']
 
-                        total = input_fields['price'] * input_fields['quantity']
-                        if self.debug:
-                            log_debug(
-                                f"[DETAIL] ✅ Input fields cached: "
-                                f"{input_fields['quantity']:,}x @ {input_fields['price']:,} "
-                                f"(total: {total:,})"
-                            )
+                        if cached_quantity and cached_price:
+                            # Cache for later use (valid for 5 seconds)
+                            self._detail_cached_input_fields = {
+                                'quantity': cached_quantity,
+                                'price': cached_price,
+                            }
+                            self._detail_cached_input_timestamp = now
+
+                            total = cached_price * cached_quantity
+                            if self.debug:
+                                log_debug(
+                                    f"[DETAIL] ✅ {purpose.title()} inputs cached: "
+                                    f"{cached_quantity:,}x @ {cached_price:,} "
+                                    f"(total: {total:,})"
+                                )
+                        else:
+                            self._set_need_flag('detail_inputs', True, "detail_input_incomplete")
+                            if self.debug:
+                                log_debug(f"[DETAIL] ⚠️ Input field extraction failed (incomplete data)")
                     else:
                         self._set_need_flag('detail_inputs', True, "detail_input_incomplete")
                         if self.debug:
@@ -5151,14 +5206,18 @@ class MarketTracker:
         # This MUST happen BEFORE plausibility check to avoid false rejections
         # Sell-side analog to preorder placement: items moved TO market, no silver received yet
         if abs(balance_delta) < 1000 and warehouse_delta < 0 and window_type == 'sell_item':
+            cached_fields = getattr(self, '_detail_cached_input_fields', None)
+            cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
             # Listing placement detected!
             listing_detected = self._detect_listing_placement(
                 item_name=self._detail_window_item,
                 warehouse_delta=warehouse_delta,
                 current_metrics=current_metrics,
                 timestamp=datetime.datetime.now(),
-                balance_delta=balance_delta,
-                cached_input=self._detail_cached_input_fields if hasattr(self, '_detail_cached_input_fields') else None
+                cached_input=cached_fields,
+                cached_timestamp=cached_ts,
+                img=img,
+                proc_img=proc_img
             )
             
             if listing_detected:
@@ -5166,6 +5225,10 @@ class MarketTracker:
                 self._detail_baseline_balance = current_balance
                 self._detail_baseline_warehouse = current_warehouse
                 self._detail_last_metrics = current_metrics.copy()
+
+                # Cached input fields have been consumed for this listing
+                self._detail_cached_input_fields = None
+                self._detail_cached_input_timestamp = None
                 
                 # Reset delta accumulators
                 self._detail_partial_balance_delta = 0

@@ -1,15 +1,15 @@
-Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 2820 Magical Shard im warehouse. 
+Nun habe ich folgenden Test im Autotrack durchgeführt: beim öffnen des markts waren 3060 Magical Shard im warehouse und davon noch 79x gelistet. 
 1. Öffnen des Marktfensters im sell-overview-fenster
-2. Click "Relist" auf bestehendes 80x Magical Shard Listing (davon 80x gefüllt)
+2. Click "Relist" auf bestehendes 200x Magical Shard Listing (davon 121x gefüllt)
 3. Detail-Fenster öffnet sich
-4. Neues Listing gesetzt: 200x @ 652,000,000 (brutto) → Altes Listing wird automatisch gecollected 80x @ 232,814,400 (netto) 
+4. Neues Listing gesetzt: 200x @ 664,000,000 (brutto) → Altes Listing wird automatisch gecollected 121x @ 360,720,360 (netto) 
 5. Detail-Fenster wird automatisch direkt geschlossen
 6. Overview-Fenster wird geschlossen
 
 hier ist was passiert:
 t=0: Click Relist
-t=0.1: Detail-Window öffnet → Baseline sollte 2820 sein 
-t=0.3: Neues Listing gesetzt und altes collected → 2620 im Warehouse [...]
+t=0.1: Detail-Window öffnet → Baseline sollte 3060 sein 
+t=0.3: Neues Listing gesetzt und altes collected → 2860 im Warehouse [...]
 
-Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die magical shard transaktion wurde nicht gespeichert. die preorder wurde auch nicht aktualisiert und keine neue angelegt.
-Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen. 
+Analysiere das Testszenario, den Log und was wirklich gespeichert/geändert (Listings/Transaktionen) wurde. die neue preorder und transaktion wurden erst mit hilfe des log-fallbacks gespeichert und nicht mit hilfe des detail-fensters wie es eigentlich geschehen sollte. Außerdem wurde für die Magical Shard transaktion ein falscher preis gespeichert.
+Erstelle sorgfältig einen ausführlichen Plan das Problem zu fixen.

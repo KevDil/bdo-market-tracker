@@ -714,12 +714,31 @@ class PreorderManager:
                         f"warehouse_delta={warehouse_delta})"
                     )
                 return None
-        
         except Exception as e:
             if self.debug:
                 log_debug(f"[LISTING] ERROR finding match: {e}")
             return None
-    
+
+    def find_active_listing(self, item_name: str) -> Optional[Dict]:
+        """Return the currently active listing for an item (if any)."""
+        try:
+            self._refresh_listings_cache_if_needed()
+
+            if not self._active_listings_cache:
+                return None
+
+            item_lower = item_name.lower()
+            for listing in self._active_listings_cache:
+                if listing['item_name'].lower() == item_lower:
+                    return listing
+
+            return None
+
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[LISTING] ERROR retrieving active listing: {e}")
+            return None
+
     def get_active_listings(
         self,
         item_name: Optional[str] = None

@@ -653,6 +653,45 @@ class TestDetailWindowStateMachine:
         preorder_manager_mock.mark_collected.assert_called_once()
         assert self.tracker._relist_side_effect_signatures
 
+    def test_listing_placement_uses_cached_input_fields(self, monkeypatch):
+        tracker = self.tracker
+
+        tracker._detail_window_active = True
+        tracker._detail_window_type = 'sell_item'
+        tracker._detail_window_item = 'Lion Blood'
+        tracker._detail_baseline_balance = 1_000_000_000
+        tracker._detail_baseline_warehouse = 5_000
+        tracker._detail_last_metrics = {'balance': 1_000_000_000, 'warehouse_qty': 5_000}
+        tracker._detail_cached_input_fields = {'quantity': 200, 'price': 5_000_000}
+        tracker._detail_cached_input_timestamp = datetime.datetime.now()
+
+        tracker._extract_preorder_input_fields = MagicMock(return_value=None)
+        tracker._extract_detail_window_metrics = MagicMock(return_value={
+            'balance': 999_999_500,
+            'warehouse_qty': 4_800,
+            'item_name': 'Lion Blood',
+        })
+
+        tracker._preorder_manager.store_listing.return_value = 321
+
+        tracker._monitor_detail_window('sell_item', 'dummy text')
+
+        tracker._extract_preorder_input_fields.assert_not_called()
+        tracker._preorder_manager.store_listing.assert_called_once()
+        call = tracker._preorder_manager.store_listing.call_args
+        kwargs = call.kwargs if call.kwargs else {}
+
+        if kwargs:
+            assert kwargs['item_name'] == 'Lion Blood'
+            assert kwargs['quantity'] == 200
+            assert kwargs['price'] == 1_000_000_000
+        else:
+            args = call.args
+            assert args[0] == 'Lion Blood'
+            assert args[1] == 200
+            assert args[2] == 1_000_000_000
+        assert tracker._detail_cached_input_fields is None
+
     def test_state_no_change_no_transaction(self):
         """Test: Keine Änderung → Keine Transaktion"""
         ocr_text = """
