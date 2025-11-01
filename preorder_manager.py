@@ -138,7 +138,55 @@ class PreorderManager:
             if self.debug:
                 log_debug(f"[PREORDER] ERROR storing preorder: {e}")
             return -1
-    
+
+    def record_legacy_preorder(
+        self,
+        item_name: str,
+        quantity: int,
+        price: float,
+        collected_at: datetime,
+        status: str = 'collected',
+    ) -> Optional[int]:
+        """Persistiert historische Preorders ohne aktive ID."""
+        try:
+            cur = get_cursor()
+            cur.execute(
+                """
+                INSERT INTO preorders (
+                    item_name,
+                    quantity,
+                    quantity_filled,
+                    price,
+                    timestamp,
+                    status,
+                    collected_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    item_name,
+                    quantity,
+                    quantity,
+                    price,
+                    collected_at,
+                    status,
+                    collected_at,
+                ),
+            )
+            get_connection().commit()
+            legacy_id = cur.lastrowid
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] Recorded legacy preorder: {item_name} x{quantity} @ {price:,.0f} (status={status})"
+                )
+            return legacy_id
+        except Exception as exc:
+            if self.debug:
+                log_debug(f"[PREORDER] ERROR recording legacy preorder: {exc}")
+            return None
+
     # === Retrieval Operations ===
     
     def find_matching_preorder(

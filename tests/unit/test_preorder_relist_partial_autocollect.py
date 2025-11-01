@@ -140,6 +140,61 @@ def test_apply_relist_side_effects_idempotent(tracker_with_mocks):
     tracker._preorder_manager.mark_collected.assert_called_once()
 
 
+def test_apply_relist_side_effects_legacy_record(monkeypatch, tracker_with_mocks):
+    tracker = tracker_with_mocks
+    tracker._relist_side_effect_signatures.clear()
+    pm = tracker._preorder_manager
+    pm.reset_mock()
+
+    pm.find_matching_preorder.return_value = None
+    pm.record_legacy_preorder.return_value = 101
+    pm.store_preorder.return_value = 202
+
+    ui_orders_completed = 33
+    tx_timestamp = datetime.datetime(2025, 10, 31, 12, 35, 25)
+
+    tracker._detail_cached_input_fields = {'quantity': 50, 'price': 1_320_000_000}
+    tracker._detail_cached_input_timestamp = tx_timestamp
+
+    tx_payload = {
+        'item_name': 'Crystallized Despair',
+        'quantity': 33,
+        'price': 871_200_000,
+        'timestamp': tx_timestamp,
+        'transaction_type': 'buy',
+        '_pending_relist': {
+            'tx_item': 'Crystallized Despair',
+            'tx_qty': 33,
+            'tx_price': 871_200_000,
+            'tx_timestamp': tx_timestamp,
+            'tx_type': 'buy',
+            'listed_entry': None,
+            'placed_entry': {'qty': 50, 'price': 1_320_000_000},
+            'ui_orders_completed': ui_orders_completed,
+        },
+    }
+
+    tracker._apply_relist_side_effects(tx_payload)
+
+    pm.find_matching_preorder.assert_called_once()
+    pm.record_legacy_preorder.assert_called_once_with(
+        item_name='Crystallized Despair',
+        quantity=33,
+        price=871_200_000,
+        collected_at=tx_timestamp,
+        status='collected',
+    )
+    pm.update_quantity_filled.assert_not_called()
+    pm.store_preorder.assert_called_once_with(
+        'Crystallized Despair',
+        50,
+        1_320_000_000,
+        tx_timestamp,
+    )
+    assert tracker._detail_cached_input_fields is None
+    assert tracker._detail_cached_input_timestamp is None
+
+
 def test_apply_relist_side_effects_no_payload(tracker_with_mocks):
     tracker = tracker_with_mocks
     tracker._preorder_manager.reset_mock()

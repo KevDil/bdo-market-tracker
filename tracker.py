@@ -242,6 +242,8 @@ class MarketTracker:
         self._detail_relist_new_preorder_signature: tuple[str, int, int] | None = None
         self._relist_side_effect_signatures: dict[tuple, float] = {}
         self._relist_side_effect_ttl = 120.0
+        self._pending_relist_events: dict[str, dict] = {}
+        self._pending_relist_ttl_seconds = 12.0
         
         # Preorder Manager (Phase 3: Auto-Collect Detection)
         self._preorder_manager = PreorderManager(debug=self.debug)
@@ -270,6 +272,23 @@ class MarketTracker:
         # Sync-Tracking: Verhindert Plausibility Check bei partial updates
         self._detail_balance_changed_once = False  # True wenn Balance sich mindestens 1x geändert hat
         self._detail_warehouse_changed_once = False  # True wenn Warehouse sich mindestens 1x geändert hat
+
+    def _prune_pending_relist_events(self) -> None:
+        if not self._pending_relist_events:
+            return
+
+        now = datetime.datetime.now()
+        cutoff = now - datetime.timedelta(seconds=self._pending_relist_ttl_seconds)
+        stale_keys = []
+        for key, payload in self._pending_relist_events.items():
+            detected_at = payload.get('detected_at') if isinstance(payload, dict) else None
+            if isinstance(detected_at, datetime.datetime) and detected_at < cutoff:
+                stale_keys.append(key)
+        for key in stale_keys:
+            self._pending_relist_events.pop(key, None)
+            if self.debug:
+                log_debug(f"[RELIST] 🧹 Pending relist event expired for key='{key}'")
+
         
         # Frame-Perfect Baseline Capture (FIX: Pig Blood Issue)
         self._detail_needs_baseline_capture = False  # True direkt nach Window-Transition
@@ -3090,6 +3109,8 @@ class MarketTracker:
         item_lc = item_name.lower()
         missing: list[dict] = []
 
+        pending_event = self._pending_relist_events.get(item_lc)
+
         for entry in structured_entries:
             if entry.get('type') not in ('purchased', 'transaction'):
                 continue
@@ -3128,10 +3149,16 @@ class MarketTracker:
                 self._log_fallback_seen_hashes.add(hash_val)
                 continue
 
+            normalized_qty = int(qty)
+            normalized_price = int(price)
+
+            if normalized_qty <= 0 or normalized_price <= 0:
+                continue
+
             normalized_row = {
                 'item_name': item_name,
-                'quantity': int(qty),
-                'price': int(price),
+                'quantity': normalized_qty,
+                'price': normalized_price,
                 'timestamp': ts,
                 'transaction_type': 'buy',
                 'case': 'buy_collect_log_fallback',
@@ -3147,6 +3174,10 @@ class MarketTracker:
             self._log_fallback_recent_hashes.append(content_hash)
             self._log_fallback_seen_hashes.add(hash_val)
             missing.append(normalized_row)
+
+            if pending_event is not None:
+                pending_event['fallback_attached'] = True
+                pending_event['fallback_entry'] = normalized_row
 
         return missing
 
@@ -4777,6 +4808,7 @@ class MarketTracker:
             autocollect_candidates = relist_log_candidates
             consume_log_fallback_entry: dict | None = None
             if is_relist_with_autocollect or autocollect_candidates:
+                self._prune_pending_relist_events()
                 if self.debug:
                     log_debug(
                         f"[RELIST-DETECT] ✅ Pattern matched: "
@@ -4792,6 +4824,12 @@ class MarketTracker:
                 # 1. Find matching old preorder
                 corrected_tuple = self._safe_correct_item_name(self._detail_window_item or "") if self._detail_window_item else (None, False)
                 corrected_name = corrected_tuple[0]
+                pending_key = None
+                if corrected_name:
+                    pending_key = corrected_name.lower()
+                elif self._detail_window_item:
+                    pending_key = self._detail_window_item.lower()
+                pending_event = self._pending_relist_events.get(pending_key) if pending_key else None
 
                 matching_preorder = self._preorder_manager.find_matching_preorder(
                     item_name=corrected_name or self._detail_window_item,
@@ -4821,15 +4859,84 @@ class MarketTracker:
                             log_debug(
                                 f"[RELIST] ⚠️ Using log fallback for autocollect: qty={expected_autocollect_qty}, price={autocollect_total}"
                             )
+                        if pending_event is not None:
+                            pending_event['fallback_attached'] = True
+                            pending_event['fallback_entry'] = fallback_entry
                     else:
                         if self.debug:
                             log_debug("[RELIST] ❌ Log fallback missing quantity/price – skipping autocollect")
+                        if pending_event is None:
+                            # Ensure we wait for future fallback data instead of aborting permanently
+                            detected_at = datetime.datetime.now()
+                            if pending_key:
+                                self._pending_relist_events[pending_key] = {
+                                    'item_name': corrected_name or self._detail_window_item,
+                                    'detected_at': detected_at,
+                                    'balance_delta': balance_delta,
+                                    'warehouse_delta': warehouse_delta,
+                                    'baseline_balance': self._detail_baseline_balance,
+                                    'baseline_warehouse': self._detail_baseline_warehouse,
+                                    'window_type': window_type,
+                                    'metrics': current_metrics.copy(),
+                                }
+                                if self.debug:
+                                    log_debug(
+                                        f"[RELIST] ⏳ Pending relist event created for {self._detail_window_item} – awaiting fallback"
+                                    )
                         return
 
                 if not matching_preorder:
-                    if self.debug:
-                        log_debug(f"[RELIST] ❌ No matching preorder found - cannot proceed")
-                    return
+                    if pending_event is None and pending_key:
+                        detected_at = datetime.datetime.now()
+                        self._pending_relist_events[pending_key] = {
+                            'item_name': corrected_name or self._detail_window_item,
+                            'detected_at': detected_at,
+                            'balance_delta': balance_delta,
+                            'warehouse_delta': warehouse_delta,
+                            'baseline_balance': self._detail_baseline_balance,
+                            'baseline_warehouse': self._detail_baseline_warehouse,
+                            'window_type': window_type,
+                            'metrics': current_metrics.copy(),
+                        }
+                        pending_event = self._pending_relist_events.get(pending_key)
+                        if self.debug:
+                            log_debug(
+                                f"[RELIST] ⏳ Pending relist event created for {self._detail_window_item} – waiting for log fallback"
+                            )
+                    else:
+                        if pending_event is not None:
+                            pending_event['balance_delta'] = balance_delta
+                            pending_event['warehouse_delta'] = warehouse_delta
+                            pending_event['metrics'] = current_metrics.copy()
+                            pending_event['updated_at'] = datetime.datetime.now()
+                            if pending_event.get('fallback_entry'):
+                                fallback_data = pending_event['fallback_entry']
+                                expected_autocollect_qty = int(fallback_data.get('quantity') or fallback_data.get('quantity_filled') or 0)
+                                autocollect_total = int(fallback_data.get('price') or 0)
+                                if expected_autocollect_qty > 0 and autocollect_total > 0:
+                                    matching_preorder = {
+                                        'id': None,
+                                        'item_name': corrected_name or self._detail_window_item,
+                                        'quantity': expected_autocollect_qty,
+                                        'price': autocollect_total,
+                                    }
+                                    if self.debug:
+                                        log_debug(
+                                            f"[RELIST] ♻️ Using pending fallback entry for autocollect: "
+                                            f"qty={expected_autocollect_qty}, price={autocollect_total}"
+                                        )
+                                else:
+                                    fallback_data = None
+                        if matching_preorder is None:
+                            # Wenn trotz Fallback noch kein Match existiert und keine zusätzlichen Kandidaten vorliegen, warten wir weiter
+                            if not autocollect_candidates:
+                                return
+                            # andernfalls geht es mit den vorhandenen Kandidaten weiter (siehe oben)
+                            matching_preorder = matching_preorder  # noop für Klarheit
+                        if matching_preorder is None and self.debug:
+                            log_debug(f"[RELIST] ⏸️ Deferred relist handling for {self._detail_window_item} – no matching preorder yet")
+                        if matching_preorder is None and not autocollect_candidates:
+                            return
 
                 # Expected auto-collect quantity from old preorder
                 if expected_autocollect_qty is None:
@@ -4935,7 +5042,17 @@ class MarketTracker:
                                         log_debug(
                                             f"[RELIST] ✅ Old preorder ID={matching_preorder['id']} marked collected"
                                         )
+                                else:
+                                    self._preorder_manager.record_legacy_preorder(
+                                        item_name=corrected_name,
+                                        quantity=int(expected_autocollect_qty),
+                                        price=int(autocollect_total),
+                                        collected_at=timestamp_now,
+                                        status='collected'
+                                    )
                                 self._detail_relist_autocollect_signature = autocollect_signature
+                                if pending_key:
+                                    self._pending_relist_events.pop(pending_key, None)
                                 self._detail_last_transaction_saved = timestamp_now
                                 self._detail_baseline_balance = current_balance
                                 self._detail_baseline_warehouse = current_warehouse
@@ -6277,11 +6394,6 @@ class MarketTracker:
                 prev_ui_buy = {k: dict(v) for k, v in self._last_ui_buy_metrics.items()}
             except Exception:
                 prev_ui_buy = self._last_ui_buy_metrics.copy()
-        elif self.last_overview_text:
-            try:
-                prev_ui_buy = self._extract_buy_ui_metrics(self.last_overview_text) or {}
-            except Exception:
-                prev_ui_buy = {}
 
         ui_buy_delta_detected = False
         if wtype == 'buy_overview' and ui_buy and prev_ui_buy:
@@ -6295,29 +6407,33 @@ class MarketTracker:
                 collect_prev = prev_metrics.get('remainingPrice') or 0
                 if orders_curr > orders_prev or collect_curr > collect_prev:
                     ui_buy_delta_detected = True
+                    # Bei Relist-Metrik-Auswertung quantity_filled aktualisieren
+                    metrics['quantity_filled'] = orders_curr
                     break
+
         prev_ui_sell = {}
+        if getattr(self, '_last_ui_sell_metrics', None):
+            try:
+                prev_ui_sell = {k: dict(v) for k, v in self._last_ui_sell_metrics.items()}
+            except Exception:
+                prev_ui_sell = self._last_ui_sell_metrics.copy()
+        elif self.last_overview_text:
+            try:
+                prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
+            except Exception:
+                prev_ui_sell = {}
+
         prev_ui_sell_norm = {}
-        if wtype == 'sell_overview':
-            if getattr(self, '_last_ui_sell_metrics', None):
-                try:
-                    prev_ui_sell = {k: dict(v) for k, v in self._last_ui_sell_metrics.items()}
-                except Exception:
-                    prev_ui_sell = self._last_ui_sell_metrics.copy()
-            elif self.last_overview_text:
-                try:
-                    prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
-                except Exception:
-                    prev_ui_sell = {}
-            if prev_ui_sell:
-                try:
-                    for k, v in prev_ui_sell.items():
-                        prev_ui_sell_norm[_norm_key(k)] = v
-                        nm_prev = (v.get('item') or '')
-                        if nm_prev:
-                            prev_ui_sell_norm[_norm_key(nm_prev)] = v
-                except Exception:
-                    prev_ui_sell_norm = {}
+        if prev_ui_sell:
+            try:
+                for k, v in prev_ui_sell.items():
+                    prev_ui_sell_norm[_norm_key(k)] = v
+                    nm_prev = (v.get('item') or '')
+                    if nm_prev:
+                        prev_ui_sell_norm[_norm_key(nm_prev)] = v
+            except Exception:
+                prev_ui_sell_norm = {}
+
         ui_sell_norm = {}
         if ui_sell:
             for k, v in ui_sell.items():
@@ -7076,7 +7192,7 @@ class MarketTracker:
             
             # ⚡ RELIST HANDLING: Process relist pattern (transaction + listed/placed at same timestamp)
             if tx.get('_is_relist'):
-                tx['_pending_relist'] = {
+                pending_payload = {
                     'tx_item': tx.get('item_name'),
                     'tx_qty': tx.get('quantity'),
                     'tx_price': tx.get('price'),
@@ -7085,6 +7201,15 @@ class MarketTracker:
                     'listed_entry': tx.get('_listed_entry'),
                     'placed_entry': tx.get('_placed_entry'),
                 }
+
+                item_norm = (tx.get('item_name') or '').lower()
+                if item_norm and item_norm in ui_buy:
+                    ui_entry = ui_buy[item_norm]
+                    orders_completed = ui_entry.get('ordersCompleted')
+                    if isinstance(orders_completed, int) and orders_completed > 0:
+                        pending_payload['ui_orders_completed'] = orders_completed
+
+                tx['_pending_relist'] = pending_payload
 
             if final_type in ('sell', 'buy') and len(transaction_entries_sorted) > 1:
                 for extra_entry in transaction_entries_sorted[1:]:
@@ -7836,6 +7961,7 @@ class MarketTracker:
         pm = self._preorder_manager
         listed_entry = payload.get('listed_entry')
         placed_entry = payload.get('placed_entry')
+        ui_orders_completed = payload.get('ui_orders_completed')
 
         def _safe_int(val):
             try:
@@ -7900,6 +8026,11 @@ class MarketTracker:
                             tx_timestamp or datetime.datetime.now(),
                             transaction_id=tx.get('id'),
                         )
+                        if ui_orders_completed and ui_orders_completed > 0:
+                            pm.update_quantity_filled(
+                                preorder_id=old_preorder['id'],
+                                filled_quantity=ui_orders_completed
+                            )
                         if self.debug:
                             log_debug(f"[RELIST] ✅ Alte Preorder ID={old_preorder['id']} als collected markiert")
                     except Exception as exc:
@@ -7918,6 +8049,11 @@ class MarketTracker:
                 except Exception as exc:
                     if self.debug:
                         log_debug(f"[RELIST] ❌ Neue Preorder speichern fehlgeschlagen: {exc}")
+
+                # Cached Detail-Inputs zurücksetzen, damit nachfolgende Detail-Scans aktuelle Werte ziehen
+                if ui_orders_completed and ui_orders_completed > 0:
+                    self._detail_cached_input_fields = None
+                    self._detail_cached_input_timestamp = None
 
         if signature:
             self._relist_side_effect_signatures[signature] = now_ts
