@@ -516,7 +516,69 @@ class PreorderManager:
             if self.debug:
                 log_debug(f"[PREORDER] ERROR updating filled quantity: {e}")
             return False
-    
+
+    def update_quantity_filled_by_item(
+        self,
+        item_name: str,
+        filled_quantity: int
+    ) -> bool:
+        """Synchronisiert quantity_filled für aktives Item anhand von UI-Metriken."""
+        if not item_name or filled_quantity is None or filled_quantity < 0:
+            return False
+
+        try:
+            cur = get_cursor()
+            cur.execute(
+                """
+                SELECT id, quantity, quantity_filled
+                FROM preorders
+                WHERE item_name = ? AND status = 'active'
+                """,
+                (item_name,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+
+            preorder_id, total_qty, current_filled = row
+            current_filled = current_filled or 0
+            if total_qty is None or total_qty <= 0:
+                return False
+
+            target_filled = min(int(filled_quantity), int(total_qty))
+            if target_filled <= current_filled:
+                return False
+
+            cur.execute(
+                """
+                UPDATE preorders
+                SET quantity_filled = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'active'
+                """,
+                (target_filled, preorder_id)
+            )
+            get_connection().commit()
+
+            if cur.rowcount <= 0:
+                return False
+
+            # Invalidate cache damit Folgezugriffe frische Werte sehen
+            self._active_preorders_cache = None
+
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] UI-sync updated filled quantity: {item_name} "
+                    f"filled={target_filled} (prev={current_filled})"
+                )
+
+            return True
+
+        except Exception as exc:
+            if self.debug:
+                log_debug(f"[PREORDER] ERROR syncing filled quantity for {item_name}: {exc}")
+            return False
+
     # === Cache Management ===
     
     def _refresh_cache_if_needed(self):

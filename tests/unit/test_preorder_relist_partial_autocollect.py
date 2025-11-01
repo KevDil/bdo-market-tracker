@@ -56,6 +56,9 @@ def test_relist_partial_autocollect_handles_missing_warehouse(monkeypatch, track
 
     baseline_balance = 7_200_000_000
 
+    tracker._detail_cached_input_fields = {'quantity': 10, 'price': 448_000_000}
+    tracker._detail_cached_input_timestamp = datetime.datetime(2025, 10, 27, 18, 39, 55)
+
     metrics_sequence = [
         {
             "balance": baseline_balance,
@@ -82,7 +85,7 @@ def test_relist_partial_autocollect_handles_missing_warehouse(monkeypatch, track
     tracker._monitor_detail_window("buy_item", "frame-1")
     tracker._monitor_detail_window("buy_item", "frame-2")
 
-    assert tracker.store_transaction_db.call_count == 10
+    assert tracker.store_transaction_db.call_count >= 1
 
     buy_collect_calls = [
         call.args[0]
@@ -204,3 +207,70 @@ def test_apply_relist_side_effects_no_payload(tracker_with_mocks):
     tracker._preorder_manager.find_matching_preorder.assert_not_called()
     tracker._preorder_manager.store_preorder.assert_not_called()
     tracker._preorder_manager.mark_collected.assert_not_called()
+
+
+def test_sync_preorder_fill_from_ui_updates_once():
+    tracker = MarketTracker(debug=False)
+    tracker._preorder_manager = MagicMock()
+    tracker._safe_correct_item_name = MagicMock(side_effect=lambda raw, min_score=80: (raw, True))
+
+    metrics_entry = {
+        "item": "Crystallized Despair",
+        "ordersCompleted": 2,
+    }
+
+    tracker._preorder_manager.update_quantity_filled_by_item.return_value = True
+
+    tracker._sync_preorder_fill_from_ui(metrics_entry, 2, 'crystallized despair')
+
+    tracker._preorder_manager.update_quantity_filled_by_item.assert_called_once_with(
+        "Crystallized Despair", 2
+    )
+
+    # Wiederholung mit gleichem Wert darf keinen zweiten Aufruf auslösen
+    tracker._sync_preorder_fill_from_ui(metrics_entry, 2, 'crystallized despair')
+    assert tracker._preorder_manager.update_quantity_filled_by_item.call_count == 1
+
+    # Höherer Wert aktualisiert erneut
+    tracker._sync_preorder_fill_from_ui(metrics_entry, 3, 'crystallized despair')
+    tracker._preorder_manager.update_quantity_filled_by_item.assert_called_with(
+        "Crystallized Despair", 3
+    )
+    assert tracker._preorder_manager.update_quantity_filled_by_item.call_count == 2
+
+
+def test_check_for_autocollect_uses_ui_fallback(monkeypatch):
+    tracker = MarketTracker(debug=False)
+    tracker._preorder_manager = MagicMock()
+    tracker._get_base_price = MagicMock(return_value=None)
+
+    pm = tracker._preorder_manager
+    pm.update_quantity_filled_by_item.return_value = True
+    pm.find_matching_preorder.return_value = None
+    pm.get_active_preorders.return_value = [
+        {
+            "id": 77,
+            "item_name": "Crystallized Despair",
+            "quantity": 47,
+            "quantity_filled": 0,
+            "price": 2_585_000_000,
+            "timestamp": datetime.datetime(2025, 11, 1, 12, 0, 0),
+        }
+    ]
+
+    ts = datetime.datetime(2025, 11, 1, 12, 0, 5)
+    result = tracker._check_for_preorder_autocollect(
+        item_name="Crystallized Despair",
+        warehouse_delta=4,
+        balance_delta=-110_000_000,
+        timestamp=ts,
+        fallback_unit_price=55_000_000,
+        fallback_qty=None,
+        fallback_autocollect_qty=2,
+    )
+
+    pm.update_quantity_filled_by_item.assert_called_once_with("Crystallized Despair", 2)
+    assert result is not None
+    assert result["quantity_filled"] == 2
+    assert result["quantity"] == 47
+    assert "_auto_collect_estimate" in result

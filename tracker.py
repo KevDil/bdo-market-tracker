@@ -124,6 +124,7 @@ class MarketTracker:
         self._burst_fast_scans = 0
         self._request_immediate_rescan = 0
         self.running = False
+        self._async_controller = None
         self.lock = threading.Lock()
         self._debug_image_lock = threading.Lock()
         self._use_fast_preprocess = USE_GPU
@@ -195,6 +196,7 @@ class MarketTracker:
 
         self._last_ui_buy_metrics = _load_ui_metrics('last_ui_buy_metrics')
         self._last_ui_sell_metrics = _load_ui_metrics('last_ui_sell_metrics')
+        self._last_ui_buy_fill_sync: dict[str, int] = {}
         
         # Fenster-Historie: Liste von (timestamp, window_type)
         self.window_history = []  # keep last 5
@@ -272,6 +274,68 @@ class MarketTracker:
         # Sync-Tracking: Verhindert Plausibility Check bei partial updates
         self._detail_balance_changed_once = False  # True wenn Balance sich mindestens 1x geändert hat
         self._detail_warehouse_changed_once = False  # True wenn Warehouse sich mindestens 1x geändert hat
+
+        # Detail-/ROI-State: muss vor erster Verarbeitung existieren
+        self._detail_needs_baseline_capture = False
+        self._detail_baseline_captured = False
+        self._detail_window_entry_item = None
+        self._detail_await_preorder_check = False
+        self._detail_preorder_check_baseline = None
+        self._detail_last_transaction_saved = None
+        self._detail_ui_orders_completed: int | None = None
+        self._log_capture_failed = False
+
+        self._last_roi_signatures = {
+            "log": None,
+            "label": None,
+            "metrics": None,
+        }
+        self._last_roi_results = {
+            "log": "",
+            "label": "",
+            "metrics": "",
+        }
+        self._roi_skip_counters = {
+            "log": 0,
+            "label": 0,
+            "metrics": 0,
+        }
+        self._roi_force_refresh_threshold = 10
+        self._metrics_refresh_failures = 0
+
+        self._needs_log_text = True
+        self._needs_metrics_text = False
+        self._needs_detail_balance = False
+        self._needs_detail_warehouse = False
+        self._needs_detail_inputs = False
+
+        self._roi_usage_last_scan = {
+            'label': 'not_run',
+            'log': 'not_run',
+            'metrics': 'not_run',
+            'detail_balance': 'not_run',
+            'detail_warehouse': 'not_run',
+            'detail_inputs': 'not_run',
+        }
+        self._roi_usage_session_stats = {
+            'scans_total': 0,
+            'label': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'log': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'metrics': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_balance': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_warehouse': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+            'detail_inputs': {'ocr': 0, 'cache': 0, 'skipped': 0, 'failed': 0},
+        }
+
+        self._detail_metric_state = 'idle'
+        self._window_detection_history = []
+        self._stable_window = 'unknown'
+        self._last_metrics_refresh_time = None
+
+        self._pending_log_fallback_txs = []
+        self._log_fallback_recent_hashes = deque(maxlen=64)
+        self._log_fallback_seen_hashes: set[str] = set()
+        self._log_fallback_ttl_seconds = 5.0
 
     def _prune_pending_relist_events(self) -> None:
         if not self._pending_relist_events:
@@ -1482,6 +1546,7 @@ class MarketTracker:
         timestamp: datetime.datetime,
         fallback_unit_price: int | None = None,
         fallback_qty: int | None = None,
+        fallback_autocollect_qty: int | None = None,
     ) -> Optional[Dict]:
         """
         Check if warehouse increase indicates preorder auto-collect.
@@ -1552,12 +1617,38 @@ class MarketTracker:
                 )
 
             # Query PreorderManager for matching preorder
+            if fallback_autocollect_qty and fallback_autocollect_qty > 0 and item_name:
+                try:
+                    self._preorder_manager.update_quantity_filled_by_item(
+                        item_name,
+                        int(fallback_autocollect_qty),
+                    )
+                except Exception:
+                    pass
+
             matching_preorder = self._preorder_manager.find_matching_preorder(
                 item_name=item_name,
                 warehouse_delta=warehouse_delta,
                 balance_delta=balance_delta,
                 timestamp=timestamp
             )
+
+            if not matching_preorder and fallback_autocollect_qty and fallback_autocollect_qty > 0 and item_name:
+                try:
+                    active_po = self._preorder_manager.get_active_preorders(item_name)
+                except Exception:
+                    active_po = []
+                if active_po:
+                    candidate = dict(active_po[0])
+                    qty_total = candidate.get('quantity') or 0
+                    qty_filled = min(int(fallback_autocollect_qty), int(qty_total) if qty_total else int(fallback_autocollect_qty))
+                    if qty_filled > 0:
+                        candidate['quantity_filled'] = qty_filled
+                        matching_preorder = candidate
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER-CHECK] Using UI fallback for '{item_name}': filled={qty_filled}"
+                            )
 
             if matching_preorder:
                 matching_preorder['_auto_collect_estimate'] = {
@@ -2455,6 +2546,42 @@ class MarketTracker:
             self._request_immediate_rescan -= 1
             return True
         return False
+
+    def _sync_preorder_fill_from_ui(
+        self,
+        metrics_entry: dict,
+        orders_completed: int,
+        fallback_key: str,
+    ) -> None:
+        """Aktualisiert quantity_filled eines aktiven Preorders basierend auf UI-Metriken."""
+        if not metrics_entry or orders_completed is None or orders_completed <= 0:
+            return
+
+        raw_name = (metrics_entry.get('item') or fallback_key or '').strip()
+        if not raw_name:
+            return
+
+        try:
+            corrected_name, is_valid = self._safe_correct_item_name(raw_name, min_score=80)
+        except Exception:
+            corrected_name, is_valid = raw_name, True
+
+        target_name = corrected_name if corrected_name and is_valid else raw_name
+        if not target_name:
+            return
+
+        norm_key = target_name.lower()
+        last_synced = self._last_ui_buy_fill_sync.get(norm_key, 0)
+        if orders_completed <= last_synced:
+            return
+
+        try:
+            updated = self._preorder_manager.update_quantity_filled_by_item(target_name, orders_completed)
+        except Exception:
+            updated = False
+
+        if updated:
+            self._last_ui_buy_fill_sync[norm_key] = orders_completed
 
     def _extract_buy_ui_metrics(self, full_text):
         """
@@ -3469,6 +3596,7 @@ class MarketTracker:
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
+        self._detail_ui_orders_completed = None
         self._detail_relist_autocollect_signature = None
         self._detail_relist_instant_signature = None
         self._detail_relist_new_preorder_signature = None
@@ -4465,6 +4593,35 @@ class MarketTracker:
             raw_item_name = current_metrics.get('item_name')
             self._detail_window_item = self._normalize_detail_item_name(raw_item_name)
             self._detail_window_entry_item = raw_item_name  # Für Log-Fallback
+            self._detail_ui_orders_completed = None
+            if window_type == 'buy_item':
+                metrics_map = getattr(self, '_last_ui_buy_metrics', {}) or {}
+                lookup_key = (self._detail_window_item or raw_item_name or '').lower()
+                ui_entry = metrics_map.get(lookup_key)
+                if not ui_entry and lookup_key:
+                    try:
+                        for cached_key, cached_entry in metrics_map.items():
+                            if (cached_entry.get('item') or '').lower() == lookup_key:
+                                ui_entry = cached_entry
+                                break
+                    except Exception:
+                        ui_entry = None
+                if ui_entry:
+                    oc_val = ui_entry.get('ordersCompleted')
+                    try:
+                        oc_int = int(oc_val)
+                    except Exception:
+                        try:
+                            from parsing import normalize_numeric_str  # local import to avoid cycle
+                            oc_int = normalize_numeric_str(str(oc_val))
+                        except Exception:
+                            oc_int = None
+                    if isinstance(oc_int, int) and oc_int > 0:
+                        self._detail_ui_orders_completed = oc_int
+                        if self.debug:
+                            log_debug(
+                                f"[DETAIL] UI fallback ordersCompleted={oc_int} for '{self._detail_window_item}'"
+                            )
             self._detail_baseline_captured = True
             self._detail_needs_baseline_capture = False
             self._detail_detail_snapshot_ts = datetime.datetime.now()
@@ -4940,7 +5097,11 @@ class MarketTracker:
 
                 # Expected auto-collect quantity from old preorder
                 if expected_autocollect_qty is None:
-                    expected_autocollect_qty = int(matching_preorder['quantity'])
+                    qty_filled = matching_preorder.get('quantity_filled') if matching_preorder else None
+                    if qty_filled and qty_filled > 0:
+                        expected_autocollect_qty = int(qty_filled)
+                    else:
+                        expected_autocollect_qty = int(matching_preorder['quantity'])
                 actual_warehouse_delta = warehouse_delta
                 if actual_warehouse_delta == 0 and expected_autocollect_qty:
                     actual_warehouse_delta = expected_autocollect_qty
@@ -5093,9 +5254,21 @@ class MarketTracker:
                         )
                 
                 # Calculate new preorder quantity
-                # Expected: warehouse_delta = auto-collect + instant buy
-                # So: new_preorder_qty = original qty (same as auto-collected qty if no instant buy)
-                new_preorder_qty = expected_autocollect_qty - instant_buy_qty
+                fallback_qty_local = locals().get('fallback_qty')
+                previous_preorder_qty = None
+                if matching_preorder:
+                    prev_qty = matching_preorder.get('quantity')
+                    if prev_qty and prev_qty > 0:
+                        previous_preorder_qty = int(prev_qty)
+
+                if fallback_qty_local and fallback_qty_local > 0:
+                    new_preorder_qty = int(fallback_qty_local)
+                elif previous_preorder_qty is not None:
+                    new_preorder_qty = previous_preorder_qty
+                else:
+                    # Expected: warehouse_delta = auto-collect + instant buy
+                    # So: new_preorder_qty = original qty (same as auto-collected qty if no instant buy)
+                    new_preorder_qty = expected_autocollect_qty - instant_buy_qty
                 
                 if new_preorder_qty <= 0:
                     if self.debug:
@@ -5508,10 +5681,6 @@ class MarketTracker:
                         log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:,.0f} > {max_price_per_item:,} Silver/item (net)")
                         if base_price:
                             log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,}, net_range={min_price_per_item:,} - {max_price_per_item:,}")
-                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
-                        log_debug(f"[DETAIL] Likely OCR error in balance - waiting for next scan...")
-                    return
-        
         # NEW: Check for preorder auto-collect scenario (BEFORE transaction inference)
         preorder_correction = None
         if window_type == 'buy_item' and warehouse_delta > 0 and balance_delta < 0:
@@ -5519,6 +5688,7 @@ class MarketTracker:
 
             fallback_unit_price = None
             fallback_qty = None
+            fallback_autocollect_qty = self._detail_ui_orders_completed
             cached_fields = getattr(self, '_detail_cached_input_fields', None)
             cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
             if cached_fields and cached_ts and isinstance(cached_ts, datetime.datetime):
@@ -5544,6 +5714,7 @@ class MarketTracker:
                 timestamp=datetime.datetime.now(),
                 fallback_unit_price=fallback_unit_price,
                 fallback_qty=fallback_qty,
+                fallback_autocollect_qty=fallback_autocollect_qty,
             )
 
             if preorder_correction and self.debug:
@@ -6398,10 +6569,13 @@ class MarketTracker:
         ui_buy_delta_detected = False
         if wtype == 'buy_overview' and ui_buy and prev_ui_buy:
             for item_lc, metrics in ui_buy.items():
+                orders_curr = metrics.get('ordersCompleted') or 0
+                if orders_curr > 0:
+                    self._sync_preorder_fill_from_ui(metrics, orders_curr, item_lc)
+
                 prev_metrics = prev_ui_buy.get(item_lc)
                 if not prev_metrics:
                     continue
-                orders_curr = metrics.get('ordersCompleted') or 0
                 orders_prev = prev_metrics.get('ordersCompleted') or 0
                 collect_curr = metrics.get('remainingPrice') or 0
                 collect_prev = prev_metrics.get('remainingPrice') or 0
@@ -6422,6 +6596,12 @@ class MarketTracker:
                 prev_ui_sell = self._extract_sell_ui_metrics(self.last_overview_text) or {}
             except Exception:
                 prev_ui_sell = {}
+
+        if ui_buy and not prev_ui_buy:
+            for item_lc, metrics in ui_buy.items():
+                orders_curr = metrics.get('ordersCompleted') or 0
+                if orders_curr > 0:
+                    self._sync_preorder_fill_from_ui(metrics, orders_curr, item_lc)
 
         prev_ui_sell_norm = {}
         if prev_ui_sell:
@@ -8036,6 +8216,30 @@ class MarketTracker:
                     except Exception as exc:
                         if self.debug:
                             log_debug(f"[RELIST] ❌ Mark Collected fehlgeschlagen: {exc}")
+                else:
+                    # Keine aktive Preorder gefunden → Legacy-Eintrag erfassen und UI-Fills synchronisieren
+                    if ui_orders_completed and ui_orders_completed > 0 and tx_item:
+                        try:
+                            pm.update_quantity_filled_by_item(tx_item, ui_orders_completed)
+                        except Exception as exc:
+                            if self.debug:
+                                log_debug(f"[RELIST] ⚠️ UI-Fill-Sync fehlgeschlagen: {exc}")
+                    legacy_qty = _safe_int(tx_qty)
+                    legacy_price = _safe_int(tx_price)
+                    if legacy_qty and legacy_qty > 0 and legacy_price and legacy_price > 0:
+                        try:
+                            pm.record_legacy_preorder(
+                                item_name=tx_item,
+                                quantity=legacy_qty,
+                                price=legacy_price,
+                                collected_at=tx_timestamp or datetime.datetime.now(),
+                                status='collected',
+                            )
+                            if self.debug:
+                                log_debug(f"[RELIST] ✅ Legacy Preorder erfasst: {legacy_qty}x {tx_item} @ {legacy_price:,}")
+                        except Exception as exc:
+                            if self.debug:
+                                log_debug(f"[RELIST] ❌ Legacy Preorder erfassen fehlgeschlagen: {exc}")
 
                 try:
                     pm.store_preorder(
