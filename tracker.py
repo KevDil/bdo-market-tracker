@@ -235,8 +235,17 @@ class MarketTracker:
         self._detail_window_item = None  # Item-Name aus Detail-Fenster
         self._detail_window_hint: str | None = None  # Fallback-Klassifikation aus Label-OCR
         self._detail_detail_snapshot_ts: datetime.datetime | None = None
-        self._detail_cached_input_fields: dict | None = None
-        self._detail_cached_input_timestamp: datetime.datetime | None = None
+        self._detail_input_cache: dict[str, dict | None] = {
+            'baseline': None,
+            'refresh': None,
+        }
+        self._detail_input_cache_ttl: dict[str, float] = {
+            'baseline': 6.0,
+            'refresh': 4.0,
+        }
+        self._detail_input_refresh_pending: bool = False
+        self._detail_input_refresh_reason: str | None = None
+        self._detail_input_refresh_window: str | None = None
         self._detail_pending_log_snapshots: list[dict] = []
         self._detail_pending_snapshot_hashes: set[str] = set()
         self._detail_relist_autocollect_signature: tuple[str, int, int] | None = None
@@ -1378,6 +1387,120 @@ class MarketTracker:
             if self.debug:
                 log_debug(f"[ITEM-NAME] Correction failed for '{candidate}': {exc}")
             return candidate, False
+
+    def _invalidate_detail_input_cache(self, kind: str | None = None) -> None:
+        if not hasattr(self, '_detail_input_cache'):
+            return
+
+        if kind is None:
+            for key in list(self._detail_input_cache.keys()):
+                self._detail_input_cache[key] = None
+        elif kind in self._detail_input_cache:
+            self._detail_input_cache[kind] = None
+
+        if kind is None or kind == 'refresh':
+            self._detail_input_refresh_pending = False
+            self._detail_input_refresh_reason = None
+            self._detail_input_refresh_window = None
+
+    def _cache_detail_input_fields(
+        self,
+        *,
+        kind: str,
+        fields: dict[str, int | float | str | None],
+        window_type: str,
+        source: str = "",
+        timestamp: datetime.datetime | None = None,
+    ) -> None:
+        if not fields or kind not in self._detail_input_cache:
+            return
+
+        normalized: dict[str, int] = {}
+        for key in ("quantity", "price"):
+            if key not in fields:
+                return
+            value = fields.get(key)
+            if value is None:
+                return
+            try:
+                normalized[key] = int(value)
+            except Exception:
+                try:
+                    normalized[key] = int(float(value))
+                except Exception:
+                    return
+
+        entry = {
+            'fields': normalized,
+            'timestamp': timestamp or datetime.datetime.now(),
+            'window_type': window_type,
+            'source': source,
+        }
+        self._detail_input_cache[kind] = entry
+
+        if kind == 'refresh':
+            self._detail_input_refresh_pending = False
+            self._detail_input_refresh_reason = None
+            self._detail_input_refresh_window = None
+
+    def _get_detail_input_fields(
+        self,
+        *,
+        window_type: str | None = None,
+        prefer_refresh: bool = True,
+        max_age_override: float | None = None,
+    ) -> tuple[dict[str, int] | None, datetime.datetime | None, str | None]:
+        if not hasattr(self, '_detail_input_cache'):
+            return None, None, None
+
+        now = datetime.datetime.now()
+        order = ['refresh', 'baseline'] if prefer_refresh else ['baseline', 'refresh']
+
+        for kind in order:
+            entry = self._detail_input_cache.get(kind)
+            if not entry:
+                continue
+            fields = entry.get('fields')
+            timestamp = entry.get('timestamp')
+            cached_window = entry.get('window_type')
+
+            if window_type and cached_window and cached_window != window_type:
+                continue
+
+            ttl = max_age_override if max_age_override is not None else self._detail_input_cache_ttl.get(kind, 5.0)
+            if timestamp and ttl is not None:
+                try:
+                    age = (now - timestamp).total_seconds()
+                except Exception:
+                    age = ttl + 1.0
+                if age > ttl:
+                    if self.debug:
+                        log_debug(
+                            f"[DETAIL-CACHE] {kind} entry expired (age={age:.2f}s > ttl={ttl:.2f}s, window={cached_window})"
+                        )
+                    self._detail_input_cache[kind] = None
+                    continue
+
+            if fields:
+                return fields.copy(), timestamp, kind
+
+        return None, None, None
+
+    def _request_detail_input_refresh(self, window_type: str, reason: str = "") -> None:
+        if window_type not in ('buy_item', 'sell_item'):
+            return
+
+        if self._detail_input_refresh_pending and self._detail_input_refresh_window == window_type:
+            return
+
+        cached_fields, _, kind = self._get_detail_input_fields(window_type=window_type, prefer_refresh=True)
+        if cached_fields and kind == 'refresh':
+            return
+
+        self._detail_input_refresh_pending = True
+        self._detail_input_refresh_reason = reason or f"refresh_needed_{window_type}"
+        self._detail_input_refresh_window = window_type
+        self._set_need_flag('detail_inputs', True, self._detail_input_refresh_reason)
 
     def _extract_preorder_input_fields(
         self,
@@ -3591,8 +3714,10 @@ class MarketTracker:
         self._detail_baseline_captured = False
         self._detail_window_entry_item = None
         self._detail_window_hint = None
-        self._detail_cached_input_fields = None
-        self._detail_cached_input_timestamp = None
+        self._detail_input_cache = {
+            'baseline': None,
+            'refresh': None,
+        }
         self._detail_await_preorder_check = False
         self._detail_preorder_check_baseline = None
         self._detail_last_transaction_saved = None
@@ -3772,39 +3897,6 @@ class MarketTracker:
         """
         try:
             preorder_qty = None
-            preorder_unit_price = None
-            preorder_total_price = None
-            extraction_method = "unknown"
-            
-            # ═══════════════════════════════════════════════════════════════
-            # STRATEGY 0 (PRIORITY): Use cached input fields from baseline
-            # ═══════════════════════════════════════════════════════════════
-            # These were extracted proactively at baseline-capture.
-            # This is CRITICAL for relist where the window might close too fast!
-            
-            if hasattr(self, '_detail_cached_input_fields') and self._detail_cached_input_fields:
-                # Check if cache is still fresh (< 5 seconds old)
-                if hasattr(self, '_detail_cached_input_timestamp') and self._detail_cached_input_timestamp:
-                    cache_age = (timestamp - self._detail_cached_input_timestamp).total_seconds()
-                    
-                    if cache_age < 5.0:
-                        preorder_qty = self._detail_cached_input_fields['quantity']
-                        preorder_unit_price = self._detail_cached_input_fields['price']
-                        preorder_total_price = preorder_unit_price * preorder_qty
-                        extraction_method = "cached_input_fields"
-                        
-                        if self.debug:
-                            log_debug(
-                                f"[PREORDER-DETECT] ✅ Using CACHED input fields: "
-                                f"{preorder_qty:,}x @ {preorder_unit_price:,} "
-                                f"(total {preorder_total_price:,}, cache age: {cache_age:.1f}s, method: {extraction_method})"
-                            )
-            
-            # ═══════════════════════════════════════════════════════════════
-            # STRATEGY 1 (PRIMARY): Extract from Detail-Window Input Fields
-            # ═══════════════════════════════════════════════════════════════
-            # This is the ONLY reliable method for RELIST scenarios!
-            # In relist: balance_delta = auto-collect amount (NOT new preorder!)
             # Example Trace of Nature:
             #   - Old preorder: 5000x @ 770M (filled: 219x)
             #   - Click "Relist" → Auto-collect: 219x @ 33.7M
@@ -3882,6 +3974,20 @@ class MarketTracker:
 
             if preorder_unit_price is not None:
                 preorder_unit_price = int(round(preorder_unit_price))
+
+            if preorder_qty and preorder_unit_price and abs(balance_delta) > 0:
+                delta_vs_total = abs(abs(balance_delta) - (preorder_qty * preorder_unit_price))
+                tolerance = max(5000, int(preorder_unit_price * 0.02 * max(1, preorder_qty)))
+                if delta_vs_total > tolerance:
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER-DETECT] ⚠️ Plausibility mismatch: "
+                            f"Δbalance={abs(balance_delta):,} vs qty*price={preorder_qty * preorder_unit_price:,} "
+                            f"(diff {delta_vs_total:,} > tolerance {tolerance:,})"
+                        )
+                    # Refresh anfordern und abbrechen; möglicherweise wurden UI-Werte geändert
+                    self._request_detail_input_refresh('buy_item', 'preorder_mismatch_retry')
+                    return False
 
             # ═══════════════════════════════════════════════════════════════
             # Validation & Storage
@@ -3972,11 +4078,13 @@ class MarketTracker:
                 self._detail_partial_warehouse_delta = 0
                 self._detail_balance_changed_once = False
                 self._detail_warehouse_changed_once = False
-                self._detail_cached_input_fields = {
-                    'quantity': int(preorder_qty),
-                    'price': int(preorder_unit_price)
-                }
-                self._detail_cached_input_timestamp = now_saved
+                self._cache_detail_input_fields(
+                    kind='refresh',
+                    fields={'quantity': int(preorder_qty), 'price': int(preorder_unit_price)},
+                    window_type='buy_item',
+                    source='preorder_detect_saved',
+                    timestamp=now_saved,
+                )
                 self._set_need_flag('detail_inputs', False, 'preorder_detect_saved')
                 if self.debug:
                     log_debug(
@@ -4157,9 +4265,11 @@ class MarketTracker:
                 return False
             
             if listing_price is None or listing_price <= 0:
+                # Versuche durch Refresh neue Eingaben zu erhalten
+                self._request_detail_input_refresh(window_type, 'force_save_missing_price')
                 if self.debug:
                     log_debug(
-                        f"[LISTING-DETECT] Price {listing_price} invalid"
+                        f"[DETAIL] 🔶 Force-save aborted: desired price missing"
                     )
                 return False
 
@@ -4634,11 +4744,8 @@ class MarketTracker:
             self._detail_balance_delta_timestamp = None
 
             # ✅ CRITICAL FIX: Proaktive Input-Field-Extraktion
-            # Extract input fields IMMEDIATELY at baseline capture!
-            # This is CRITICAL for Relist detection where balance_delta won't help us.
-            # The input fields show the NEW preorder values even before any transaction happens.
-            self._detail_cached_input_fields = None
-            self._detail_cached_input_timestamp = None
+            # Erfasse die initialen Detail-Inputs und speichere sie getrennt als "baseline".
+            self._invalidate_detail_input_cache()
 
             if window_type in ('buy_item', 'sell_item') and img is not None and proc_img is not None:
                 purpose = "preorder" if window_type == 'buy_item' else "listing"
@@ -4654,32 +4761,25 @@ class MarketTracker:
                     )
 
                     if input_fields and 'quantity' in input_fields and 'price' in input_fields:
-                        try:
-                            cached_quantity = int(input_fields['quantity'])
-                            cached_price = int(input_fields['price'])
-                        except Exception:
-                            cached_quantity = input_fields['quantity']
-                            cached_price = input_fields['price']
+                        self._cache_detail_input_fields(
+                            kind='baseline',
+                            fields=input_fields,
+                            window_type=window_type,
+                            source='baseline_capture',
+                            timestamp=now
+                        )
 
-                        if cached_quantity and cached_price:
-                            # Cache for later use (valid for 5 seconds)
-                            self._detail_cached_input_fields = {
-                                'quantity': cached_quantity,
-                                'price': cached_price,
-                            }
-                            self._detail_cached_input_timestamp = now
-
-                            total = cached_price * cached_quantity
-                            if self.debug:
-                                log_debug(
-                                    f"[DETAIL] ✅ {purpose.title()} inputs cached: "
-                                    f"{cached_quantity:,}x @ {cached_price:,} "
-                                    f"(total: {total:,})"
-                                )
-                        else:
-                            self._set_need_flag('detail_inputs', True, "detail_input_incomplete")
-                            if self.debug:
-                                log_debug(f"[DETAIL] ⚠️ Input field extraction failed (incomplete data)")
+                        cached_fields, _, _ = self._get_detail_input_fields(
+                            window_type=window_type,
+                            prefer_refresh=False
+                        )
+                        if cached_fields and self.debug:
+                            total = cached_fields['price'] * cached_fields['quantity']
+                            log_debug(
+                                f"[DETAIL] ✅ {purpose.title()} baseline cached: "
+                                f"{cached_fields['quantity']:,}x @ {cached_fields['price']:,} "
+                                f"(total: {total:,})"
+                            )
                     else:
                         self._set_need_flag('detail_inputs', True, "detail_input_incomplete")
                         if self.debug:
@@ -4938,6 +5038,10 @@ class MarketTracker:
         # 1. Simple Preorder: balance↓, warehouse=0 (no items yet)
         # 2. Relist + Auto-Collect: balance↓, warehouse↑ (old preorder collected during relist)
         if balance_delta < 0 and window_type == 'buy_item':
+            # Anforderungen an Refresh-Cache: bei Balance- oder Warehouseänderung frische Eingaben anfordern
+            if balance_changed_this_scan or warehouse_changed_this_scan:
+                self._request_detail_input_refresh('buy_item', 'detail_delta_detected')
+
             # Check if this is a preorder scenario
             # Heuristic: If warehouse increased, it's likely auto-collect from old preorder
             # In this case, the new preorder quantity should be in UI metrics
@@ -5282,22 +5386,30 @@ class MarketTracker:
                             # Primär: Verwende ROI-Cache falls aktuell verfügbar (max 3s alt)
                             metrics_qty = None
                             metrics_price = None
-                            cached_fields = getattr(self, '_detail_cached_input_fields', None)
-                            cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
-                            if cached_fields and cached_ts and isinstance(cached_ts, datetime.datetime):
-                                if (timestamp_now - cached_ts).total_seconds() <= 3.0:
-                                    try:
-                                        cand_qty = int(cached_fields.get('quantity'))
-                                        if cand_qty > 0:
-                                            metrics_qty = cand_qty
-                                    except Exception:
-                                        metrics_qty = None
-                                    try:
-                                        cand_price = int(cached_fields.get('price'))
-                                        if cand_price > 0:
-                                            metrics_price = cand_price
-                                    except Exception:
-                                        metrics_price = None
+                            cached_fields, cached_ts, cached_kind = self._get_detail_input_fields(
+                                window_type='buy_item',
+                                prefer_refresh=True,
+                                max_age_override=3.0,
+                            )
+                            if cached_fields and cached_ts:
+                                try:
+                                    cand_qty = int(cached_fields.get('quantity'))
+                                    if cand_qty > 0:
+                                        metrics_qty = cand_qty
+                                except Exception:
+                                    metrics_qty = None
+                                try:
+                                    cand_price = int(cached_fields.get('price'))
+                                    if cand_price > 0:
+                                        metrics_price = cand_price
+                                except Exception:
+                                    metrics_price = None
+                                if self.debug and metrics_qty and metrics_price:
+                                    age = (timestamp_now - cached_ts).total_seconds()
+                                    log_debug(
+                                        f"[RELIST] Using {cached_kind} input cache for new preorder: "
+                                        f"qty={metrics_qty:,}, price={metrics_price:,} (age={age:.1f}s)"
+                                    )
 
                             if metrics_qty and metrics_price:
                                 new_preorder_qty = metrics_qty
@@ -5364,11 +5476,13 @@ class MarketTracker:
                                         self._detail_partial_warehouse_delta = 0
                                         self._detail_balance_changed_once = False
                                         self._detail_warehouse_changed_once = False
-                                        self._detail_cached_input_fields = {
-                                            'quantity': int(new_preorder_qty),
-                                            'price': int(new_preorder_unit_price)
-                                        }
-                                        self._detail_cached_input_timestamp = now_saved
+                                        self._cache_detail_input_fields(
+                                            kind='refresh',
+                                            fields={'quantity': int(new_preorder_qty), 'price': int(new_preorder_unit_price)},
+                                            window_type='buy_item',
+                                            source='relist_new_preorder_saved',
+                                            timestamp=now_saved,
+                                        )
                                         self._set_need_flag('detail_inputs', False, 'relist_new_preorder_saved')
 
 
@@ -5496,29 +5610,32 @@ class MarketTracker:
         # This MUST happen BEFORE plausibility check to avoid false rejections
         # Sell-side analog to preorder placement: items moved TO market, no silver received yet
         if abs(balance_delta) < 1000 and warehouse_delta < 0 and window_type == 'sell_item':
-            cached_fields = getattr(self, '_detail_cached_input_fields', None)
-            cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
+            self._request_detail_input_refresh('sell_item', 'listing_delta_detected')
+            cached_fields, cached_ts, cached_kind = self._get_detail_input_fields(
+                window_type='sell_item',
+                prefer_refresh=True,
+                max_age_override=3.0,
+            )
             # Listing placement detected!
             listing_detected = self._detect_listing_placement(
                 item_name=self._detail_window_item,
                 warehouse_delta=warehouse_delta,
                 current_metrics=current_metrics,
                 timestamp=datetime.datetime.now(),
-                cached_input=cached_fields,
-                cached_timestamp=cached_ts,
                 img=img,
-                proc_img=proc_img
+                proc_img=proc_img,
+                cached_input=cached_fields,
+                cached_timestamp=cached_ts
             )
-            
+
             if listing_detected:
                 # IMPORTANT: Update rolling baseline for next transaction
                 self._detail_baseline_balance = current_balance
                 self._detail_baseline_warehouse = current_warehouse
                 self._detail_last_metrics = current_metrics.copy()
 
-                # Cached input fields have been consumed for this listing
-                self._detail_cached_input_fields = None
-                self._detail_cached_input_timestamp = None
+                # Verbrauchte Refresh-Werte nach erfolgreichem Listing zurücksetzen
+                self._invalidate_detail_input_cache('refresh')
                 
                 # Reset delta accumulators
                 self._detail_partial_balance_delta = 0
@@ -5681,6 +5798,7 @@ class MarketTracker:
                         log_debug(f"[DETAIL] ⚠️ PLAUSIBILITY FAIL: Implied price {implied_price_per_item:,.0f} > {max_price_per_item:,} Silver/item (net)")
                         if base_price:
                             log_debug(f"[DETAIL] Item '{item_name}': base_price={base_price:,}, net_range={min_price_per_item:,} - {max_price_per_item:,}")
+                        log_debug(f"[DETAIL] balance_delta={balance_delta:,}, warehouse_delta={warehouse_delta:+,}")
         # NEW: Check for preorder auto-collect scenario (BEFORE transaction inference)
         preorder_correction = None
         if window_type == 'buy_item' and warehouse_delta > 0 and balance_delta < 0:
@@ -5689,24 +5807,26 @@ class MarketTracker:
             fallback_unit_price = None
             fallback_qty = None
             fallback_autocollect_qty = self._detail_ui_orders_completed
-            cached_fields = getattr(self, '_detail_cached_input_fields', None)
-            cached_ts = getattr(self, '_detail_cached_input_timestamp', None)
-            if cached_fields and cached_ts and isinstance(cached_ts, datetime.datetime):
+            cached_fields, cached_ts, cached_kind = self._get_detail_input_fields(
+                window_type='buy_item',
+                prefer_refresh=True,
+                max_age_override=5.0,
+            )
+            if cached_fields and cached_ts:
                 cache_age = (datetime.datetime.now() - cached_ts).total_seconds()
-                if cache_age < 5.0:
-                    try:
-                        cand_price = int(cached_fields.get('price'))
-                        if cand_price > 0:
-                            fallback_unit_price = cand_price
-                    except Exception:
-                        fallback_unit_price = None
-                    try:
-                        cand_qty = int(cached_fields.get('quantity'))
-                        if cand_qty > 0:
-                            fallback_qty = cand_qty
-                    except Exception:
-                        fallback_qty = None
-
+                try:
+                    fallback_unit_price = int(cached_fields.get('price'))
+                except Exception:
+                    fallback_unit_price = None
+                try:
+                    fallback_qty = int(cached_fields.get('quantity'))
+                except Exception:
+                    fallback_qty = None
+                if self.debug and (fallback_unit_price or fallback_qty):
+                    log_debug(
+                        f"[PREORDER-CHECK] Using {cached_kind} cache for fallback values (age={cache_age:.1f}s): "
+                        f"qty={fallback_qty}, price={fallback_unit_price}"
+                    )
             preorder_correction = self._check_for_preorder_autocollect(
                 item_name=detail_item,
                 warehouse_delta=warehouse_delta,
@@ -5990,7 +6110,6 @@ class MarketTracker:
                     
                     # OLD LOGIC (DISABLED):
                     # if (hasattr(self, '_detail_cached_input_fields') and 
-                    #     self._detail_cached_input_fields and 
                     #     self._detail_window_type == 'buy_item'):
                     #     ... create preorder from cached fields ...
                     
@@ -8256,8 +8375,7 @@ class MarketTracker:
 
                 # Cached Detail-Inputs zurücksetzen, damit nachfolgende Detail-Scans aktuelle Werte ziehen
                 if ui_orders_completed and ui_orders_completed > 0:
-                    self._detail_cached_input_fields = None
-                    self._detail_cached_input_timestamp = None
+                    self._invalidate_detail_input_cache('refresh')
 
         if signature:
             self._relist_side_effect_signatures[signature] = now_ts

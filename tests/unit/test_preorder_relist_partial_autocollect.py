@@ -56,8 +56,13 @@ def test_relist_partial_autocollect_handles_missing_warehouse(monkeypatch, track
 
     baseline_balance = 7_200_000_000
 
-    tracker._detail_cached_input_fields = {'quantity': 10, 'price': 448_000_000}
-    tracker._detail_cached_input_timestamp = datetime.datetime(2025, 10, 27, 18, 39, 55)
+    tracker._cache_detail_input_fields(
+        kind='baseline',
+        fields={'quantity': 10, 'price': 448_000_000},
+        window_type='buy_item',
+        source='test_fixture',
+        timestamp=datetime.datetime(2025, 10, 27, 18, 39, 55)
+    )
 
     metrics_sequence = [
         {
@@ -156,8 +161,13 @@ def test_apply_relist_side_effects_legacy_record(monkeypatch, tracker_with_mocks
     ui_orders_completed = 33
     tx_timestamp = datetime.datetime(2025, 10, 31, 12, 35, 25)
 
-    tracker._detail_cached_input_fields = {'quantity': 50, 'price': 1_320_000_000}
-    tracker._detail_cached_input_timestamp = tx_timestamp
+    tracker._cache_detail_input_fields(
+        kind='refresh',
+        fields={'quantity': 50, 'price': 1_320_000_000},
+        window_type='buy_item',
+        source='test_payload',
+        timestamp=tx_timestamp
+    )
 
     tx_payload = {
         'item_name': 'Crystallized Despair',
@@ -194,8 +204,7 @@ def test_apply_relist_side_effects_legacy_record(monkeypatch, tracker_with_mocks
         1_320_000_000,
         tx_timestamp,
     )
-    assert tracker._detail_cached_input_fields is None
-    assert tracker._detail_cached_input_timestamp is None
+    assert tracker._detail_input_cache['refresh'] is None
 
 
 def test_apply_relist_side_effects_no_payload(tracker_with_mocks):

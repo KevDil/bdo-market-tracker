@@ -307,14 +307,16 @@ def compare_roi_similarity(img, roi: tuple[int, int, int, int], hist_ref: Option
 
 
 _OCR_TOKEN_TRANSLATION = str.maketrans({
-    '0': 'o',
-    '1': 'l',
-    '2': 'z',
-    '3': 'e',
-    '4': 'a',
-    '5': 's',
-    '6': 'g',
-    '7': 't',
+    'O': '0', 'o': '0', 'D': '0', 'Q': '0', 'Ø': '0', 'Φ': '0', '⊕': '0',
+    'I': '1', 'l': '1', '|': '1', 'i': '1', 'L': '1', '¹': '1',
+    'S': '5', 's': '5', '$': '5', '§': '5',
+    'B': '8', 'β': '8', 'ß': '8',
+    'Z': '2', 'z': '2', 'ƶ': '2',
+    'G': '6', 'g': '9', 'q': '9', 'P': '9',
+    'T': '7', 't': '7', 'F': '7',
+    'E': '3', 'e': '3',
+    'A': '4', 'a': '4',
+    'C': '0', 'c': '0', 'U': '0', 'u': '0',
     '8': 'b',
     '9': 'g',
     'i': 'l',
@@ -1215,20 +1217,47 @@ def clear_cache():
     log_debug("[CACHE] Cleared all cache entries")
 
 def normalize_numeric_str(s):
-    """Ersetze häufige OCR-Fehler und parse int."""
+    """Normalisiert OCR-Zahlenstrings (inkl. konfuser Zeichen, Mischformaten)."""
     if not s:
         return None
-    # CRITICAL FIX: Remove whitespace FIRST to handle OCR errors like "585, 585, OO0" (spaces between digits)
-    s = s.replace(' ', '')
-    # map confusables
-    mapped = "".join(LETTER_TO_DIGIT.get(ch, ch) for ch in s)
-    cleaned = re.sub(r'[^0-9,\.]', '', mapped)
-    if cleaned == "":
+
+    if isinstance(s, (int, float)):
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    text = str(s)
+    # Entferne klassische OCR-Artefakte
+    text = text.replace('\u200b', '').replace('\xad', '')  # Zero-Width / Soft Hyphen
+    text = text.replace('²', '2').replace('³', '3').replace('º', '0')
+    text = re.sub(r"\s+", "", text)
+    text = text.replace('o', '0').replace('O', '0')
+
+    # Split on non-digit separators to handle mixed entries (e.g., "154,000/ea")
+    candidates = re.split(r"[^0-9A-Za-z]+", text)
+    normalized_numbers = []
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        mapped = ''.join(LETTER_TO_DIGIT.get(ch, ch) for ch in candidate)
+        cleaned = re.sub(r'[^0-9]', '', mapped)
+        if not cleaned:
+            continue
+        normalized_numbers.append(cleaned)
+
+    if not normalized_numbers:
         return None
-    cleaned = cleaned.replace(',', '').replace('.', '')
+
+    # Nimm längste Zahl (häufig wichtigste) – aber zu lange (z.B. 30 Ziffern) verwerfen
+    best = max(normalized_numbers, key=len)
+    if len(best) > 12:  # 999B Grenze
+        return None
+
     try:
-        return int(cleaned)
-    except:
+        return int(best)
+    except Exception:
         return None
 
 def clean_item_name(raw):
