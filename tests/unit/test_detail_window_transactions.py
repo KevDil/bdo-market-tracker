@@ -7,11 +7,29 @@ Tests für:
 - _monitor_detail_window (State Machine)
 """
 
-import pytest
+import sys
 import datetime
-import tracker
-from tracker import MarketTracker
-from utils import normalize_numeric_str
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+import tracker  # noqa: E402
+import database  # noqa: E402
+from tracker import MarketTracker  # noqa: E402
+from utils import normalize_numeric_str  # noqa: E402
 
 
 class TestDetailWindowMetrics:
@@ -436,6 +454,9 @@ class TestDetailWindowStateMachine:
     def setup_method(self):
         """Setup vor jedem Test."""
         self.tracker = MarketTracker(debug=False)
+        self.tracker._preorder_manager = MagicMock()
+        self.tracker.store_transaction_db = MagicMock(return_value=True)
+        self.tracker._safe_correct_item_name = lambda raw, min_score=86: (raw, True)
     
     def test_state_initial_entry(self):
         """Test: Erstes Betreten des Detail-Fensters setzt Baseline
@@ -459,9 +480,218 @@ class TestDetailWindowStateMachine:
         assert self.tracker._detail_window_active
         assert self.tracker._detail_window_type == 'sell_item'
         assert self.tracker._detail_baseline_balance == 1000000
-        # Baseline wird direkt aus OCR-Ablesung gesetzt (keine Manipulation mehr)
+        # Baseline wird direkt aus OCR-Ablesung gesetzt (keine Manipulation)
         assert self.tracker._detail_baseline_warehouse == 50
-    
+
+    def test_relist_autocollect_creates_transaction_and_marks_preorder(self):
+        self.tracker._safe_correct_item_name = MagicMock(return_value=("Ash Sap", True))
+        self.tracker._extract_detail_window_metrics = MagicMock()
+        self.tracker._detail_window_active = True
+        self.tracker._detail_window_type = 'buy_item'
+        self.tracker._detail_window_item = 'Ash Sap'
+        self.tracker._detail_baseline_balance = 10_000_000_000
+        self.tracker._detail_baseline_warehouse = 0
+        self.tracker._detail_last_metrics = {'balance': 10_000_000_000, 'warehouse_qty': 0}
+
+        matching_preorder = {
+            'id': 38,
+            'item_name': 'Ash Sap',
+            'quantity': 1000,
+            'price': 21_000_000_000,
+        }
+        self.tracker._preorder_manager.find_matching_preorder.return_value = matching_preorder
+
+        self.tracker._extract_detail_window_metrics.return_value = {
+            'balance': 10_000_000_000 - 21_000_000_000,
+            'warehouse_qty': 1000,
+            'timestamp': datetime.datetime(2025, 10, 27, 9, 36, 0),
+        }
+
+        self.tracker._monitor_detail_window('buy_item', 'dummy text')
+
+        assert self.tracker.store_transaction_db.called
+        tx = self.tracker.store_transaction_db.call_args.args[0]
+        assert tx['item_name'] == 'Ash Sap'
+        assert tx['quantity'] == 1000
+        assert tx['price'] == 21_000_000_000
+        assert tx['tx_case'] == 'buy_collect'
+        self.tracker._preorder_manager.mark_collected.assert_called_once()
+        assert self.tracker._detail_relist_autocollect_signature is not None
+
+    def test_detail_log_buffer_replays_snapshot(self):
+        now = datetime.datetime(2025, 10, 27, 21, 15, 0)
+        self.tracker._detail_pending_log_snapshots = [
+            {
+                "text": (
+                    "2025.10.27 21.14 Listed Trace of Nature x2OO for 27,500,000 Silver\n"
+                    "2025.10.27 21.15 Transaction of Trace of Nature x80 worth 9,120,000 Silver has been completed\n"
+                ),
+                "hash": "dummy",
+                "captured_at": now,
+                "source_window": "sell_item",
+                "prev_window": "sell_overview",
+            }
+        ]
+        self.tracker._detail_pending_snapshot_hashes = {"dummy"}
+
+        stored_rows = []
+
+        def fake_store(tx):
+            stored_rows.append(tx)
+            return True
+
+        self.tracker.store_transaction_db = fake_store
+        self.tracker._preorder_manager.mark_listing_collected = MagicMock()
+        self.tracker._preorder_manager.find_matching_listing = MagicMock(return_value=None)
+        self.tracker._preorder_manager.cancel_listing = MagicMock()
+
+        mt = self.tracker
+        mt._stable_window = 'sell_item'
+        mt._detail_window_active = True
+        mt._detail_window_type = 'sell_item'
+        mt._detail_window_entry_item = 'Trace of Nature'
+
+        # simulate transition to overview
+        mt.process_ocr_text(
+            "2025.10.27 21.15 Transaction of Trace of Nature x80 worth 9,120,000 Silver has been completed"
+        )
+
+        assert len(stored_rows) >= 1
+        tx = next(tx for tx in stored_rows if tx['transaction_type'] == 'sell')
+        assert tx['item_name'] == 'Trace of Nature'
+        assert tx['quantity'] == 80
+        assert tx['price'] == 9_120_000
+
+    def test_relist_instant_buy_creates_second_transaction(self):
+        self.tracker._safe_correct_item_name = MagicMock(return_value=("Ash Sap", True))
+        self.tracker._extract_detail_window_metrics = MagicMock()
+        self.tracker._detail_window_active = True
+        self.tracker._detail_window_type = 'buy_item'
+        self.tracker._detail_window_item = 'Ash Sap'
+        self.tracker._detail_baseline_balance = 10_000_000_000
+        self.tracker._detail_baseline_warehouse = 0
+        self.tracker._detail_last_metrics = {'balance': 10_000_000_000, 'warehouse_qty': 0}
+
+        matching_preorder = {
+            'id': 38,
+            'item_name': 'Ash Sap',
+            'quantity': 1000,
+            'price': 21_000_000_000,
+        }
+        self.tracker._preorder_manager.find_matching_preorder.return_value = matching_preorder
+
+        total_balance_after = 10_000_000_000 - (21_000_000_000 + 2_100_000_000)
+        self.tracker._extract_detail_window_metrics.return_value = {
+            'balance': total_balance_after,
+            'warehouse_qty': 1200,
+            'timestamp': datetime.datetime(2025, 10, 27, 9, 36, 0),
+        }
+
+        self.tracker._monitor_detail_window('buy_item', 'dummy text')
+
+        assert self.tracker.store_transaction_db.call_count == 2
+        calls = [call.args[0] for call in self.tracker.store_transaction_db.call_args_list]
+        auto_collect = next(tx for tx in calls if tx['tx_case'] == 'buy_collect')
+        instant = next(tx for tx in calls if tx['tx_case'] == 'buy_collect_instant')
+
+        assert auto_collect['quantity'] == 1000
+        assert instant['quantity'] == 200
+        assert instant['price'] == 2_100_000_000
+        assert self.tracker._detail_relist_instant_signature is not None
+
+    def test_relist_side_effects_deferred_until_tx_saved(self):
+        preorder_manager_mock = MagicMock()
+        preorder_manager_mock.find_matching_preorder.return_value = {"id": 201, "item_name": "Unknown Seed"}
+        self.tracker._preorder_manager = preorder_manager_mock
+
+        store_calls: list[dict] = []
+
+        def fake_store(tx: dict) -> bool:
+            store_calls.append(tx)
+            saved_now = len(store_calls) == 2
+            if saved_now:
+                self.tracker._apply_relist_side_effects(tx)
+            return saved_now
+
+        self.tracker.store_transaction_db = fake_store
+
+        relist_candidate = {
+            'item_name': 'Unknown Seed',
+            'quantity': 10,
+            'price': 1_420_000_000,
+            'timestamp': datetime.datetime(2025, 10, 28, 11, 40, 0),
+            'transaction_type': 'buy',
+            'case': 'buy_relist_full',
+            'raw_related': [],
+            'occurrence_index': None,
+            'occurrence_slot': 0,
+            '_is_relist': True,
+            '_pending_relist': {
+                'tx_item': 'Unknown Seed',
+                'tx_qty': 10,
+                'tx_price': 1_420_000_000,
+                'tx_timestamp': datetime.datetime(2025, 10, 28, 11, 40, 0),
+                'tx_type': 'buy',
+                'placed_entry': {'qty': 10, 'price': 1_420_000_000},
+                'listed_entry': None,
+            },
+        }
+
+        self.tracker.seen_tx_signatures.clear()
+        self.tracker._relist_side_effect_signatures.clear()
+
+        saved = self.tracker.store_transaction_db(relist_candidate)
+        assert saved is False
+        preorder_manager_mock.store_preorder.assert_not_called()
+        preorder_manager_mock.mark_collected.assert_not_called()
+
+        relist_candidate['_pending_relist']['tx_timestamp'] = datetime.datetime(2025, 10, 28, 11, 41, 0)
+
+        saved_second = self.tracker.store_transaction_db(relist_candidate)
+        assert saved_second is True
+        preorder_manager_mock.store_preorder.assert_called_once()
+        preorder_manager_mock.mark_collected.assert_called_once()
+        assert self.tracker._relist_side_effect_signatures
+
+    def test_listing_placement_uses_cached_input_fields(self, monkeypatch):
+        tracker = self.tracker
+
+        tracker._detail_window_active = True
+        tracker._detail_window_type = 'sell_item'
+        tracker._detail_window_item = 'Lion Blood'
+        tracker._detail_baseline_balance = 1_000_000_000
+        tracker._detail_baseline_warehouse = 5_000
+        tracker._detail_last_metrics = {'balance': 1_000_000_000, 'warehouse_qty': 5_000}
+        tracker._detail_cached_input_fields = {'quantity': 200, 'price': 5_000_000}
+        tracker._detail_cached_input_timestamp = datetime.datetime.now()
+
+        tracker._extract_preorder_input_fields = MagicMock(return_value=None)
+        tracker._extract_detail_window_metrics = MagicMock(return_value={
+            'balance': 999_999_500,
+            'warehouse_qty': 4_800,
+            'item_name': 'Lion Blood',
+        })
+
+        tracker._preorder_manager.store_listing.return_value = 321
+
+        tracker._monitor_detail_window('sell_item', 'dummy text')
+
+        tracker._extract_preorder_input_fields.assert_not_called()
+        tracker._preorder_manager.store_listing.assert_called_once()
+        call = tracker._preorder_manager.store_listing.call_args
+        kwargs = call.kwargs if call.kwargs else {}
+
+        if kwargs:
+            assert kwargs['item_name'] == 'Lion Blood'
+            assert kwargs['quantity'] == 200
+            assert kwargs['price'] == 1_000_000_000
+        else:
+            args = call.args
+            assert args[0] == 'Lion Blood'
+            assert args[1] == 200
+            assert args[2] == 1_000_000_000
+        assert tracker._detail_cached_input_fields is None
+
     def test_state_no_change_no_transaction(self):
         """Test: Keine Änderung → Keine Transaktion"""
         ocr_text = """
@@ -500,6 +730,73 @@ class TestDetailWindowStateMachine:
         assert self.tracker._detail_baseline_balance == 2000000
         # Baseline wird direkt aus OCR-Ablesung gesetzt
         assert self.tracker._detail_baseline_warehouse == 10
+    
+    def test_relist_helix_elixir_fast_close_fallback(self, monkeypatch):
+        """Sicherstellt, dass Relist-Autocollects beim schnellen Schließen via Log-Fallback gespeichert werden."""
+
+        tracker_instance = MarketTracker(debug=False)
+        tracker_instance._preorder_manager = MagicMock()
+        tracker_instance._preorder_manager.find_matching_preorder.return_value = {
+            'id': 40,
+            'item_name': 'Helix Elixir',
+            'quantity': 500,
+            'price': 82_000_000,
+            'quantity_filled': 500,
+        }
+        tracker_instance._preorder_manager.store_preorder.return_value = 41
+
+        # Tracker erwartet aktive Detail-Session kurz vor dem Schließen
+        tracker_instance._detail_window_active = False
+        tracker_instance._detail_window_entry_item = 'Helix Elixir'
+        tracker_instance._detail_window_item = 'Helix Elixir'
+        tracker_instance._stable_window = 'buy_overview'
+
+        # store_transaction_db im Tracker beobachten
+        tracker_store_mock = MagicMock(return_value=True)
+        tracker_instance.store_transaction_db = tracker_store_mock
+
+        # Direkte DB-Aufrufe mocken, damit sie nicht ausgeführt werden
+        db_store_mock = MagicMock(return_value=True)
+        db_conn_mock = MagicMock()
+        db_conn_mock.cursor.return_value.fetchone.return_value = (None, None)
+
+        monkeypatch.setattr(database, 'store_transaction_db', db_store_mock)
+        monkeypatch.setattr(database, 'get_connection', MagicMock(return_value=db_conn_mock))
+
+        # Zeitstempel deterministisch halten
+        fixed_now = datetime.datetime(2025, 10, 27, 16, 47, 0)
+        monkeypatch.setattr(datetime, 'datetime', MagicMock(now=MagicMock(return_value=fixed_now)))
+
+        # OCR-Text simuliert Buy-Overview mit Transaction + Placed order
+        full_text = (
+            "2025.10.27 16:46 Transaction of Helix Elixir x500 worth 82,000,000 Silver\n"
+            "2025.10.27 16:46 Placed order of Helix Elixir x500 for 82,000,000 Silver\n"
+            "Orders Completed 1\nOrders 1\n"
+        )
+
+        tracker_instance.process_ocr_text(full_text)
+
+        # Prüfen, dass der Tracker selbst speichert
+        tracker_store_mock.assert_called()
+        saved_tx = tracker_store_mock.call_args.args[0]
+        assert saved_tx['item_name'] == 'Helix Elixir'
+        assert saved_tx['quantity'] == 500
+        assert saved_tx['price'] == 82_000_000
+        assert saved_tx['tx_case'] == 'buy_collect'
+
+        # Preorder muss als collected markiert werden
+        tracker_instance._preorder_manager.mark_collected.assert_called_once()
+
+        # Neue Preorder sollte trotz Detail-Abbruch erstellt werden
+        tracker_instance._preorder_manager.store_preorder.assert_called_once()
+        preorder_args = tracker_instance._preorder_manager.store_preorder.call_args
+        assert preorder_args.kwargs.get('item_name') == 'Helix Elixir'
+        assert preorder_args.kwargs.get('quantity') == 500
+        assert preorder_args.kwargs.get('price') == 82_000_000
+
+        # Alter Direkt-Import darf nicht mehr genutzt werden
+        db_store_mock.assert_not_called()
+
     
     def test_state_manual_reset(self):
         """Test: Manueller State-Reset"""

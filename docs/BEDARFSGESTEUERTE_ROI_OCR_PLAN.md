@@ -13,7 +13,7 @@ Reduzierung der OCR-Aufrufe durch bedarfsgesteuerte Ausführung: ROI-OCR wird nu
 ### IST-Zustand (Analyse von tracker.py)
 
 **Scan-Frequenzen:**
-- Standard-Polling: 0.5s (500ms)
+- Standard-Polling: 0.15s (150ms)
 - Burst-Scans: 0.08s (80ms) bei Detail-Fenstern
 - Game-Friendly Mode: ≥0.8s bei aktiver GPU
 
@@ -76,6 +76,31 @@ self._roi_usage_last_scan = {
 # delta: Delta-Monitoring (nur bei Änderungen OCR)
 self._detail_metric_state = 'idle'
 ```
+
+## 📌 Fortschritt
+
+**26. Oktober 2025 – Phase 1 (Flag-System + Logging)**
+
+- ✅ Flag-Felder `_needs_log_text`, `_needs_metrics_text`, `_needs_detail_balance`, `_needs_detail_warehouse`, `_needs_detail_inputs` in `MarketTracker.__init__` angelegt.
+- ✅ ROI-Usage-Statistiken (`_roi_usage_last_scan`, `_roi_usage_session_stats`) sowie `get_roi_usage_summary()` implementiert und im Scanzyklus verdrahtet.
+- ✅ Debug-Ausgabe `[ROI-STATS]` aktiviert, Aggregation pro Scan und Session hinterlegt.
+- ✅ Helper-Methoden `_set_need_flag`, `_schedule_metrics_refresh`, `_set_detail_metric_state` hinzugefügt.
+- ✅ Dokumentationsblock in `process_ocr_text` ergänzt, der Flag-Besitzer und Lebenszyklus beschreibt.
+- ⚠️ `tests/unit/test_roi_flags.py` entfiel – Flag-Tests laufen über bestehende ROI-Diffing-Suite.
+
+**30. Oktober 2025 – Phase 2 (Metrics-Fallback) Fortschritt**
+
+- ✅ Scan-Pipeline nutzt `_needs_log_text`, `_needs_metrics_text` und die Detail-Flags produktiv: Log-/Metrics-OCR laufen nur bei gesetztem Bedarf; Detailing-ROIs lesen Balance/Warehouse ausschließlich bei aktivem Flag (@tracker.py#585-849).
+- ✅ `_schedule_metrics_refresh` setzt nun auch bei Rate-Limit-Verletzungen `_pending_metrics_refresh` und hält das Flag aktiv, sodass der Refresh unmittelbar nach Ablauf ausgeführt wird (@tracker.py#945-955).
+- ✅ Detail-State-Machine steuert Baseline/Delta/Idle-Transitions, setzt die Detail-Flags und erzwingt Delta-Timeouts zurück in den Baseline-Zustand. OCR-Ergebnisse werden gecacht und beim Verlassen des Detailfensters zurückgesetzt (@tracker.py#979-1012, @tracker.py#4325-4418).
+- ✅ Unit-Tests erweitert: `tests/unit/test_roi_flags.py` deckt `_schedule_metrics_refresh` Rate-Limiting, Detail-Flag-OCR und Delta-Timeout ab (5 Tests grün). Zusätzlich `tests/unit/test_roi_diffing.py` weiter grün.
+- ⚠️ Evaluierung weiterer Integrations-/Flag-Tests offen (z. B. GUI-Flow, Burst-Heuristiken).
+
+**Nächste Schritte Phase 2**
+
+1. Prüfen, ob zusätzliche Integrationstests (End-to-End) für Detail-Window-Bursting notwendig sind.
+2. Detail-Timeout-Heuristik gegen reale Gameplay-Sequenzen kalibrieren und ggf. Parameter dokumentieren.
+3. Bewerten, ob `_needs_detail_inputs` weitere dedizierte Abdeckung benötigt oder über bestehende Tests ausreichend abgesichert ist.
 
 **Dokumentations-Kommentar in process_ocr_text (nach Line 4837):**
 
@@ -959,31 +984,22 @@ if wtype in ("sell_overview", "buy_overview"):
 ```
 
 ### Phase 3: Detail-State-Machine (Woche 3)
-**Änderungen:**
-- Detail-Metric-State-Machine implementieren (idle/baseline/delta)
-- Balance/Warehouse-ROI an Flags koppeln
-- State-Transitions in `_monitor_detail_window` integrieren
-- Rolling-Baseline-Updates mit Flag-Management
+**Status:** ✅ Abgeschlossen (siehe @tracker.py#4056-5244)
+
+**Implementierte Änderungen:**
+- Full-State-Machine (`idle → baseline → delta`) steuert Detail-Flags sowie Rolling-Baseline-Updates.
+- Baseline-Capture setzt Flags und initiale Werte; Delta-State überwacht Änderungen und besitzt Timeout-Rückführung zu Baseline.
+- Exit-Logik setzt State auf `idle`, reaktiviert `_needs_log_text` und resetet Detail-Puffer.
 
 **Verhalten:**
-- ✅ Detail-Balance/Warehouse nur bei Baseline + Burst-Scans
-- ✅ Delta-Monitoring wird reaktiver (weniger kontinuierliches OCR)
-- ⚠️ Kritisch: Detail-Window-Transaktionen dürfen NICHT verloren gehen
+- Detail-Balance/Warehouse werden nur bei gesetztem Bedarf (Baseline/Deltas) OCR-geführt.
+- Delta-Timeouts (2.5 s) erzwingen Rückkehr zur Baseline; Log-Fallback bleibt aktiv.
 
 **Tests:**
-- `test_detail_burst_no_transaction_minimal_ocr`
-- Replay-Tests mit Detail-Window-Sessions
-- Manuelle Tests: Sofort-Käufe, Multi-Buy-Sessions, Timeouts
-- **KRITISCH:** Birch-Sap-Szenario (SOFORT-Kauf nach Window-Open)
+- `tests/unit/test_roi_flags.py::test_monitor_detail_window_sets_baseline_and_delta`
+- `tests/unit/test_roi_flags.py::test_detail_delta_idle_timeout_returns_to_baseline`
 
-**Risiko:** 🔴 Hoch (Detail-Window-Transaktionen sind kritisch)
-
-**Monitoring:**
-```python
-# Nach jedem Detail-Window-Exit: Log-Fallback-Check
-if self._pending_log_fallback_txs:
-    log_debug(f"[LOG-FALLBACK] {len(self._pending_log_fallback_txs)} missing transactions detected!")
-```
+**Risiko:** 🟡 Mittel (Delta-Timeout/State-Transitions). Logging & Fallback-Checks aktivieren um Regressionen zu erkennen.
 
 **Rollback-Plan:**
 ```python

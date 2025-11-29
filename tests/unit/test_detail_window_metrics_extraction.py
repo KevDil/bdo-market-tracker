@@ -5,8 +5,24 @@ Unit-Tests für Detail-Window-Metriken-Extraktion
 Tests die Regex-Pattern-Fixes für verschiedene OCR-Formate
 """
 
+import sys
+from pathlib import Path
+
 import pytest
-from tracker import MarketTracker
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+from tracker import MarketTracker  # noqa: E402
 
 
 class TestDetailWindowMetricsExtraction:
@@ -74,6 +90,32 @@ class TestDetailWindowMetricsExtraction:
         assert metrics is not None
         assert 'warehouse_qty' in metrics
         assert metrics['warehouse_qty'] == 25
+
+    def test_extract_warehouse_on_next_line_after_label(self):
+        """Test: Warehouse-Zahl steht auf eigener Zeile unter dem Label."""
+        text = "Balance 5,000,000\nWarehouse Quantity\n3"
+        metrics = self.tracker._extract_detail_window_metrics(text, 'buy_item')
+
+        assert metrics is not None
+        assert metrics['warehouse_qty'] == 3
+
+    def test_extract_warehouse_missing_triggers_flag(self, monkeypatch):
+        """Test: Wenn keine Warehouse-Zahl erkannt wird, bleibt Flag aktiv."""
+
+        # Flag-Verhalten beobachten
+        calls = []
+
+        def fake_set_need_flag(flag, value, reason=""):
+            calls.append((flag, value, reason))
+
+        monkeypatch.setattr(self.tracker, '_set_need_flag', fake_set_need_flag)
+
+        text = "Balance 5,000,000\nWarehouse Quantity"
+        metrics = self.tracker._extract_detail_window_metrics(text, 'buy_item')
+
+        assert metrics is not None
+        assert 'warehouse_qty' not in metrics
+        assert ('detail_warehouse', True, 'detail_extract_missing_warehouse') in calls
     
     # === Item-Name Tests ===
     

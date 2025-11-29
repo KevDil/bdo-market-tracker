@@ -1,6 +1,43 @@
 # Repository Guidelines
 - Reply to the user in German.
 
+## Agent Interaction Guidelines
+Nutze immer, wenn es sinnvoll ist, die dir zur Verfügung stehenden MCP-Server.
+Befolge diese Schritte für jede Agenten‑Interaktion im Kontext dieses Repositories:
+
+1. Benutzeridentifikation
+  - Nimm standardmäßig an, dass du mit `default_user` interagierst (z. B. dem Entwickler oder dem primären Anwender dieses Repos).
+  - Wenn `default_user` nicht eindeutig ist, versuche proaktiv zusätzliche Anhaltspunkte (z. B. Git-Konfiguration, PR-Autor, Issue-Metadaten) zu ermitteln.
+
+2. Memory‑Abruf
+  - Beginne jede Chat‑Session damit alle relevanten Informationen aus deinem Knowledge‑Graph abzurufen.
+  - Bezeichne diesen Knowledge‑Graph konsequent als dein "Memory".
+
+3. Memory (was beobachtet werden soll)
+  - Achte während der Unterhaltung auf neue Informationen in diesen Kategorien und markiere sie für das Memory:
+    a) Benutzerinteraktionen mit der GUI (z.B. häufige Verwendung bestimmter Tabs, Schließen von Fenstern, Button-Klicks)
+    b) OCR- und Parsing-Probleme (z.B. wiederkehrende Token-Mismatches, ROI-Anpassungen, fehlgeschlagene OCR-Erkennungen)
+    c) Performance- und Konfigurationspräferenzen (z.B. GPU-Nutzung, Polling-Intervalle, Cache-Hit-Raten)
+    d) Projektziele und Aufgaben (z.B. Optimierungen, neue Features, Bug-Fixes)
+    e) Datenbank- und Persistenz-Issues (z.B. Dedupe-Fehler, fehlende Transaktionen, Cache-Probleme)
+    f) API- und Netzwerkprobleme (z.B. BDO API-Ausfälle, Preisabfragen, Throttling)
+  - Projekt‑spezifisch: Erfasse UI‑/Workflow‑Regeln als Memory, z. B. wenn beobachtet wird, dass
+    - der Benutzer `overview`- und/oder `detail`-Fenster sehr schnell schließt,
+    - ROI/Regionen regelmäßig angepasst werden müssen,
+    - bestimmte OCR‑Fehler immer wieder auftreten (z. B. wiederkehrende Token‑Mismatches),
+    — solche Regeln helfen, Heuristiken in `tracker.py`, `parsing.py` oder `preorder_manager.py` gezielt zu verbessern.
+
+4. Memory‑Aktualisierung (wie speichern)
+  - Wenn neue Informationen auftreten, aktualisiere das Memory wie folgt:
+    a) Lege neue Entities für wiederkehrende Personen, Organisationen oder signifikante Ereignisse an.
+    b) Verbinde diese Entities mit bestehenden Entities über Relations (z. B. `user_works_on -> project_x`).
+    c) Speichere beobachtete Fakten als Observations (kurze, zeitgestempelte Einträge).
+  - Wenn eine neue Verhaltensregel projektrelevant ist (z. B. Fenster‑Schließverhalten), erstelle eine Observation und markiere sie als "actionable" so dass Automatisierungen (z. B. Baseline‑Capture) darauf reagieren können.
+
+Hinweis zur Privatsphäre & Gültigkeit
+  - Speichere nur Informationen, die für die Arbeit an diesem Projekt relevant sind. Vermeide die Sammlung sensibler persönlicher Daten, sofern sie nicht ausdrücklich benötigt und zugestimmt sind.
+
+
 ## Scope & Sources of Truth
 - This is the single authoritative guide for maintainers, automation agents, and contributors. Retired specs (`instructions.md`, `copilot-instructions.md`, `.windsurf/rules/project-rules.md`) now mirror this file or point to archived copies under `docs/archive/`.
 - Keep this document synchronized with real implementation details (OCR engine, ROI, cache values, test counts, etc.). When you change behaviour, update this file before merging.
@@ -73,7 +110,8 @@
 - Database schema (see `database.py` migrations): table `transactions` with `item_name`, `quantity`, `price`, `transaction_type`, `timestamp`, `tx_case`, `occurrence_index`, `content_hash`. Unique index `idx_unique_tx_full` spans these fields to guard duplicates. Additional tables `preorders` and `listings` track active market orders (see Preorder & Listing Tracking section above).
 - `occurrence_index` plus `_occurrence_slot` differentiate repeated same-second events. The resolver now only reuses a stored index when the snapshot timestamp trails the latest committed event by ≥1 s (historical import) or when the baseline already contained the line; fresh same-minute transactions continue to receive new indices. Use helpers (`fetch_occurrence_indices`, `transaction_exists_exact`) instead of manual SQL.
 - `store_transaction_db` performs an additional historical guard: if an older snapshot (≤ last processed timestamp) tries to persist an item that already has matching occurrences for that minute, the insert is skipped even if the baseline cache was cleared during an auto-track toggle. This blocks the double-save seen when restarting auto-track mid-session.
-- Detailfenster-Erkennung nutzt normalisierte Schlüsselfrasen mit robuster ODER-Logik. `sell_item` wird erkannt, sobald `Set Price` sowie **mindestens eines** der Skalenfelder `MAX` oder `MIN` (inklusive OCR-Varianten wie `M4X`, `rnax`, `M1N`, `MLN`) im Text stehen; `Register Quantity` ist optional. `buy_item` setzt analog auf `Desired Price` + (`MAX` **ODER** `MIN`), `Desired Amount` ist optional. Dies ermöglicht robuste Erkennung auch bei Layout-Varianten oder partiellen OCR-Fehlern. Legacy-Heuristiken (Base/Min/Max) bleiben als Fallback aktiv.
+- Detailfenster-Erkennung nutzt normalisierte Schlüsselfrasen mit robuster ODER-Logik. `sell_item` setzt auf `Set Price` plus **mindestens eines** der Skalenfelder `MAX`/`MIN` **oder** alternative Detail-Tokens wie `Register Quantity`, `Total Price`, `Confirm Sell`. `buy_item` wird erkannt, sobald `Desired Price` zusammen mit `MAX`/`MIN` **oder** Detail-Tokens wie `Desired Amount`, `Capacity`, `Continue`, `Confirm Purchase` erscheint. OCR-Varianten (`M4X`, `rnax`, `M1N`, `MLN`) bleiben abgedeckt. Legacy-Heuristiken (Base/Min/Max) sind weiterhin als Fallback aktiv.
+- Tracker fallbackt bei „unknown“-Fenstern automatisch auf den zuletzt erkannten Detail-Hint (`desired price`/`set price`). Dadurch läuft `_monitor_detail_window` auch dann an, wenn die Snapshot-Heuristik den Typ nicht sofort stabilisiert.
 - Parser bewahrt `raw_price_hint` für Transaktionszeilen; `MarketTracker` rekonstruiert Buy-Totals anhand dieser Suffixe statt fallback-mäßig den Placed-Betrag zu speichern. Placed/Withdrew-Hints werden dabei ignoriert, sodass nach fehlenden führenden Ziffern (z. B. `688,420`) der volle Betrag (4 688 420) wiederhergestellt und Duplikate verhindert werden.
 - Transaktionen ohne erkannte Menge werden nur noch übernommen, wenn starke Anker (listed/withdrew/purchased mit Menge, UI-Metriken oder echte Transaction-Zeile) vorliegen; andernfalls werden sie verworfen, um 1×-Phantome zu verhindern.
 - Persistent state in `tracker_state` tracks `last_overview_text`, UI baselines, and flags; only refresh after successful transaction commits. `tracker_settings` holds toggles (capture region, GPU usage, debug mode).
@@ -101,6 +139,7 @@
 - Sync this file with actual behaviour and archive references whenever configuration, cases, or invariants change.
 
 ## Safety, Configuration & No-Go Items
+- **Long-Running Auto-Track Mode**: The application is designed to run continuously for hours in auto-track mode. All optimizations (caching, polling intervals, ROI usage) must maintain stability and performance over extended periods without memory leaks, performance degradation, or false positives. Never introduce changes that could cause issues after 2+ hours of continuous operation.
 - Maintain the focus guard, ROI bounds, caching, and content-hash dedupe. Disabling these invites duplicate writes and OCR noise.
 - Do not introduce system-time fallbacks for timestamps or bypass item whitelist validation to force saves.
 - Avoid blocking operations inside the capture loop; network calls (BDO API) and DB writes must occur after OCR completes.

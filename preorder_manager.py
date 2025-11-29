@@ -138,7 +138,55 @@ class PreorderManager:
             if self.debug:
                 log_debug(f"[PREORDER] ERROR storing preorder: {e}")
             return -1
-    
+
+    def record_legacy_preorder(
+        self,
+        item_name: str,
+        quantity: int,
+        price: float,
+        collected_at: datetime,
+        status: str = 'collected',
+    ) -> Optional[int]:
+        """Persistiert historische Preorders ohne aktive ID."""
+        try:
+            cur = get_cursor()
+            cur.execute(
+                """
+                INSERT INTO preorders (
+                    item_name,
+                    quantity,
+                    quantity_filled,
+                    price,
+                    timestamp,
+                    status,
+                    collected_at,
+                    created_at,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    item_name,
+                    quantity,
+                    quantity,
+                    price,
+                    collected_at,
+                    status,
+                    collected_at,
+                ),
+            )
+            get_connection().commit()
+            legacy_id = cur.lastrowid
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] Recorded legacy preorder: {item_name} x{quantity} @ {price:,.0f} (status={status})"
+                )
+            return legacy_id
+        except Exception as exc:
+            if self.debug:
+                log_debug(f"[PREORDER] ERROR recording legacy preorder: {exc}")
+            return None
+
     # === Retrieval Operations ===
     
     def find_matching_preorder(
@@ -198,20 +246,45 @@ class PreorderManager:
             candidate = candidates[0]
             
             # Check if there's any filled quantity to collect
-            quantity_filled = candidate.get('quantity_filled', 0)
-            
+            quantity_filled = candidate.get('quantity_filled', 0) or 0
+
+            # Berechne erwartete Auto-Collect-Summe für gefüllte Mengen
+            expected_autocollect_total = None
+            try:
+                if candidate['quantity'] > 0 and quantity_filled > 0:
+                    unit_price = candidate['price'] / candidate['quantity']
+                    expected_autocollect_total = unit_price * quantity_filled
+            except Exception:
+                expected_autocollect_total = None
+
             # Validate quantity alignment
-            # For partial fills: we collect the filled portion
-            if quantity_filled > 0 and quantity_filled <= warehouse_delta:
-                if self.debug:
-                    log_debug(
-                        f"[PREORDER] Match found (partial fill): {candidate['item_name']} "
-                        f"x{candidate['quantity']} (filled={quantity_filled}) @ {candidate['price']:,.0f} "
-                        f"(ID: {candidate['id']})"
-                    )
-                return candidate
-            # For non-filled preorders: standard check
-            elif quantity_filled == 0 and candidate['quantity'] <= warehouse_delta:
+            # For partial fills: wir sammeln die gefüllte Menge ein
+            if quantity_filled > 0:
+                if warehouse_delta >= quantity_filled:
+                    if self.debug:
+                        log_debug(
+                            f"[PREORDER] Match found (partial fill): {candidate['item_name']} "
+                            f"x{candidate['quantity']} (filled={quantity_filled}) @ {candidate['price']:,.0f} "
+                            f"(ID: {candidate['id']})"
+                        )
+                    return candidate
+
+                # Sonderfall: warehouse_delta == 0 (Detail-OCR hat Lager nicht gelesen)
+                # Prüfe ob balance_delta dem erwarteten Auto-Collect entspricht (mit Toleranz)
+                if warehouse_delta == 0 and expected_autocollect_total is not None and balance_delta:
+                    spent = abs(balance_delta)
+                    tolerance = max(expected_autocollect_total * 0.02, 1000)  # 2% oder mindestens 1k Silver
+                    if abs(spent - expected_autocollect_total) <= tolerance:
+                        if self.debug:
+                            log_debug(
+                                f"[PREORDER] Match via balance delta: {candidate['item_name']} "
+                                f"filled={quantity_filled}, expected_total={expected_autocollect_total:,.0f}, "
+                                f"balance_delta={balance_delta:,.0f}"
+                            )
+                        return candidate
+
+            # Für komplett ungefüllte Preorders (quantity_filled == 0): Standard-Check
+            if quantity_filled == 0 and candidate['quantity'] <= warehouse_delta and candidate['quantity'] > 0:
                 if self.debug:
                     log_debug(
                         f"[PREORDER] Match found: {candidate['item_name']} "
@@ -219,14 +292,14 @@ class PreorderManager:
                         f"(ID: {candidate['id']})"
                     )
                 return candidate
-            else:
-                if self.debug:
-                    log_debug(
-                        f"[PREORDER] No quantity match for '{item_name}' "
-                        f"(preorder_qty={candidate['quantity']}, filled={quantity_filled}, "
-                        f"warehouse_delta={warehouse_delta})"
-                    )
-                return None
+
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] No quantity match for '{item_name}' "
+                    f"(preorder_qty={candidate['quantity']}, filled={quantity_filled}, "
+                    f"warehouse_delta={warehouse_delta}, balance_delta={balance_delta})"
+                )
+            return None
         
         except Exception as e:
             if self.debug:
@@ -443,7 +516,69 @@ class PreorderManager:
             if self.debug:
                 log_debug(f"[PREORDER] ERROR updating filled quantity: {e}")
             return False
-    
+
+    def update_quantity_filled_by_item(
+        self,
+        item_name: str,
+        filled_quantity: int
+    ) -> bool:
+        """Synchronisiert quantity_filled für aktives Item anhand von UI-Metriken."""
+        if not item_name or filled_quantity is None or filled_quantity < 0:
+            return False
+
+        try:
+            cur = get_cursor()
+            cur.execute(
+                """
+                SELECT id, quantity, quantity_filled
+                FROM preorders
+                WHERE item_name = ? AND status = 'active'
+                """,
+                (item_name,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+
+            preorder_id, total_qty, current_filled = row
+            current_filled = current_filled or 0
+            if total_qty is None or total_qty <= 0:
+                return False
+
+            target_filled = min(int(filled_quantity), int(total_qty))
+            if target_filled <= current_filled:
+                return False
+
+            cur.execute(
+                """
+                UPDATE preorders
+                SET quantity_filled = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'active'
+                """,
+                (target_filled, preorder_id)
+            )
+            get_connection().commit()
+
+            if cur.rowcount <= 0:
+                return False
+
+            # Invalidate cache damit Folgezugriffe frische Werte sehen
+            self._active_preorders_cache = None
+
+            if self.debug:
+                log_debug(
+                    f"[PREORDER] UI-sync updated filled quantity: {item_name} "
+                    f"filled={target_filled} (prev={current_filled})"
+                )
+
+            return True
+
+        except Exception as exc:
+            if self.debug:
+                log_debug(f"[PREORDER] ERROR syncing filled quantity for {item_name}: {exc}")
+            return False
+
     # === Cache Management ===
     
     def _refresh_cache_if_needed(self):
@@ -689,12 +824,31 @@ class PreorderManager:
                         f"warehouse_delta={warehouse_delta})"
                     )
                 return None
-        
         except Exception as e:
             if self.debug:
                 log_debug(f"[LISTING] ERROR finding match: {e}")
             return None
-    
+
+    def find_active_listing(self, item_name: str) -> Optional[Dict]:
+        """Return the currently active listing for an item (if any)."""
+        try:
+            self._refresh_listings_cache_if_needed()
+
+            if not self._active_listings_cache:
+                return None
+
+            item_lower = item_name.lower()
+            for listing in self._active_listings_cache:
+                if listing['item_name'].lower() == item_lower:
+                    return listing
+
+            return None
+
+        except Exception as e:
+            if self.debug:
+                log_debug(f"[LISTING] ERROR retrieving active listing: {e}")
+            return None
+
     def get_active_listings(
         self,
         item_name: Optional[str] = None

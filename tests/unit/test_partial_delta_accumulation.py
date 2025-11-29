@@ -5,8 +5,24 @@ Testet dass Balance- und Warehouse-Deltas über mehrere Scans korrekt akkumulier
 wenn BDO die Updates asynchron liefert.
 """
 
+import sys
+from pathlib import Path
+
 import pytest
-from tracker import MarketTracker
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from ._stubs import install_dependency_stubs  # type: ignore
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from _stubs import install_dependency_stubs  # type: ignore
+
+install_dependency_stubs()
+
+from tracker import MarketTracker  # noqa: E402
 
 
 class TestPartialDeltaAccumulation:
@@ -33,6 +49,7 @@ class TestPartialDeltaAccumulation:
         assert result1 is None, "Should return None when only balance changed"
         assert tracker._detail_partial_balance_delta == -100000
         assert tracker._detail_partial_warehouse_delta == 0
+        assert tracker._detail_pending_collect_qty == 0
         
         # Scan 2: Warehouse steigt (Ware empfangen)
         result2 = tracker._infer_transaction_from_deltas(
@@ -51,6 +68,7 @@ class TestPartialDeltaAccumulation:
         # Partial deltas should be reset after successful transaction
         assert tracker._detail_partial_balance_delta == 0
         assert tracker._detail_partial_warehouse_delta == 0
+        assert tracker._detail_pending_collect_qty == 0
 
     def test_buy_transaction_partial_deltas_warehouse_first(self):
         """
@@ -58,7 +76,7 @@ class TestPartialDeltaAccumulation:
         
         Scenario:
         1. Scan 1: Balance +0, Warehouse +5000 → Keine Transaktion (incomplete)
-        2. Scan 2: Balance -100,000, Warehouse +0 → Transaktion komplett ✅
+        2. Scan 2: Balance -100,000, Warehouse +0 → Transaktion komplett 
         """
         tracker = MarketTracker(debug=True)
         
@@ -73,6 +91,7 @@ class TestPartialDeltaAccumulation:
         assert result1 is None
         assert tracker._detail_partial_balance_delta == 0
         assert tracker._detail_partial_warehouse_delta == 5000
+        assert tracker._detail_pending_collect_qty == 5000
         
         # Scan 2: Balance sinkt (Kauf bezahlt)
         result2 = tracker._infer_transaction_from_deltas(
